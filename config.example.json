@@ -1,0 +1,7 @@
+{
+  "alpaca_key": "",
+  "alpaca_secret": "",
+  "fred_key": "",
+  "broker_orders_enabled": false,
+  "contracts_per_trade": 1
+}
