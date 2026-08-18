@@ -1,0 +1,19 @@
+---
+description: ASH Terminal visual system. Before changing fonts, charts, color, or mobile layout, follow docs/ui-rulebook.md and the matching ash-* skill.
+alwaysApply: true
+---
+
+# ASH UI
+
+Visual work is gated by the rulebook, not by taste.
+
+1. Read `docs/ui-rulebook.md` — identity first (§1.1–1.8), then tokens and drawers.
+2. Load `.cursor/skills/ash-identity/SKILL.md` on visual work, then the group:
+   - Type / fonts / numbers → `.cursor/skills/ash-type/SKILL.md`
+   - Canvas or chart HTML → `.cursor/skills/ash-charts/SKILL.md`
+   - Color, P&L, contrast → `.cursor/skills/ash-color/SKILL.md`
+   - Spacing, touch, Home/phone structure → `.cursor/skills/ash-layout/SKILL.md`
+   - Boot, flakes vs candles, title A, lighting → `.cursor/skills/ash-intro/SKILL.md`
+3. Reuse `resize()` and existing drawers in `static/index.html`. Do not add Chart.js/D3 for a panel.
+4. Nothing readable below 11 px. Touch 44×44. Color is never the only cue.
+5. Do not implement a visual restyle unless the user asked. Research and skills first.

@@ -1,0 +1,9 @@
+{
+  "name": "ASH Terminal",
+  "short_name": "ASH",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#000000",
+  "description": "Cinematic local paper research terminal with flying candlestick intro palettes and clear replay direction outcomes"
+}
