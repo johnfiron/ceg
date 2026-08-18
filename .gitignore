@@ -9,6 +9,7 @@ __pycache__/
 *.pyo
 data/
 *.db
+.venv/
 
 # OS
 .DS_Store

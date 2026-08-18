@@ -25,7 +25,7 @@ The code already states this:
 - True black canvas (`#000`), bone ink (`#f5f5f1`, `--ash #deded8`), hairline charcoal panels
 - Ambient falling flakes (`ambientAsh`) — grey-white, never colored
 - Boot: 2.5D **candlestick storm** that pulls into an eye, then a **serif A**, then tracked `ASH TERMINAL`
-- Page changes **vaporize** into particles (text + edges + canvas samples) on a curl-noise wind — comment: “exact-origin chaotic-wind”
+- Page changes release from the exact tapped control, arc with navigation direction, then **settle onto the destination** in 780ms — comment: “exact-origin pressure-and-settle page cut”
 - Live candles are **ash / grey**, not green/red. Green/red is an optional intro costume (`market` / `white` / `pink`)
 - Eyebrows are uppercase, tracked, heavy (`MARKET DATA · STRATEGIES`)
 - Brand orb: metallic coal/pearl + Georgia/Times **A** — the only serif
@@ -70,7 +70,7 @@ Two layers, already in the DOM:
 
 | Layer | Job | Rules |
 |---|---|---|
-| **Atmosphere** | Boot storm, ambient ash, vaporize | Pale flakes `rgba(230,230,224,…)`. No colored ash. `prefers-reduced-motion`: skip storm/vaporize, keep a still frame + wordmark. Do not paint atmosphere on top of plot pixels. |
+| **Atmosphere** | Boot storm, ambient ash, pressure/settle cut | Pale flakes `rgba(230,230,224,…)`. No colored ash. `prefers-reduced-motion`: skip storm/page cut, keep a still frame + wordmark. Do not paint atmosphere on top of plot pixels. |
 | **Desk** | Panels, numbers, charts, explain | Quiet. Hairlines. Bone type. One chart. Color only for state. |
 
 Cinema is the **entrance and the page cut**. The session is a **desk**. If atmosphere competes with a number, the number wins.
@@ -96,7 +96,7 @@ Already implemented — extend, don’t replace:
 
 1. **Boot (once):** camera pull through candle storm → eye → serif A → tracked wordmark → fade. 5–7s. Optional palettes are costumes; **classic white** is the identity default.
 2. **Idle:** ash drift, slow, depth-sorted. Cap particle count on phones (already width-based).
-3. **Navigate:** vaporize old page → turbulent wind → reassemble. Physical, not a 200ms fade.
+3. **Navigate:** release from the tapped nav/action → directional arc → settle onto the next page. The current cut is 280ms out + 500ms in. No center snap, bounce, or magnetic pull.
 4. **Desk:** almost still. Replay play and surface drag are tools, not brand.
 
 No bounce, no springy SaaS, no colored particle bursts on tap.
@@ -115,10 +115,10 @@ Read from `static/index.html`, not from a moodboard:
 | Soft chrome | panel `20px`, dock `21px`, pills `999px` | Sequel/iOS prestige, **not** A24 zero-radius. |
 | Blur on chrome only | topbar + `.bottomNav` | Desk glass. Plots stay unfrosted. |
 | Monochrome tape | live `candles` ash/grey | Price is material, not a traffic light. |
-| Costumes | `INTRO_PALETTES` market / white / pink | **white** is identity. Default in code is still `market` — a drift to fix later, not a new look. |
+| Costumes | `INTRO_PALETTES` market / white / pink | **white** is identity. Code default is `white`. |
 | Stamp voice | `.eyebrow` weight 950, tracking `.18em` | Identity is case + tracking + weight. Size can rise to 11px. |
-| Serif lock | Georgia / Times on orb + boot A | Never blotter, never strategy cards. |
-| Cinema comment | “cinematic polish”, “2.5D flying-candlestick storm”, “exact-origin chaotic-wind” | Atmosphere is authored, not leftover decoration. |
+| Serif lock | Path-drawn A (boot + `.orbA`); wordmark stays sans | Never blotter, never strategy cards. |
+| Cinema comment | “cinematic polish”, “2.5D flying-candlestick storm”, “exact-origin pressure-and-settle page cut” | Atmosphere is authored, not leftover decoration. |
 
 **Tension to keep, not average out:** cinema marketing uses 7px tracked meta; a phone desk cannot. Raise size, keep the stamp. Do not “clean” radii, ash, or the serif A to look more institutional.
 
@@ -132,7 +132,7 @@ ASH is already a hybrid. The neighbors that matter are not “dark mode dashboar
 
 | Job | ASH already | How the genre does it well | Failure mode |
 |---|---|---|---|
-| **Ceremony** | Boot storm, serif A, vaporize | Bloomberg BQuant launch (Nov 2025) used particle worlds and motion studies to *introduce* a research terminal — then the desk is quiet. Game/film title cards (Territory, A24) end; they do not loop under the HUD. | Running the storm or colored particles during a session |
+| **Ceremony** | Boot storm, serif A, pressure/settle page cut | Bloomberg BQuant launch (Nov 2025) used particle worlds and motion studies to *introduce* a research terminal — then the desk is quiet. Game/film title cards (Territory, A24) end; they do not loop under the HUD. | Running the storm or colored particles during a session |
 | **Masthead** | Tracked `ASH TERMINAL`, Georgia A, eyebrows | Editorial finance (FT, Linear’s rare Tiempos): serif is a **strike**, not a body face. Labels are stamped evidence (`SESSION TAPE · AND-GATE`). Display numbers tighten (Linear −0.02em at 40px) while captions open. | Serif on strategy cards; Inter-as-luxury everywhere |
 | **Instrument** | Panels, chips, `line`/`candles`, keyboard | Linear / Raycast: no illustration in the product, accent on ~5% of a view, elevation by **hairline + one luminance step**, not drop-shadow theater. TradeX: red/green only for direction. | Rainbow indicators, Material purple, mint-as-brand |
 
@@ -158,7 +158,7 @@ Do not “warm the background” to look more editorial. The void is the brand; 
 - Boot storm is OK without a pause **while it is the only content** (Understanding 2.2.2: a loader that is the whole view is exempt). After `finishIntro()`, it must not keep flying under Home.
 - Craft: Linear/BQuant put spectacle at launch. NN/G Liquid Glass (Oct 2025): do not frost the thing you are reading. Ash behind a chart is atmosphere; ash **on** chart pixels is noise.
 
-When implementing later: still-frame ash or hide after boot; a control to stop idle flakes; `matchMedia('(prefers-reduced-motion: reduce)')` around `ashFrame` / `stormFrame` / `vaporizeTransition` (CSS media queries do not stop `requestAnimationFrame`).
+When implementing later: still-frame ash or hide after boot; a control to stop idle flakes; `matchMedia('(prefers-reduced-motion: reduce)')` around `ashFrame` / `stormFrame` / `settleTransition` (CSS media queries do not stop `requestAnimationFrame`).
 
 ### Tracking is two voices, not one “luxury” setting
 
@@ -234,7 +234,7 @@ Ownable details (draw these; do not pick a Google font and stop):
 - High-contrast serif: thick stems, hairline crossbar (Didone / film-title). Crossbar can read as a single flake of ash — one distinctive cut, like IBM’s stripes.
 - Open counter (the hole in the A) so it survives 18px.
 - One weight, one stress angle, used in both boot and orb.
-- Assemble, don’t fade: matter pulls into the three strokes (A24 geometry → letter). Matches `vaporizeTransition` (physical cut).
+- Assemble, don’t fade: matter pulls into the three strokes (A24 geometry → letter). Matches `settleTransition` (physical cut).
 
 Refuse: script A, neon outline A, logo-plus-candlestick lockup, serif on `ASH TERMINAL`, a new display family for the whole UI.
 
@@ -254,14 +254,14 @@ A variable monogram for every letter, each a *thing* (A=ash, B=beach, C=cherry�
 |---|---|---|
 | **Letter** | A–Z (skeleton paths) | **A** |
 | **Matter** | `flakes` · `candles` | **flakes** |
-| **Flow** | `assemble` (chaos → letter) · `emit` (letter/tree → chaos) | assemble for flakes; emit is the reverse you already have in `vaporizeTransition` |
+| **Flow** | `assemble` (chaos → letter) · `emit` (letter/tree → chaos) | assemble for flakes; emit uses the pressure-release phase already present in `settleTransition` |
 | **Material** | flight regime + albedo + sprite (table below) | **A = ash** (locked) |
 
 Color (`white` / `market` / `pink`) still tints albedo. Do not invent a new renderer per letter.
 
 ### Why this can work (sourced)
 
-- **Particle → glyph is solved.** Offscreen `fillText` / path → `getImageData` → particles spring home (WIZ Particle Text, ICS WebGPU write-up, countless Canvas demos). ASH already does the reverse (`vaporizeTransition`). Assemble = home springs; emit = the same points leave along the wind.
+- **Particle → glyph is solved.** Offscreen `fillText` / path → `getImageData` → particles spring home (WIZ Particle Text, ICS WebGPU write-up, countless Canvas demos). ASH already releases sampled page particles in `settleTransition`. Assemble = home springs; emit = the same points leave along the wind.
 - **Letters are skeletons, not pictures.** Type anatomy: stems (vertical/diagonal), bars/crossbars/arms (horizontal), bowls/spines (curves). One stroke list per glyph. Flakes *land on* the skeleton. Candles *are* the stroke.
 - **Falling stuff actually looks different** because the flight regime changes, not because you write a new movie. Papers on falling plates (JFM, J. Mech.): steady / flutter / tumble / chaos. Ash *seeds* (*Fraxinus* samaras) autorotate on two axes (WJET 2017; McCutchen 1977) — a different motion from fire-ash plates. Petals flutter. Droplets are spheres (no tumble, optional splash). Sand is ballistic. That is how B/C/D differ without 26 shaders.
 - **A is a double.** Fire residue (the product) **and** the ash tree’s winged seed. Emit mode can be a still tree/crown in the middle shedding samaras; assemble mode is bone plates landing into the A. Do not pick one and forget the other.
@@ -296,7 +296,7 @@ For each stroke in the skeleton:
 
 1. Sample the path-A (later, any letter) to home points — not Georgia `fillText` if we can path it.
 2. `assemble`: particles start in the storm, advection as now, then lerp/spring to homes in the last third of the 5.6s. Last 1.2s **hold still** (motion-design rule: hold ≥ build).
-3. `emit`: homes start occupied (or a still tree/crown), then shed into the storm. This is vaporize aimed at the mark.
+3. `emit`: homes start occupied (or a still tree/crown), then shed into the storm. This is the pressure-release phase aimed at the mark.
 4. Sprite + flight regime + albedo come from the material row. Lighting stays §1.7 (plate/samara/petal get N·L; droplets use spherical fake-normal).
 
 ### What we still do not know (honest)
@@ -457,7 +457,7 @@ Avoid on phone: pie, stacked bars, 3D, 2×2/3×2 workspaces, 800 px tables.
 - **WCAG 1.4.10:** no two-axis scroll to read. Tables become cards on phone (`min-width: 800px` is a known breach).
 - Glass/blur on chrome only (NN/g 2025 Liquid Glass). Do not frost the plot.
 
-Home order: **explain → the number → one supporting chart → closest-to-fire list → the rest in Lab.**
+Home order: **now/explain → portfolio number + one supporting chart → closest-to-fire + open exits → Market / Models / Desk summaries → native evidence disclosures.** Full live tape and Markets live on Charts; full strategy analysis lives on Models; research density lives in Lab.
 
 ---
 
@@ -474,13 +474,19 @@ Home order: **explain → the number → one supporting chart → closest-to-fir
 
 ## 8. Current gaps (do not “fix” unless asked)
 
-- Most UI type is 7–9 px; Inter is named but not loaded; no `rem` / tabular nums.
-- Canvas axis labels are 8 px; `barChart` is hue-only; `drawXhair` is hover-only.
-- Tables `min-width: 800px`; 6-item nav at 7 px; explain panel (~11–16 px) is the voice to standardize on.
-- `ambientAsh` loops for the whole session with no pause control (WCAG 2.2.2 A). Intro default is `market` while identity is `white`.
-- Boot matter is candles-only; flakes are ambient, not a title option. Neither is lit. `drawBrandedA` is system Georgia, not a path mark.
-- Letter-as-material alphabet (§1.8) is researched as a system, not implemented. No 26-letter dictionary yet. SL-as-crossbar is untested.
-- Remaining unknowns are prototype questions (fps, does the A read), not more articles. Research freeze until A is drawn.
+**Title engine is shipped.** Do not rebuild `makeStorm`, path-A, lighting, or the two-axis settings. Defaults are flakes + white. Fingerprint door, idle-ash pause, and `prefers-reduced-motion` exist. Only `intro-flakes-white.webm` is in git; other costumes use the live canvas. Letter-as-material (§1.8) stays research — no 26-letter dictionary.
+
+**Desk type / phone contract is shipped.** Tokens `--t-display` … `--t-label` in rem. Floor 11px. Phone tables card-stack below 850px. Nav/buttons 44×44. Canvas labels 12px. `barChart` labels include `+`/`−`. Boot `.small` stays 8px on purpose (ceremony).
+
+**Daily-use Home and refresh lifecycle are shipped.** Home owns only the compact decision stack above. Data refresh is scoped to the active destination, prior requests are aborted on navigation, open-trade detail is conditional, and closed disclosures load their secondary evidence only when opened. Page cuts originate at the control that caused them and reduced motion swaps pages immediately.
+
+Still open, not this pass:
+
+- `drawXhair` is hover-only; 3D surface is drag-only (need a button/stepper).
+- `drawSurface` points are still hue-only for P&L.
+- Inter was dropped (never loaded). Do not add a display family.
+
+Leave cinema, ash, void `#000`, and the serif A alone. Do not start another identity research pass.
 
 ---
 
