@@ -1,6 +1,6 @@
 # Canvas drawing internals
 
-Source: `static/index.html` functions `resize`, `line`, `barChart`, `candles`, `volumes`, `spark`, `histChart`, `tradeChart`, `drawSurface`, `drawXhair`. CSS plot boxes: `.chart`, `.chartTall`, `.miniChart`, `.spark`.
+Source: `static/index.html` functions `resize`, `line`, `barChart`, `candles`, `volumes`, `spark`, `histChart`, `tradeChart`, `drawSurface`, `drawXhair`, `chartEmpty` / `startWait`. CSS plot boxes: `.chart`, `.chartTall`, `.miniChart`, `.spark`.
 
 Agents extend these. Copy the pad/scale math; do not guess.
 
@@ -26,7 +26,7 @@ If you overlay two canvases (replay price + volume), **same `upto` and same n**.
 ## `line`
 
 - Filters non-finite `pts[i][key]`.
-- Empty → grey `fillText` at (14,24).
+- Empty → `chartEmpty(c)` (flake cluster). Keep the sentence in `chartSummary`.
 - Degenerate range → `lo-=1; hi+=1`.
 - Grid: 4 horizontal strokes `#171717` from x=34 to w-8.
 - One path, `lineWidth` 1.65, default stroke `#e7e7e1`.
@@ -94,6 +94,18 @@ Richest drawer. Order of paint (back → front):
 
 When adding inspect: store `xhair`, on tap set frac, draw readout in a DOM node (time + OHLC). Do not leave the value only on the canvas.
 
+## `chartEmpty` / `startWait`
+
+Empty or in-flight plot holes. Not a spinner and not `fillText`.
+
+- `startWait(c, {busy})` paints 8 (phone) / 9–16 plates with `drawLitFlakeOn` + `ashSprites`, albedo `[230,230,224]`. Pulse is plate tumble / spec flash.
+- `busy:true` (replay SIP, Charts panes, MTF): rAF until a real drawer calls `resize()` (`stopWait` unless `c._waitPaint`).
+- Empty / no data: same cluster; tumble ≤4s then freeze. `prefers-reduced-motion` or Settings idle **pause** → still from frame 0.
+- DOM takeaway stays in `chartSummary` / readout. Canvas gets `aria-busy` only while `busy`.
+- `signedBars` empty slot: 48px `.spark` canvas, same helper.
+
+Do not invent a CSS spinner or write “Awaiting…” on the canvas.
+
 ## HTML bars (not canvas)
 
 - `setupBar(s)`: width = `s.score` 0–1; classes `hot` if fired, `armed` if ≥0.85. CSS `.setupBar` height 5px — bump toward 8–12 if touching layout.
@@ -104,4 +116,4 @@ Use these for gates and counts. They survive zoom and screen readers better than
 
 ## Empty and error
 
-All canvas drawers should `fillText` at ≥12px if there is no data. Do not leave a black rectangle. Trade board already swaps to a `.sub` string on fetch error — prefer DOM for errors.
+Empty plots use `chartEmpty` / `startWait` (flake cluster), not `fillText`. Keep the sentence in DOM (`chartSummary` / readout). Fetch errors stay DOM text (replay status, trade board `.sub`). Do not leave a silent black rectangle.

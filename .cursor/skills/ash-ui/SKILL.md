@@ -7,6 +7,8 @@ description: Dispatcher for ASH Terminal visual work. Use when restyling the das
 
 Not a restyle skill. Load the **group** skills so type, plots, color, and layout stay one system.
 
+**Title engine is shipped.** Desk type / phone contract is shipped. Do not implement a visual pass unless the user asked. Do not rebuild the intro or redo the rem scale.
+
 ## Order of operations
 
 1. Read [docs/ui-rulebook.md](../../../docs/ui-rulebook.md) — identity first (§1.1–1.8), then tokens and drawers.
@@ -16,10 +18,9 @@ Not a restyle skill. Load the **group** skills so type, plots, color, and layout
    - Any `<canvas>` or bar/pareto → [ash-charts](../ash-charts/SKILL.md) (+ [drawing.md](../ash-charts/drawing.md) before editing a drawer)
    - Palettes, `.up`/`.down`, contrast → [ash-color](../ash-color/SKILL.md)
    - Grids, nav, touch, Home structure → [ash-layout](../ash-layout/SKILL.md)
-   - Boot storm, intro matter/color, title A, orb → [ash-intro](../ash-intro/SKILL.md)
-4. If the task is “make it look right on a phone,” load identity + **all four** groups. Identity, then layout, type, charts, color.
+   - Boot storm, intro matter/color, title A, orb → [ash-intro](../ash-intro/SKILL.md) (shipped — extend, do not replace)
+4. If the task is “make it look right on a phone,” load identity + **type + layout** (then charts/color if you touch plots). Identity, then layout, type, charts, color.
 5. Reuse `resize()` and existing drawers. No new chart library.
-6. Do not implement a visual pass unless the user asked — this repo is still in a research → skills → later-implementation sequence.
 
 ## Balance checks (before finishing a UI change)
 

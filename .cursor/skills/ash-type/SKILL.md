@@ -52,8 +52,8 @@ Right-align. Fixed decimals (`money()`, `pct()`). Heavier than the label beside 
 
 | Surface | Mechanism | Trap |
 |---|---|---|
-| DOM | CSS on `.heroValue`, `.sub`, `.kpi span`, `.metric`, `table`, `.nav` | Dozens of one-off `font-size: 7px`–`9px`. Map each to a role; do not add an 8th size. |
-| Canvas | `g.font = '11px system-ui'` after `resize()` | **Ignores CSS.** `barChart`, `tradeChart` markers, `histChart` use **8px**. If you bump CSS labels to 12, bump these too or plots look like a different app. |
+| DOM | CSS roles `--t-display` … `--t-label` on `.heroValue`, `.sub`, `.kpi`, `.metric`, `table`, `.nav` | Roles are shipped. Do not add a 7–9px class. Boot `.small` is ceremony, not desk. |
+| Canvas | `g.font = '12px system-ui'` after `resize()` | **Ignores CSS.** Keep canvas labels ≥ 12px if you change CSS. |
 | Empty states | `fillText('Awaiting data', 14, 24)` | Use 12px+, `--text-mid`, Body-sized. |
 
 `resize()` maps drawing to CSS pixels. `g.font` sizes are CSS px, not device px. Good. Still set ≥12 for any label a user must read on a phone.

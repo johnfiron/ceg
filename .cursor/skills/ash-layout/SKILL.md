@@ -38,7 +38,7 @@ If a panel does not change a decision in the current `session_clock` window, it 
 
 8-point grid: 4 / 8 / 12 / 16 / 24 / 40. Panel padding 16, gap 8–12, bottom nav clearance `padding-bottom` ≥ 100px **plus** `env(safe-area-inset-bottom)`.
 
-Safe area today is only on `#bootOverlay`. Apply to `.topbar` and `.bottomNav` when touching those nodes.
+Safe area is on `#bootOverlay`, `.topbar`, `.bottomNav`, and `.app` bottom padding.
 
 ## Touch (Apple 44, Material 48, WCAG AA 24)
 
@@ -50,7 +50,7 @@ Safe area today is only on `#bootOverlay`. Apply to `.topbar` and `.bottomNav` w
 | Icon 20–24 | hit slop via padding to 44 |
 | List rows (`liveRow`, `market`) | min ~44 height |
 
-Bottom nav: already thumb-zone (good). Max 6 items; **labels ≥ 11px** (`ash-type`). Six 7px captions are not a nav.
+Bottom nav: thumb-zone, 6 items, labels at `--t-label` (11px), 44×44 hits.
 
 ## Gestures need a button
 

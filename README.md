@@ -1,48 +1,58 @@
-# ASH Terminal V7.2 — Flying Candles
+# ASH Terminal V10
 
-## Replay clarity
-The old green replay labels meant only "signal fired." V7.2 now distinguishes outcome:
+Phone-first Flask **paper** desk. One UI file (`static/index.html`) plus `app.py`. Orders stay on the Alpaca paper API. Do not point this at live.
 
-- GREEN: the strategy's underlying direction worked from 3:45 PM to the next-session open.
-- RED: the direction failed over that interval.
-- GRAY: outcome unavailable.
+Open http://127.0.0.1:8765
 
-CALL worked = next open > 3:45 underlying price.
-PUT worked = next open < 3:45 underlying price.
+## What it is
 
-This is explicitly a directional underlying proxy, not historical option P&L.
+- Session clock and plain-language explain on Home
+- Fifteen models: 3:45 overnight (CEG, VCT, XED, …) and midday sleeves (OPN, OSF, ORB, VRC, MVR)
+- Replay with directional hit rate — not historical option P&L
+- Lab: shadow book, debrief, snapshots, research metrics
+- Title door: flakes or candles × white / market / pink. Identity default is **flakes + white**. Path-drawn A is shipped; do not rebuild it.
 
-Replay now shows signal count, worked count, missed count and directional hit rate.
+## Run
 
-## Flying candlestick intro
-The storm objects are actual miniature candles with:
-- variable body width and height
-- independent upper/lower wick lengths
-- mixed bullish/bearish bodies
-- variable speed, direction and depth
-- clockwise and counter-clockwise flight
-- independent rotation / tumble
-- lift, fall, radial drift and lateral gusts
-- multi-frequency turbulence
+Copy the example config once. Leave keys empty to boot the UI. Add Alpaca paper (and optional FRED) keys when you want tape or paper orders. Never commit `config.json` or `data/`.
 
-They fly through the 2.5D storm while the camera pulls back/up into the eye.
-
-## Three intro schemes
-Settings -> Intro visual style:
-1. Green / Red Candles
-2. Classic White
-3. Pink Glitter
-
-The selection is stored locally and takes effect on the next launch.
-
-## Upgrade
 ```bash
-pkill -f "python app.py"
-cd ~/storage/downloads/CEG_V7_2_FLYING_CANDLES
+cp config.example.json config.json
+```
+
+### WSL / Linux
+
+```bash
+bash start_wsl.sh
+```
+
+`start_wsl.sh` creates `config.json` if missing and a venv at `~/.venvs/ceg` (Linux disk — not `/mnt/c`). Override with `CEG_VENV`.
+
+### Termux
+
+```bash
 bash setup_termux.sh
 bash start.sh
 ```
 
-Open http://127.0.0.1:8765
+Stop with Ctrl-C on the start script, or `kill -TERM` on the `python app.py` PID. Do not `pkill -f "python app.py"` — that can kill a Cursor agent attached to the same process name.
 
-Clear Chrome site data for 127.0.0.1 once if V7.1 remains cached.
+Dashboard on this device: http://127.0.0.1:8765  
+LAN URL is printed by the start script when a non-loopback address exists.
+
+## Replay
+
+GREEN / RED / GRAY on replay labels mean directional outcome from 3:45 to the next-session open, not “signal fired”:
+
+- CALL worked = next open > 3:45 underlying price
+- PUT worked = next open < 3:45 underlying price
+
+This is a directional underlying proxy. Replay also shows signal count, worked, missed, and hit rate.
+
+## Title settings
+
+Settings → Intro: **matter** and **color** are independent. They apply on the **next** launch. Fingerprint waits for ENTER after the A is built; AUTO is the timed door. Laptop `?record=1` can bake a denser webm into `static/` for the phone. Only `intro-flakes-white.webm` ships in git; other costumes fall back to the live canvas.
+
+## Agent notes
+
+Visual contract: `docs/ui-rulebook.md` and `.cursor/skills/ash-*`. Title engine and desk type/phone contract are shipped. Do not start another identity research pass, 26-letter alphabet, or WebGL.

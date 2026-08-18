@@ -42,7 +42,7 @@ Never assign `c.width` outside `resize`. Call `resize` at the start of every dra
 | OHLC path | **canvas** `candles` | Wick/body; ash/grey already not hue-only |
 | Volume with price | **canvas** `volumes` **under** candles, same `upto` | Shared x, separate y |
 | Thumbnail beside a price | **canvas** `spark` | Illustration only — number is the encoding |
-| Signed P&L by ≤8 short IDs | `barChart` or HTML bars | `barChart` labels are 8px and collide on phone — prefer HTML if names are long |
+| Signed P&L by ≤8 short IDs | `barChart` or HTML bars | `barChart` labels are 12px with `+`/`−`; prefer HTML if names are long |
 | This fill’s tape | **canvas** `tradeChart` | Only drawer with OR + VWAP + IN/OUT |
 | Stretch vs fire | **canvas** `histChart` | Threshold lines baked in |
 | RSI×CP×RVOL cloud | `drawSurface` | Lab/desktop; not Home |
@@ -54,7 +54,7 @@ If it can be a **sentence + one number**, do not chart it.
 | Function | Inputs | How it draws | Use | Do not use |
 |---|---|---|---|---|
 | `line(c, pts, key, color)` | array of objects, numeric `key` | min/max y, X pad 34, Y pad 11/30, 4 `#171717` grids, one stroke 1.65px `#e7e7e1` | Equity `cumPnl` | Two series, categories, OHLC |
-| `barChart(c, rows, key, label)` | rows, value key, label key | **zero at h/2**, up green `#4ee693` / down `#ff626c`, 8px labels | Strategy/ticker P&L desktop | Time, long labels, phone |
+| `barChart(c, rows, key, label)` | rows, value key, label key | **zero at h/2**, up green `#4ee693` / down `#ff626c`, 12px labels with `+`/`−` | Strategy/ticker P&L desktop | Time, long labels, phone |
 | `candles(c, arr, upto)` | `{o,h,l,c}[]`, optional end index | y from min(l) max(h), wick line + body rect, up `#dcded8` down `#72746f` | Replay, MTF, workspace | P&L, counts |
 | `volumes(c, arr, upto)` | same bars `.v` | columns from bottom, weak tint | Paired with candles | Alone |
 | `spark(c, bars)` | `.c` closes | 4px inset polyline `#73bfff` 1.2px, no grid | Live-row thumbnail | Primary chart |
@@ -62,6 +62,7 @@ If it can be a **sentence + one number**, do not chart it.
 | `tradeChart(c, pack)` | `bars` + `or_*` + `vwap_*` + indices | candles + OR dash `#73bfff` + amber cone + VWAP `#f1b94e` + IN/OUT | Open/closed trade cards | Market overview |
 | `drawSurface(points)` | `{rsi,cp,rvol,pnl}` | 3D project, drag on `pointermove` | Lab | Phone Home; claims |
 | `drawXhair(c, frac)` | 0–1 | dashed violet x at pad 38 | Linked panes **plus DOM readout** | Hover-only |
+| `chartEmpty(c, opts)` / `startWait(c,{busy})` | canvas, optional `{busy, summaryId, summary}` | 9–16 lit bone plates (`drawLitFlakeOn`, `230,230,224`). Busy = rAF until `resize()`; empty freezes at 4s | In-flight fetch or no data | Data ink, spinners, colored ash |
 
 Replay: `candles(replayChart, bars, i)` + `volumes(replayVolume, bars, i)` — **same `i`**. Workspace: `candles` + `drawXhair` on mousemove (touch still missing — add tap/step when changing this).
 

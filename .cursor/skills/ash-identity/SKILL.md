@@ -22,7 +22,7 @@ ASH is **what is left after the fire**: bone type on a true-black void, falling 
 | Live `candles` ash/grey | `#dcded8` / `#72746f` | Price is monochrome |
 | Intro palettes | `INTRO_PALETTES` | Costumes. **white** = identity; market/pink optional |
 | Tracked eyebrows | `.eyebrow`, `.brandText span` | Stamped metadata |
-| Orb + Georgia A | `.brandOrb` | Only serif |
+| Orb + path A | `.brandOrb` / `.orbA` | Only serif |
 | Amber | VWAP, armed, stale | Ember — the 3% accent |
 
 ## Steal / refuse

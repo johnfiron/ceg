@@ -17,8 +17,10 @@ MIDDAY_TICKERS=['SPY','QQQ','IWM','AAPL','MSFT','NVDA','AMD','TSLA','META','AMZN
 ALL_TICKERS=list(dict.fromkeys(TICKERS+MIDDAY_TICKERS))
 EOD_STRATEGY_IDS=['CEG','VCT','XED','LAR','RSI2','BB','MACD','DON','STO','KEL']
 MIDDAY_STRATEGY_IDS=['OPN','OSF','ORB','VRC','MVR']
+OPEN_TRADE_STATUSES=('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED')
 RUNNER_STARTED=False
 WATCHDOG_STARTED=False
+_HIST_THREAD=None
 NOTES=ROOT/'notes.md'
 BACKUP_DIR=DATA/'backups'
 app=Flask(__name__, static_folder=str(STATIC))
@@ -272,6 +274,10 @@ def cfg():
         try:return json.loads(CFG.read_text())
         except:pass
     return {}
+
+def keys_ok():
+    c=cfg()
+    return bool(c.get('alpaca_key') and c.get('alpaca_secret') and c.get('fred_key') and c.get('keys_ok'))
 
 def save_cfg(c):
     CFG.write_text(json.dumps(c,indent=2))
@@ -809,24 +815,39 @@ def opening_range(bars):
     if not or_bars:return None,None,0
     return max(float(b['h']) for b in or_bars), min(float(b['l']) for b in or_bars), sum(float(b.get('v') or 0) for b in or_bars)
 
-def ensure_daily_cache(symbols=None):
+def daily_cache_missing(symbols=None):
     symbols=symbols or ALL_TICKERS
     date=now_ny().date().isoformat()
-    if meta_get('daily_cache_'+date)=='1':return
+    con=db(); missing=[]
+    for sym in symbols:
+        n=con.execute("SELECT COUNT(*) n FROM live_bars WHERE ticker=? AND timeframe='1Day' AND trade_date<?",(sym,date)).fetchone()['n']
+        if (n or 0)<20: missing.append(sym)
+    con.close()
+    return missing
+
+def ensure_daily_cache(symbols=None):
+    if not keys_ok(): return
+    symbols=symbols or ALL_TICKERS
+    date=now_ny().date().isoformat()
+    missing=daily_cache_missing(symbols)
+    if not missing and meta_get('daily_cache_'+date)=='1': return
+    fetch_syms=missing or list(symbols)
     start=(now_ny().date()-timedelta(days=80)).isoformat()+'T00:00:00Z'
     end=now_ny().isoformat()
     try:
-        multi=fetch_bars_multi(symbols,start,end,'1Day','iex')
+        multi=fetch_bars_multi(fetch_syms,start,end,'1Day','iex')
         for sym,bars in multi.items(): upsert_live_bars(sym,'1Day',bars)
-        meta_set('daily_cache_'+date,'1')
+        if not daily_cache_missing(symbols): meta_set('daily_cache_'+date,'1')
     except Exception as e:
         event(f'Daily cache ingest: {e}','WARN')
-        for sym in symbols:
+        for sym in fetch_syms:
             try: upsert_live_bars(sym,'1Day',fetch_bars(sym,start,end,'1Day','iex'))
             except Exception as e2: event(f'Daily cache {sym}: {e2}','WARN')
+        if not daily_cache_missing(symbols): meta_set('daily_cache_'+date,'1')
 
 def ensure_minute_history(symbols=None,days=25):
     """Once per day, backfill recent 1Min history into SQLite so 15:45 RVOL does not re-download 38 days."""
+    if not keys_ok(): return {'note':'need keys'}
     symbols=symbols or ALL_TICKERS
     date=now_ny().date().isoformat()
     if meta_get('minute_hist_'+date)=='1':return {'note':'cached'}
@@ -844,9 +865,22 @@ def ensure_minute_history(symbols=None,days=25):
         event(f'Minute history ingest: {e}','WARN')
     return {'stored':stored}
 
+def kick_minute_history():
+    """Backfill 1Min history without blocking the midday scan."""
+    global _HIST_THREAD
+    date=now_ny().date().isoformat()
+    if meta_get('minute_hist_'+date)=='1': return
+    if _HIST_THREAD and _HIST_THREAD.is_alive(): return
+    def _run():
+        try: ensure_minute_history()
+        except Exception as e: event(f'Minute history: {e}','WARN')
+    _HIST_THREAD=threading.Thread(target=_run,daemon=True,name='minute-hist')
+    _HIST_THREAD.start()
+
 def ingest_live_data(symbols=None,force=False):
     """Keep a full RTH session locally. Fetch only missing completed minutes + the forming tail."""
     n=now_ny(); date=n.date().isoformat(); hm=n.strftime('%H:%M')
+    if not keys_ok(): return {'note':'need keys','date':date,'bars':0}
     if n.weekday()>=5 and not force: return {'note':'weekend','date':date,'bars':0}
     if not force and (hm<'09:25' or hm>'16:10'): return {'note':'outside rth','date':date,'bars':0}
     last=meta_get('last_ingest')
@@ -1043,10 +1077,19 @@ def build_local_live_overview(date=None,quotes=None):
                 reasons=row.get('read') or []
                 if 'halt / no prints' not in reasons: row['read']=list(reasons)+['halt / no prints']
     clock=session_clock()
+    sig_idx=today_signal_index(date); traded=today_traded_index(date)
+    for row in tickers.values():
+        s=dict(row.get('setup') or {})
+        s['why']=setup_why(row, s)
+        book=setup_book(s, row.get('sym'), sig_idx, traded)
+        s['book']=book.get('state'); s['book_label']=book.get('label')
+        s['book_status']=book.get('status'); s['skip_reason']=book.get('skip_reason')
+        row['setup']=s
     watch=sorted(tickers.values(), key=lambda x:-(x.get('setup') or {}).get('score') or 0)[:5]
     return {'asof':now_ny().isoformat(),'trade_date':date,'source':'local-sqlite','tickers':tickers,
             'live_dir':str(LIVE_DIR/date),'coverage':coverage,'session_complete_pct':coverage_avg(coverage),
-            'clock':clock,'watchlist':[{'sym':x.get('sym'),'setup':x.get('setup'),'c':x.get('c'),'ret':x.get('ret')} for x in watch]}
+            'clock':clock,'watchlist':[{'sym':x.get('sym'),'setup':x.get('setup'),'c':x.get('c'),'ret':x.get('ret'),
+                                       'read':x.get('read')} for x in watch]}
 
 def already_signaled(date,strategy_id,ticker):
     con=db(); r=con.execute("""SELECT id FROM signals WHERE trade_date=? AND strategy_id=? AND ticker=?
@@ -1059,6 +1102,117 @@ def already_traded(date,strategy_id,ticker):
                                AND IFNULL(status,'') NOT IN ('ERROR') LIMIT 1""",
                             (date,strategy_id,ticker)).fetchone(); con.close()
     return bool(r)
+
+def today_signal_index(date):
+    con=db(); rows=con.execute("""SELECT ticker,strategy_id,ts,window,direction,execution_status,note FROM signals
+                                  WHERE trade_date=? AND IFNULL(execution_status,'PENDING') NOT IN ('ERROR')
+                                  ORDER BY id DESC""",(date,)).fetchall(); con.close()
+    idx={}
+    for r in rows:
+        key=(r['strategy_id'], r['ticker'])
+        if key not in idx: idx[key]=dict(r)
+    return idx
+
+def today_traded_index(date):
+    con=db(); rows=con.execute("""SELECT DISTINCT strategy_id,ticker FROM trades
+                                  WHERE trade_date=? AND IFNULL(status,'') NOT IN ('ERROR')""",(date,)).fetchall(); con.close()
+    return {(r['strategy_id'], r['ticker']) for r in rows}
+
+def setup_why(row, setup):
+    """One English tape line for the active sleeve. Prefer reclaim/stretch tags over generic volume."""
+    read=list(row.get('read') or [])
+    win=(setup or {}).get('window'); side=(setup or {}).get('side')
+    prefer=[]
+    if win=='VRC':
+        prefer=['lost VWAP from above'] if side=='PUT' else (['VWAP reclaim from below'] if side=='CALL' else ['lost VWAP from above','VWAP reclaim from below'])
+    elif win=='MVR':
+        prefer=['stretched ','5m RSI oversold','5m RSI overbought']
+    elif win=='ORB':
+        prefer=['above opening range','below opening range']
+    elif win=='OPN':
+        prefer=['gap-up still holding','gap-down still holding']
+    elif win=='OSF':
+        prefer=['already given back']
+    for tag in read:
+        for p in prefer:
+            if tag==p or (p.endswith(' ') and tag.startswith(p.strip())) or (p in tag):
+                return tag
+    skip={'inside opening range','normal/light volume','elevated volume'}
+    for tag in read:
+        if tag in skip or str(tag).startswith('gap '): continue
+        return tag
+    bn=(setup or {}).get('bottleneck_en') or (setup or {}).get('bottleneck')
+    if bn and bn not in ('FIRED','this setup is at the fire line'): return bn
+    return None
+
+def setup_book(setup, ticker, sig_idx, traded):
+    """Tape armed ≠ order. Label what the sender already did today for this sleeve/name."""
+    sid=(setup or {}).get('window')
+    empty={'state':'none','label':None,'status':None,'skip_reason':None}
+    if not sid or not ticker: return empty
+    sig=(sig_idx or {}).get((sid, ticker))
+    if sig:
+        st=sig.get('execution_status') or ''
+        skip=None
+        try: skip=(json.loads(sig.get('note') or '{}') or {}).get('skip_reason')
+        except Exception: skip=None
+        hm=None
+        if sig.get('window') and len(str(sig.get('window')))==5 and str(sig.get('window'))[2]==':':
+            hm=str(sig.get('window'))
+        else:
+            dt=parse_ny(sig.get('ts'))
+            if dt: hm=dt.strftime('%H:%M')
+        if st in ('ENTRY_SUBMITTED','OPEN','CLOSED','EXIT_SUBMITTED','SIGNAL_ONLY'):
+            other=bool(setup.get('side') and sig.get('direction') and sig.get('direction')!=setup.get('side'))
+            if other:
+                return {'state':'held','label':'no order · already traded today','status':st,'skip_reason':None}
+            return {'state':'sent','label':(f'sent {hm}' if hm else 'sent'),'status':st,'skip_reason':None}
+        if str(st).startswith('SKIP_'):
+            if st=='SKIP_DAILY_CAP':
+                label=f'no order · {sid} {skip}' if skip else f'no order · {sid} daily cap'
+            elif st=='SKIP_CLUSTER':
+                label=f'no order · {skip}' if skip else 'no order · cluster'
+            elif st=='SKIP_OPPOSITE':
+                label=f'no order · {skip}' if skip else 'no order · open opposite'
+            else:
+                label=f'no order · {skip}' if skip else f'no order · {st}'
+            return {'state':'blocked','label':label,'status':st,'skip_reason':skip}
+        return {'state':'signaled','label':st,'status':st,'skip_reason':skip}
+    if traded and (sid, ticker) in traded:
+        return {'state':'held','label':'no order · already traded today','status':None,'skip_reason':None}
+    if (setup or {}).get('fired'):
+        return {'state':'armed','label':'armed · waiting on sender','status':None,'skip_reason':None}
+    return {'state':'watch','label':None,'status':None,'skip_reason':None}
+
+def open_opposite(ticker, direction):
+    """Direction of an OPEN row on this ticker if it is the other side. Else None."""
+    if not ticker or not direction: return None
+    con=db(); rows=con.execute("SELECT direction FROM trades WHERE ticker=? AND status IN ('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED')",(ticker,)).fetchall(); con.close()
+    for r in rows:
+        d=r['direction']
+        if d and d!=direction: return d
+    return None
+
+def rank_signals(signals):
+    return sorted(list(signals or []), key=lambda s: (-float(s.get('score') or 0), s.get('strategy_id') or '', s.get('ticker') or ''))
+
+def attach_broker_mark(d, pos=None):
+    """Live mark only on open rows. Closed rows keep stored pnl — never inherit another ticket's contract."""
+    d=dict(d); st=d.get('status')
+    if st in OPEN_TRADE_STATUSES:
+        p=(pos or {}).get(d.get('option_symbol') or '') if pos else None
+        if p:
+            try: d['mark']=float(p.get('current_price') or 0)
+            except Exception: pass
+            try: d['unrealized_pl']=float(p.get('unrealized_pl') or 0)
+            except Exception: pass
+            try: d['unrealized_plpc']=float(p.get('unrealized_plpc') or 0)
+            except Exception: pass
+    elif st=='CLOSED':
+        d['mark']=d.get('exit_fill')
+        d['unrealized_pl']=d.get('pnl')
+        d['unrealized_plpc']=None
+    return d
 
 def fredj(path,p):
     c=cfg(); key=c.get('fred_key')
@@ -1480,23 +1634,34 @@ def bar_integrity(date=None):
     return out
 
 def mae_mfe_from_tape(tr):
+    """Underlying MAE/MFE from bar high/low vs atm_spot (not close-to-close)."""
     date=tr.get('trade_date') or now_ny().date().isoformat()
     bars=rth_bars(load_local_bars(tr.get('ticker'),date,'1Min'))
     start=parse_ny(tr.get('entry_filled_at') or tr.get('signal_ts'))
     end=parse_ny(tr.get('exit_filled_at')) or now_ny()
     if not start or not bars: return None, None
-    path=[]
+    entry=None
+    try:
+        if tr.get('atm_spot') not in (None,''): entry=float(tr['atm_spot'])
+    except Exception: entry=None
+    hi=None; lo=None
     for b in bars:
         dt=parse_ny(b.get('t'))
         if not dt or dt<start: continue
         if dt>end: break
-        path.append(float(b['c']))
-    if len(path)<2: return None, None
-    entry=path[0]; mae=0.0; mfe=0.0
-    for px in path:
-        move=(px-entry)/entry
-        if tr.get('direction')=='PUT': move=-move
-        mae=min(mae,move); mfe=max(mfe,move)
+        try:
+            h=float(b['h']); l=float(b['l']); c=float(b['c'])
+        except Exception: continue
+        if entry is None: entry=c
+        hi=h if hi is None else max(hi,h)
+        lo=l if lo is None else min(lo,l)
+    if entry in (None,0) or hi is None or lo is None: return None, None
+    if tr.get('direction')=='PUT':
+        mae=min(0.0,(entry-hi)/entry)
+        mfe=max(0.0,(entry-lo)/entry)
+    else:
+        mae=min(0.0,(lo-entry)/entry)
+        mfe=max(0.0,(hi-entry)/entry)
     return round(mae,5), round(mfe,5)
 
 def fill_quality(tr):
@@ -1665,9 +1830,11 @@ def refresh_excursions_and_stops():
                 except Exception as e:
                     event(f'Scale-out {tr["id"]}: {e}','WARN')
             else:
-                note=(tr.get('comment') or '')
-                if 'would scale' not in note:
-                    con=db(); con.execute("UPDATE trades SET comment=? WHERE id=?",((note+' | would scale at +0.4% (qty=1)').strip(' |'),tr['id'])); con.commit(); con.close()
+                try:
+                    submit_exit(tr, 'SCALE')
+                    continue
+                except Exception as e:
+                    event(f'Scale-out {tr["id"]}: {e}','WARN')
         entry=parse_ny(tr.get('entry_filled_at') or tr.get('signal_ts'))
         held=None if not entry else (now_ny()-entry).total_seconds()/60.0
         sid=tr.get('strategy_id'); horizon=tr.get('horizon') or 'OVERNIGHT'
@@ -1755,6 +1922,11 @@ def submit_entry(sig,states):
     qty, kelly_note = kelly_qty(sid, int(c.get('contracts_per_trade',1)))
     con=db(); dupe=con.execute("SELECT id FROM trades WHERE strategy_id=? AND ticker=? AND status IN ('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED') LIMIT 1",(sid,ticker)).fetchone(); con.close()
     if dupe:return 'SKIP_OPEN_TRADE',None
+    opp=open_opposite(ticker, direction)
+    if opp:
+        extra={'skip_reason':f'open opposite {opp} on {ticker}','ab_book':book}
+        event(f'{sid} skip opposite {ticker}','WARN')
+        log_shadow(sig,'SKIP_OPPOSITE',extra); return 'SKIP_OPPOSITE',extra
     fires=daily_fire_count(sid,date)
     if fires>=th['max_daily_fires']:
         extra={'skip_reason':f'daily cap {fires}/{th["max_daily_fires"]}','ab_book':book}; event(f'{sid} skip daily cap {ticker}','WARN')
@@ -1941,7 +2113,7 @@ def evaluate_and_trade(force_preview=False):
     con=db()
     for s in signals:con.execute('INSERT INTO signals(ts,trade_date,strategy_id,ticker,direction,score,details,execution_status,window,horizon) VALUES(?,?,?,?,?,?,?,?,?,?)',(now_ny().isoformat(),date,s['strategy_id'],s['ticker'],s['direction'],s['score'],json.dumps(s['details']),'PENDING',s.get('window','15:45'),s.get('horizon','OVERNIGHT')))
     con.commit(); con.close()
-    for s in signals:
+    for s in rank_signals(signals):
         try:
             status,extra=submit_entry(s,states); con=db(); con.execute('''UPDATE signals SET execution_status=?,note=? WHERE id=(SELECT id FROM signals WHERE trade_date=? AND strategy_id=? AND ticker=? ORDER BY id DESC LIMIT 1)''',(status,json.dumps(extra or {}),date,s['strategy_id'],s['ticker'])); con.commit(); con.close(); event(f"{s['strategy_id']} {s['ticker']} {s['direction']} -> {status}")
         except Exception as e:event(f"{s['strategy_id']} {s['ticker']} entry error: {e}",'ERROR')
@@ -1972,7 +2144,7 @@ def evaluate_midday(which='BOTH', force_preview=False):
     compact={k:compact_state(v) for k,v in states.items()}
     if force_preview: return {'signals':signals,'evals':evals,'context':context,'states':compact}
     fired=[]
-    for s in signals:
+    for s in rank_signals(signals):
         if already_signaled(date,s['strategy_id'],s['ticker']): continue
         con=db(); con.execute('INSERT INTO signals(ts,trade_date,strategy_id,ticker,direction,score,details,execution_status,window,horizon) VALUES(?,?,?,?,?,?,?,?,?,?)',
                               (now_ny().isoformat(),date,s['strategy_id'],s['ticker'],s['direction'],s['score'],json.dumps(s.get('details') or {},default=str),'PENDING',s.get('window'),s.get('horizon','EOD'))); con.commit(); con.close()
@@ -2004,12 +2176,25 @@ def runner_loop():
         try:
             n=now_ny(); hm=n.strftime('%H:%M'); date=n.date().isoformat()
             meta_set('heartbeat',n.isoformat()); meta_set('runner_pid',str(os.getpid()))
+            if not keys_ok():
+                time.sleep(30); continue
             reconcile(); submit_due_exits()
             try: refresh_excursions_and_stops()
             except Exception as e: event(f'Manage open: {e}','WARN')
             if n.weekday()<5 and '09:25'<=hm<='16:10':
                 try: ingest_live_data()
                 except Exception as e: event(f'Live ingest: {e}','WARN')
+                try: ensure_daily_cache()
+                except Exception as e: event(f'Daily cache retry: {e}','WARN')
+                if hm<'09:35' or hm>='16:05':
+                    if meta_get('minute_hist_'+date)!='1':
+                        try: ensure_minute_history()
+                        except Exception as e: event(f'Minute history: {e}','WARN')
+                else:
+                    kick_minute_history()
+            elif n.weekday()<5 and hm<'09:35':
+                try: ensure_daily_cache()
+                except Exception as e: event(f'Daily cache retry: {e}','WARN')
                 if meta_get('minute_hist_'+date)!='1':
                     try: ensure_minute_history()
                     except Exception as e: event(f'Minute history: {e}','WARN')
@@ -2149,7 +2334,7 @@ def status():
         try: stale=(now_ny()-datetime.fromisoformat(ing)).total_seconds()
         except Exception: stale=None
     return jsonify({
-        'configured':bool(c.get('alpaca_key') and c.get('alpaca_secret') and c.get('fred_key')),
+        'configured':keys_ok(),
         'paper_only':True,'broker_orders_enabled':c.get('broker_orders_enabled',True),
         'heartbeat':meta_get('heartbeat'),'last_eval':meta_get('last_eval'),
         'last_ingest':ing,'last_ingest_source':meta_get('last_ingest_source'),
@@ -2174,7 +2359,10 @@ def setconfig():
     for k in ('alpaca_key','alpaca_secret','fred_key','fomc_dates','ntfy_url','earnings_dates'):
         if k in d:c[k]=d[k]
     if 'allow_lan_orders' in d: c['allow_lan_orders']=bool(d['allow_lan_orders'])
-    c['broker_orders_enabled']=bool(d.get('broker_orders_enabled', c.get('broker_orders_enabled',True))); c['contracts_per_trade']=max(1,min(5,int(d.get('contracts_per_trade',c.get('contracts_per_trade',1))))); save_cfg(c); return jsonify({'ok':True})
+    c['broker_orders_enabled']=bool(d.get('broker_orders_enabled', c.get('broker_orders_enabled',True))); c['contracts_per_trade']=max(1,min(5,int(d.get('contracts_per_trade',c.get('contracts_per_trade',1)))));
+    if any(k in d for k in ('alpaca_key','alpaca_secret','fred_key')):
+        c['keys_ok']=False
+    save_cfg(c); return jsonify({'ok':True})
 @app.post('/api/test')
 def test():
     out={'alpaca':False,'fred':False,'paper_account':False,'errors':[]}
@@ -2184,6 +2372,8 @@ def test():
     except Exception as e:out['errors'].append('Paper account: '+str(e))
     try:out['fred']=latest_vix()[1] is not None
     except Exception as e:out['errors'].append('FRED: '+str(e))
+    c=cfg(); c['keys_ok']=bool(out['alpaca'] and out['paper_account'] and out['fred']); save_cfg(c)
+    out['ok']=c['keys_ok']
     return jsonify(out)
 
 def broker_account():
@@ -2291,18 +2481,23 @@ def dashboard():
         ticker_stats[tk]={"closed":len(rr),"pnl":sum(pp),"wins":sum(1 for p in pp if p>0),
                           "winRate":sum(1 for p in pp if p>0)/len(pp) if pp else None}
 
+    today=now_ny().date().isoformat()
+    closed_today=[t for t in closed if (t.get('trade_date') or '')==today]
+    realized_today=sum(float(t.get('pnl') or 0) for t in closed_today)
     payload={
         "strategies":list(strat.values()),
         "curve":curve,
         "dailyPnl":[{"date":k,"pnl":v} for k,v in sorted(daily.items())],
         "tickerStats":ticker_stats,
-        "openTrades":[t for t in trades if t.get("status") in ("ENTRY_SUBMITTED","OPEN","EXIT_SUBMITTED")],
+        "openTrades":[t for t in trades if t.get("status") in OPEN_TRADE_STATUSES],
         "recentEvents":ev,
         "totals":{
             "signals":len(sigs),"trades":len(trades),"closed":len(closed),
-            "open":sum(1 for t in trades if t.get("status") in ("ENTRY_SUBMITTED","OPEN","EXIT_SUBMITTED")),
+            "open":sum(1 for t in trades if t.get("status") in OPEN_TRADE_STATUSES),
             "wins":sum(1 for t in closed if float(t.get("pnl") or 0)>0),
-            "realizedPnl":sum(float(t.get("pnl") or 0) for t in closed)
+            "realizedPnl":sum(float(t.get("pnl") or 0) for t in closed),
+            "realizedToday":realized_today,
+            "sessionDate":today,
         }
     }
     mem_set('ui:dash',payload)
@@ -2728,14 +2923,7 @@ def trades():
     except Exception: pass
     out=[]
     for r in rows:
-        d=dict(r); p=pos.get(d.get('option_symbol') or '')
-        if p:
-            d['mark']=float(p.get('current_price') or 0)
-            d['unrealized_pl']=float(p.get('unrealized_pl') or 0)
-            d['unrealized_plpc']=float(p.get('unrealized_plpc') or 0)
-        elif d.get('status')=='CLOSED':
-            d['mark']=d.get('exit_fill'); d['unrealized_pl']=d.get('pnl')
-        out.append(d)
+        out.append(attach_broker_mark(dict(r), pos))
     return jsonify({'trades':out})
 
 def build_trade_pack(tr, pos=None):
@@ -2771,15 +2959,8 @@ def build_trade_pack(tr, pos=None):
     ei,xi=idx(entry_dt),idx(exit_dt)
     entry_px=bars[ei]['c'] if ei is not None else None
     last=bars[-1] if bars else None
-    mark=None; upl=None
-    p=(pos or {}).get(tr.get('option_symbol') or '')
-    if p:
-        try: mark=float(p.get('current_price') or 0)
-        except Exception: mark=None
-        try: upl=float(p.get('unrealized_pl') or 0)
-        except Exception: upl=None
-    elif tr.get('status')=='CLOSED':
-        mark=tr.get('exit_fill'); upl=tr.get('pnl')
+    marked=attach_broker_mark(tr, pos)
+    mark=marked.get('mark'); upl=marked.get('unrealized_pl')
     und_ret=None
     if entry_px and last and entry_px:
         und_ret=last['c']/entry_px-1
