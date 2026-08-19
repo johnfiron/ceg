@@ -23,6 +23,22 @@ def _seed_legacy_development_db():
     if legacy.resolve()==DB.resolve(): return
     shutil.copy2(legacy, DB)
 _seed_legacy_development_db()
+_SPLIT_LEDGER_LOGGED=False
+def _log_split_development_ledger():
+    """Do not merge. Say when yesterday's book is sitting next to the live development file."""
+    global _SPLIT_LEDGER_LOGGED
+    if _SPLIT_LEDGER_LOGGED or ENVIRONMENT!='development': return
+    if os.environ.get('CEG_DB_PATH'): return
+    legacy=ROOT/'data'/'arena.db'
+    if not legacy.exists() or not DB.exists(): return
+    if legacy.resolve()==DB.resolve(): return
+    def _n(path):
+        try:
+            con=sqlite3.connect(path); n=con.execute('SELECT COUNT(*) FROM trades').fetchone()[0]; con.close(); return n
+        except Exception:
+            return None
+    _SPLIT_LEDGER_LOGGED=True
+    event(f'Development ledger {DB} ({_n(DB)} trades); unused legacy {legacy} ({_n(legacy)} trades)')
 NY=ZoneInfo('America/New_York')
 PAPER='https://paper-api.alpaca.markets/v2'
 MD='https://data.alpaca.markets'
@@ -587,6 +603,7 @@ def init_db():
     con.execute('CREATE INDEX IF NOT EXISTS idx_account_snapshots_ts ON account_snapshots(ts)')
     con.execute('CREATE INDEX IF NOT EXISTS idx_trades_dates ON trades(trade_date, status, exit_filled_at)')
     con.commit(); con.close()
+    _log_split_development_ledger()
 
 def event(msg,level='INFO'):
     try:
@@ -1771,13 +1788,17 @@ def kelly_qty(sid, base=1):
     return qty, f'half-Kelly {half:.3f} wr={wr:.2f} b={b:.2f}'
 
 def pdt_block(horizon):
-    try: a=broker_account()
-    except Exception: return None
+    if horizon!='EOD':
+        return None
+    try:
+        a=broker_account()
+    except Exception:
+        return 'PDT risk account unread'
     eq=float(a.get('equity') or a.get('portfolio_value') or 0)
     dtc=int(float(a.get('daytrade_count') or 0))
     pdt=bool(a.get('pattern_day_trader'))
-    if horizon=='EOD' and not pdt and eq<25000 and dtc>=3:
-        return f'PDT risk daytrade_count={dtc} equity={eq:.0f}'
+    if eq<25000 and (pdt or dtc>=3):
+        return f'PDT risk daytrade_count={dtc} equity={eq:.0f} flagged={int(pdt)}'
     return None
 
 def bp_block(ask, qty):
@@ -2067,9 +2088,10 @@ def option_contract(ticker,direction,spot,allow_0dte=False,style=None):
     if dte=='0dte':
         td=today.isoformat()
         if now_ny().strftime('%H:%M')>='15:50': td=next_trading_date(td)
+        end=td
     else:
         td=next_trading_date(today.isoformat())
-    end=(datetime.strptime(td,'%Y-%m-%d').date()+timedelta(days=7)).isoformat()
+        end=(datetime.strptime(td,'%Y-%m-%d').date()+timedelta(days=7)).isoformat()
     if moneyness=='atm': target=spot
     elif moneyness=='itm1': target=spot*.99 if direction=='CALL' else spot*1.01
     else: target=spot*1.01 if direction=='CALL' else spot*.99
@@ -2078,14 +2100,19 @@ def option_contract(ticker,direction,spot,allow_0dte=False,style=None):
     p={'underlying_symbols':ticker,'status':'active','expiration_date_gte':td,'expiration_date_lte':end,'type':typ,
        'strike_price_gte':f'{spot*(1-band):.2f}','strike_price_lte':f'{spot*(1+band):.2f}','limit':1000}
     j=getj(paper_api_url('/options/contracts'),ah(),p); arr=j.get('option_contracts') or j.get('contracts') or []
-    if not arr and dte=='0dte':
-        td=next_trading_date(today.isoformat()); end=(datetime.strptime(td,'%Y-%m-%d').date()+timedelta(days=7)).isoformat()
-        p['expiration_date_gte']=td; p['expiration_date_lte']=end
-        j=getj(paper_api_url('/options/contracts'),ah(),p); arr=j.get('option_contracts') or j.get('contracts') or []
-        style['dte']='next-fallback'
-    if not arr:raise RuntimeError(f'No active {typ} contracts returned for {ticker}')
-    arr=sorted(arr,key=lambda x:(x.get('expiration_date','9999'),abs(float(x.get('strike_price',0))-target)))
+    arr=[c for c in arr if isinstance(c,dict) and (c.get('expiration_date') or '')[:10]==td] if dte=='0dte' else list(arr or [])
+    if not arr:
+        if dte=='0dte':
+            raise RuntimeError(f'No same-day {typ} contract for {ticker} exp {td}')
+        raise RuntimeError(f'No active {typ} contracts returned for {ticker}')
+    if dte=='0dte':
+        arr=sorted(arr,key=lambda x:abs(float(x.get('strike_price',0))-target))
+    else:
+        arr=sorted(arr,key=lambda x:(x.get('expiration_date','9999'),abs(float(x.get('strike_price',0))-target)))
     c=arr[0]
+    exp=(c.get('expiration_date') or '')[:10]
+    if dte=='0dte' and exp!=td:
+        raise RuntimeError(f'same-day contract expiry {exp} != {td}')
     reason=f"{style.get('dte',dte)} {moneyness} target {target:.2f} vs spot {spot:.2f}"
     return c['symbol'],c.get('expiration_date'),float(c.get('strike_price')),reason,style
 
@@ -2129,7 +2156,12 @@ def submit_entry(sig,states):
     coverage=session_coverage(ALL_TICKERS,date)
     st=states[ticker]
     dnt=do_not_trade_reasons(st, st.get('quote'))
-    option,expiry,strike,reason,style=option_contract(ticker,direction,spot,allow_0dte=(horizon=='EOD'),style=style)
+    try:
+        option,expiry,strike,reason,style=option_contract(ticker,direction,spot,allow_0dte=(horizon=='EOD'),style=style)
+    except RuntimeError as e:
+        status='SKIP_NO_0DTE' if horizon=='EOD' else 'SKIP_NO_CONTRACT'
+        extra={'skip_reason':str(e),'ab_book':book}
+        log_shadow(sig,status,extra); return status,extra
     q=option_quote(option)
     quality=contract_quality(spot,strike,expiry,direction,q,style)
     mid=None
@@ -2603,10 +2635,7 @@ def _guest_lan():
     if request.method in ('GET','HEAD','OPTIONS'): return
     if not request.path.startswith('/api/'): return
     if orders_allowed(): return
-    blocked=('/api/config','/api/reconcile','/api/thresholds','/api/backup','/api/restore','/api/trades','/api/preview')
-    if any(request.path==p or request.path.startswith(p+'/') for p in blocked):
-        return jsonify({'error':'guest LAN is read-only; paper orders stay on this device','guest':True}),403
-    return
+    return jsonify({'error':'guest LAN is read-only; paper orders stay on this device','guest':True}),403
 @app.get('/manifest.webmanifest')
 def manifest():return send_from_directory(STATIC,'manifest.webmanifest')
 @app.get('/sw.js')
@@ -3705,5 +3734,6 @@ def journal_day():
 
 init_db()
 if __name__=='__main__':
-    event('ASH Terminal web: http://0.0.0.0:8765')
-    app.run(host='0.0.0.0',port=8765,debug=False,threaded=True)
+    bind=(os.environ.get('CEG_BIND') or '0.0.0.0').strip() or '0.0.0.0'
+    event(f'ASH Terminal web: http://{bind}:8765')
+    app.run(host=bind,port=8765,debug=False,threaded=True)
