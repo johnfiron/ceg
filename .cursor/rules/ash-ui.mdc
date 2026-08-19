@@ -17,3 +17,4 @@ Visual work is gated by the rulebook, not by taste.
 3. Reuse `resize()` and existing drawers in `static/index.html`. Do not add Chart.js/D3 for a panel.
 4. Nothing readable below 11 px. Touch 44×44. Color is never the only cue.
 5. Do not implement a visual restyle unless the user asked. Title engine and desk type/phone contract are shipped.
+6. Session, runner, orders, PDT, 0DTE, or Activity ledger → `.cursor/rules/ash-desk.mdc` and `.cursor/skills/ash-desk/SKILL.md`.

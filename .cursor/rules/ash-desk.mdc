@@ -1,0 +1,16 @@
+---
+description: ASH paper desk — two processes, Activity is the book, 0DTE/PDT fail closed. Load ash-desk for session start, runner, reconcile, or order gates.
+alwaysApply: true
+---
+
+# ASH desk
+
+Paper session ops, not look. Visual work still goes through ash-ui. Do not restyle.
+
+1. Paper only. Never point `PAPER` at live Alpaca. Orders need config `broker_orders_enabled: true` **and** `CEG_ALLOW_BROKER_ORDERS=true`.
+2. Web and runner are **separate** processes. Importing `app.py` does not scan. Do not `pkill -f "python app.py"`.
+3. **Activity is the book.** Do not rebuild OPEN rows from historical Alpaca buys. Recover a fill only if the broker still holds it.
+4. Development SQLite is `data/development/arena.db`. `data/arena.db` is unused legacy. Do not start against an empty development file when the legacy book exists.
+5. Same-day 0DTE must stay same-day; no next-expiry fallback. PDT blocks EOD under $25k if flagged or daytrade count ≥ 3, or if the account cannot be read.
+6. Do not bounce the runner in a live window (OPN/OSF/ORB/VRC/MVR/15:45) unless the user asked.
+7. For session start, restart, reconcile, PDT, 0DTE, or guest LAN: load `.cursor/skills/ash-desk/SKILL.md`.
