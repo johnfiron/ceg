@@ -247,6 +247,17 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(payload['curve'][0]['date'],'2026-08-19')
         self.assertEqual(payload['totals']['realizedToday'],25.0)
 
+    def test_dashboard_books_unordered_expiry_on_economic_expiry_date(self):
+        self._wipe_trades(); app._MEM_CACHE.clear()
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,status,pnl,trade_date,expiry,exit_filled_at,exit_kind)
+                       VALUES('MVR','IWM','CLOSED',-2,'2026-08-17','2026-08-17','2026-08-18T13:35:00Z','EXPIRED')""")
+        con.commit(); con.close()
+        with mock.patch.object(app,'compute_research_metrics',return_value={'strategies':[]}):
+            payload=app.dashboard_payload()
+        self.assertEqual(payload['dailyPnl'],[{'date':'2026-08-17','pnl':-2.0}])
+        self.assertEqual(payload['curve'][0]['date'],'2026-08-17')
+
     def test_model_drift_forward_n_excludes_open_and_unknown_pnl(self):
         self._wipe_trades()
         con=app.db()
