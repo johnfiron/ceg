@@ -171,6 +171,42 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(got.get('source'),'snapshot')
         self.assertEqual(got.get('equity'),100000)
 
+    def test_option_contract_refuses_next_day_as_0dte(self):
+        frozen=app.datetime(2026,8,19,11,0,tzinfo=app.NY)
+        nxt=app.next_trading_date('2026-08-19')
+        payload={'option_contracts':[{
+            'symbol':'META260820C00500000','expiration_date':nxt,'strike_price':'100',
+        }]}
+        with mock.patch.object(app,'now_ny',return_value=frozen), \
+             mock.patch.object(app,'getj',return_value=payload) as gj, \
+             mock.patch.object(app,'ah',return_value={}):
+            with self.assertRaisesRegex(RuntimeError,'same-day'):
+                app.option_contract('META','CALL',100,allow_0dte=True,style={'dte':'0dte','moneyness':'atm'})
+        self.assertEqual(gj.call_count,1)
+        self.assertEqual(gj.call_args[0][0], app.paper_api_url('/options/contracts'))
+        params=gj.call_args[0][2]
+        self.assertEqual(params['expiration_date_gte'],'2026-08-19')
+        self.assertEqual(params['expiration_date_lte'],'2026-08-19')
+
+    def test_pdt_blocks_flagged_eod_under_25k_not_overnight(self):
+        acct={'equity':10000,'daytrade_count':0,'pattern_day_trader':True}
+        with mock.patch.object(app,'broker_account',return_value=acct):
+            self.assertIn('PDT', app.pdt_block('EOD'))
+            self.assertIsNone(app.pdt_block('OVERNIGHT'))
+
+    def test_pdt_blocks_eod_when_account_unread(self):
+        with mock.patch.object(app,'broker_account',side_effect=RuntimeError('down')):
+            self.assertIn('unread', app.pdt_block('EOD'))
+            self.assertIsNone(app.pdt_block('OVERNIGHT'))
+
+    def test_guest_lan_cannot_post_intro_save(self):
+        response=app.app.test_client().post(
+            '/api/intro-save?name=intro-flakes-white.webm',
+            data=b'not-a-video',
+            environ_base={'REMOTE_ADDR':'10.8.0.9'})
+        self.assertEqual(response.status_code,403)
+        self.assertTrue((response.get_json() or {}).get('guest'))
+
 
 if __name__=='__main__':
     unittest.main()
