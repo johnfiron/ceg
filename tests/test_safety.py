@@ -87,13 +87,15 @@ class SafetyTests(unittest.TestCase):
         con=app.db(); con.execute('DELETE FROM trades'); con.commit(); con.close()
 
     def _run_startup(self, orders, positions):
+        frozen=app.datetime(2026,8,19,16,30,tzinfo=app.NY)
         def fake_getj(url, headers=None, params=None, timeout=30):
             if str(url).rstrip('/').endswith('/positions'):
                 return positions
             if '/orders' in str(url):
                 return orders
             return {}
-        with mock.patch.object(app,'getj',side_effect=fake_getj), \
+        with mock.patch.object(app,'now_ny',return_value=frozen), \
+             mock.patch.object(app,'getj',side_effect=fake_getj), \
              mock.patch.object(app,'ah',return_value={}), \
              mock.patch.object(app,'reconcile'):
             return app.startup_reconcile()

@@ -2444,7 +2444,8 @@ def _option_is_worthless(tr, n=None):
     horizon=tr.get('horizon') or 'OVERNIGHT'
     after_close=n.weekday()>=5 or hm>='16:00'
     if exp and exp<today: return True
-    if horizon=='EOD' and after_close: return True
+    if exp==today and after_close: return True
+    if not exp and horizon=='EOD' and after_close: return True
     return False
 
 def _expire_trade(tr, note='expired / no quote after close'):
@@ -2678,7 +2679,6 @@ def startup_reconcile():
                                'recovered by startup reconciliation',horizon,sid if horizon=='EOD' else '15:45'))
         con.commit(); con.close(); recovered+=1
         event(f'Recovered broker order {cid} into the local trade ledger','WARN')
-    expire_dead_options()
     today=now_ny().date().isoformat()
     con=db(); local_open=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()]; con.close()
     missing=[]
@@ -2695,6 +2695,7 @@ def startup_reconcile():
             _expire_trade(tr, 'broker flat after Activity still OPEN')
             continue
         missing.append(str(tr['id']))
+    expire_dead_options(held)
     if missing:
         event('Startup reconciliation: local OPEN trades absent from Alpaca positions: '+','.join(missing),'ERROR')
         raise RuntimeError('startup reconciliation found missing broker positions for local trades: '+','.join(missing))
@@ -2704,10 +2705,13 @@ def startup_reconcile():
     event(f'Startup reconciliation complete: {len(orders)} orders checked, {recovered} recovered, {skipped_flat} filled buys ignored (broker already flat)')
     return True
 
-def expire_dead_options():
+def expire_dead_options(held=None):
     """0DTE still OPEN after the close is worthless — do not keep sending market sells."""
+    held=set(held or ())
     con=db(); rows=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()]; con.close()
     for tr in rows:
+        if tr.get('option_symbol') in held:
+            continue
         if _option_is_worthless(tr):
             _expire_trade(tr)
 
