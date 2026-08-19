@@ -13,4 +13,5 @@ Paper session ops, not look. Visual work still goes through ash-ui. Do not resty
 4. Development SQLite is `data/development/arena.db`. `data/arena.db` is unused legacy. Do not start against an empty development file when the legacy book exists.
 5. Same-day 0DTE must stay same-day; no next-expiry fallback. PDT blocks EOD under $25k if flagged or daytrade count ≥ 3, or if the account cannot be read.
 6. Do not bounce the runner in a live window (OPN/OSF/ORB/VRC/MVR/15:45) unless the user asked.
-7. For session start, restart, reconcile, PDT, 0DTE, or guest LAN: load `.cursor/skills/ash-desk/SKILL.md`.
+7. Strategy/algorithm edits (`STRATEGIES`, `strategy_signals`, `midday_signals`, `option_contract`, `submit_entry`, `thresh`, `pdt_block`, `runner.py`) may be committed on `dev` anytime. Do not push or merge to `main`, and do not ask production to pick up `origin/main`, on a weekday 09:25–16:10 America/New_York. Promote after 16:10 (runner already waits until 16:15).
+8. For session start, restart, reconcile, PDT, 0DTE, or guest LAN: load `.cursor/skills/ash-desk/SKILL.md`.

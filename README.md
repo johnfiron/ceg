@@ -90,7 +90,7 @@ sudo journalctl -u ash-runner -u ash-web -f
 immutable release directory, dependencies and safety tests run, and only then is
 `/opt/ash/current` switched and the services restarted. Failed tests leave the
 previous release running. Development happens on `dev`; promote only a tested
-commit to `main`.
+commit to `main`. Weekday promote to `main` after 16:10 ET.
 
 `ash-backup.timer` creates a consistent SQLite backup daily and retains 14.
 Deployment keeps the newest three immutable releases. Journald is capped at

@@ -58,3 +58,11 @@ python -m unittest tests.test_safety -v
 ## After the close
 
 Rename leftover `data/arena.db` (e.g. `data/arena.legacy-YYYYMMDD.db`). Do not delete it. Do not merge ledgers while RTH is open.
+
+## Promote to main
+
+`dev` is daytime work. `main` is after-hours promote only.
+
+- After 16:10 ET: merge/push `main`, let `ash-deploy.timer` + 16:15 runner upgrade apply it.
+- Do not bounce a live runner to get the new sleeve in during OPN/OSF/ORB/VRC/MVR/15:45.
+- Do not push or merge to `main` on a weekday 09:25–16:10 America/New_York.
