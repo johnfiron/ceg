@@ -14,6 +14,15 @@ DB=Path(os.environ.get('CEG_DB_PATH') or (DATA/'arena.db')).expanduser()
 CFG=Path(os.environ.get('CEG_CONFIG_FILE') or (ROOT/f'config.{ENVIRONMENT}.json')).expanduser()
 LIVE_DIR=DATA/'live'
 DATA.mkdir(parents=True,exist_ok=True); LIVE_DIR.mkdir(parents=True,exist_ok=True)
+def _seed_legacy_development_db():
+    """First development boot should keep yesterday's Activity book, not an empty ledger."""
+    if ENVIRONMENT!='development': return
+    if os.environ.get('CEG_DB_PATH'): return
+    legacy=ROOT/'data'/'arena.db'
+    if DB.exists() or not legacy.exists(): return
+    if legacy.resolve()==DB.resolve(): return
+    shutil.copy2(legacy, DB)
+_seed_legacy_development_db()
 NY=ZoneInfo('America/New_York')
 PAPER='https://paper-api.alpaca.markets/v2'
 MD='https://data.alpaca.markets'
@@ -24,6 +33,7 @@ ALL_TICKERS=list(dict.fromkeys(TICKERS+MIDDAY_TICKERS))
 EOD_STRATEGY_IDS=['CEG','VCT','XED','LAR','RSI2','BB','MACD','DON','STO','KEL']
 MIDDAY_STRATEGY_IDS=['OPN','OSF','ORB','VRC','MVR']
 OPEN_TRADE_STATUSES=('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED')
+DESK_WINDOW_DAYS=30
 _HIST_THREAD=None
 NOTES=ROOT/'notes.md'
 BACKUP_DIR=DATA/'backups'
@@ -48,6 +58,14 @@ STRATEGIES=[
 ]
 
 def now_ny(): return datetime.now(NY)
+
+def paper_api_url(path):
+    """Return an Alpaca paper URL and fail closed if the broker origin ever changes."""
+    if PAPER != 'https://paper-api.alpaca.markets/v2':
+        raise RuntimeError('refusing non-paper Alpaca broker endpoint')
+    if not isinstance(path,str) or not path.startswith('/') or '://' in path:
+        raise RuntimeError('invalid Alpaca paper API path')
+    return PAPER+path
 
 def session_clock(n=None):
     """What the runner is doing now, and when the next decision window starts."""
@@ -442,7 +460,7 @@ def postj(url,payload,timeout=8):
 def broker_order_by_client_id(client_id):
     if not client_id:return None
     try:
-        return getj(f'{PAPER}/orders:by_client_order_id',ah(),{'client_order_id':client_id},timeout=8)
+        return getj(paper_api_url('/orders:by_client_order_id'),ah(),{'client_order_id':client_id},timeout=8)
     except Exception:
         return None
 
@@ -456,7 +474,7 @@ def place_broker_order(payload):
     existing=broker_order_by_client_id(client_id)
     if existing:return existing
     try:
-        return postj(f'{PAPER}/orders',payload)
+        return postj(paper_api_url('/orders'),payload)
     except Exception:
         # The request can succeed at Alpaca while the response is lost locally.
         # Re-querying the deterministic id closes that crash window.
@@ -563,6 +581,11 @@ def init_db():
       payload TEXT)''')
     con.execute('''CREATE TABLE IF NOT EXISTS debriefs(
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, trade_date TEXT, q1 TEXT, q2 TEXT, q3 TEXT)''')
+    con.execute('''CREATE TABLE IF NOT EXISTS account_snapshots(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, equity REAL, cash REAL, portfolio_value REAL,
+      last_equity REAL, buying_power REAL, options_buying_power REAL, daytrade_count INTEGER, payload TEXT)''')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_account_snapshots_ts ON account_snapshots(ts)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_trades_dates ON trades(trade_date, status, exit_filled_at)')
     con.commit(); con.close()
 
 def event(msg,level='INFO'):
@@ -1256,6 +1279,124 @@ def attach_broker_mark(d, pos=None):
         d['unrealized_plpc']=None
     return d
 
+def desk_cutoff(days=None):
+    days=int(days if days is not None else DESK_WINDOW_DAYS)
+    days=max(1,min(days,365))
+    return (now_ny().date()-timedelta(days=days)).isoformat()
+
+def trade_date_fields(tr):
+    """Keep the Activity dates the desk actually uses, as ISO strings."""
+    def day(v):
+        s=str(v or '').strip()
+        return s[:10] if len(s)>=10 else (s or None)
+    return {
+        'trade_date':day(tr.get('trade_date')),
+        'signal_ts':tr.get('signal_ts'),
+        'entry_filled_at':tr.get('entry_filled_at'),
+        'exit_filled_at':tr.get('exit_filled_at'),
+        'expiry':day(tr.get('expiry')),
+        'exit_due_date':day(tr.get('exit_due_date')),
+    }
+
+def desk_trades(days=None, pos=None):
+    """Open tickets plus anything dated in the rolling window. Older closed rows stay in SQLite."""
+    cutoff=desk_cutoff(days)
+    placeholders=','.join('?'*len(OPEN_TRADE_STATUSES))
+    con=db()
+    rows=[dict(x) for x in con.execute(
+        f"""SELECT * FROM trades WHERE status IN ({placeholders})
+            OR IFNULL(trade_date,'')>=?
+            OR IFNULL(substr(exit_filled_at,1,10),'')>=?
+            OR IFNULL(substr(signal_ts,1,10),'')>=?
+            ORDER BY id DESC""",
+        (*OPEN_TRADE_STATUSES,cutoff,cutoff,cutoff)).fetchall()]
+    con.close()
+    if pos is None:
+        try: pos={x.get('symbol'):x for x in broker_positions()}
+        except Exception: pos={}
+    out=[]
+    for r in rows:
+        item=attach_broker_mark(dict(r), pos)
+        item['dates']=trade_date_fields(item)
+        out.append(item)
+    return out,cutoff
+
+def stored_account():
+    raw=meta_get('account_snapshot')
+    if raw:
+        try:
+            d=json.loads(raw)
+            if isinstance(d,dict) and (d.get('equity') is not None or d.get('portfolio_value') is not None):
+                d.setdefault('source','snapshot')
+                return d
+        except Exception:
+            pass
+    con=db(); row=con.execute('SELECT * FROM account_snapshots ORDER BY id DESC LIMIT 1').fetchone(); con.close()
+    if not row: return {'source':'none'}
+    d=dict(row)
+    try: extra=json.loads(d.get('payload') or '{}')
+    except Exception: extra={}
+    if not isinstance(extra,dict): extra={}
+    for k in ('equity','cash','portfolio_value','last_equity','buying_power','options_buying_power','daytrade_count'):
+        if d.get(k) is not None: extra[k]=d.get(k)
+    extra['source']='snapshot'
+    extra['snapshot_at']=d.get('ts')
+    extra['ts']=d.get('ts')
+    return extra
+
+def snapshot_account(acct=None):
+    a=acct if acct is not None else broker_account()
+    ts=now_ny().isoformat()
+    compact={k:a.get(k) for k in ('id','status','currency','cash','portfolio_value','equity',
+                                  'last_equity','buying_power','options_buying_power','daytrade_count',
+                                  'pattern_day_trader','trading_blocked')}
+    compact['ts']=ts
+    compact['snapshot_at']=ts
+    con=db()
+    con.execute('''INSERT INTO account_snapshots(ts,equity,cash,portfolio_value,last_equity,buying_power,options_buying_power,daytrade_count,payload)
+                   VALUES(?,?,?,?,?,?,?,?,?)''',
+                (ts,a.get('equity'),a.get('cash'),a.get('portfolio_value'),a.get('last_equity'),
+                 a.get('buying_power'),a.get('options_buying_power'),a.get('daytrade_count'),
+                 json.dumps(compact,default=str)))
+    con.execute('DELETE FROM account_snapshots WHERE ts<?',(desk_cutoff(),))
+    con.commit(); con.close()
+    meta_set('account_snapshot',json.dumps(compact,default=str))
+    meta_set('account_snapshot_at',ts)
+    return compact
+
+def maybe_snapshot_account(acct=None, min_age=60):
+    last=meta_get('account_snapshot_at')
+    if last and min_age:
+        dt=parse_ny(last)
+        if dt and (now_ny()-dt).total_seconds()<min_age:
+            return None
+    try:
+        return snapshot_account(acct)
+    except Exception as e:
+        event(f'Account snapshot: {e}','WARN')
+        return None
+
+def live_or_stored_account():
+    try:
+        a=broker_account()
+        maybe_snapshot_account(a)
+        out=dict(a); out['source']='live'; out['snapshot_at']=now_ny().isoformat(); return out
+    except Exception:
+        return stored_account()
+
+def balance_curve(days=None):
+    cutoff=desk_cutoff(days)
+    con=db()
+    rows=[dict(x) for x in con.execute(
+        'SELECT ts,equity,cash,portfolio_value FROM account_snapshots WHERE ts>=? ORDER BY ts',
+        (cutoff,)).fetchall()]
+    con.close()
+    if len(rows)<=240: return [{'t':r['ts'],'equity':r['equity'],'cash':r['cash'],'portfolio_value':r['portfolio_value']} for r in rows]
+    step=max(1,len(rows)//180)
+    sampled=rows[::step]
+    if sampled[-1] is not rows[-1]: sampled.append(rows[-1])
+    return [{'t':r['ts'],'equity':r['equity'],'cash':r['cash'],'portfolio_value':r['portfolio_value']} for r in sampled]
+
 def fredj(path,p):
     c=cfg(); key=c.get('fred_key')
     if not key:raise RuntimeError('FRED key missing')
@@ -1653,7 +1794,7 @@ def bp_block(ask, qty):
 
 def clock_skew():
     try:
-        j=getj_cached(f'{PAPER}/clock',ah(),ttl=30,key='broker:clock')
+        j=getj_cached(paper_api_url('/clock'),ah(),ttl=30,key='broker:clock')
         ts=j.get('timestamp') or j.get('server_time')
         dt=parse_ny(ts)
         if not dt: return {'ok':True,'skew_sec':None,'server':ts}
@@ -1936,11 +2077,11 @@ def option_contract(ticker,direction,spot,allow_0dte=False,style=None):
     typ='call' if direction=='CALL' else 'put'
     p={'underlying_symbols':ticker,'status':'active','expiration_date_gte':td,'expiration_date_lte':end,'type':typ,
        'strike_price_gte':f'{spot*(1-band):.2f}','strike_price_lte':f'{spot*(1+band):.2f}','limit':1000}
-    j=getj(f'{PAPER}/options/contracts',ah(),p); arr=j.get('option_contracts') or j.get('contracts') or []
+    j=getj(paper_api_url('/options/contracts'),ah(),p); arr=j.get('option_contracts') or j.get('contracts') or []
     if not arr and dte=='0dte':
         td=next_trading_date(today.isoformat()); end=(datetime.strptime(td,'%Y-%m-%d').date()+timedelta(days=7)).isoformat()
         p['expiration_date_gte']=td; p['expiration_date_lte']=end
-        j=getj(f'{PAPER}/options/contracts',ah(),p); arr=j.get('option_contracts') or j.get('contracts') or []
+        j=getj(paper_api_url('/options/contracts'),ah(),p); arr=j.get('option_contracts') or j.get('contracts') or []
         style['dte']='next-fallback'
     if not arr:raise RuntimeError(f'No active {typ} contracts returned for {ticker}')
     arr=sorted(arr,key=lambda x:(x.get('expiration_date','9999'),abs(float(x.get('strike_price',0))-target)))
@@ -2082,7 +2223,7 @@ def reconcile():
     for tr in rows:
         oid=tr['entry_order_id'] if tr['status']=='ENTRY_SUBMITTED' else tr['exit_order_id']
         if not oid:continue
-        try:o=getj(f'{PAPER}/orders/{oid}',ah(),timeout=8)
+        try:o=getj(paper_api_url(f'/orders/{oid}'),ah(),timeout=8)
         except Exception as e:event(f'Order reconcile {oid}: {e}','WARN');continue
         st=o.get('status')
         if st=='filled':
@@ -2117,8 +2258,58 @@ def _option_direction_expiry(symbol):
     except ValueError: expiry=None
     return ('CALL' if m.group(2)=='C' else 'PUT'),expiry
 
+def _broker_symbols(positions):
+    if not isinstance(positions,list): return set()
+    return {p.get('symbol') for p in positions if isinstance(p,dict) and p.get('symbol')}
+
+def _option_is_worthless(tr, n=None):
+    n=n or now_ny(); hm=n.strftime('%H:%M'); today=n.date().isoformat()
+    exp=(tr.get('expiry') or '')[:10]
+    horizon=tr.get('horizon') or 'OVERNIGHT'
+    after_close=n.weekday()>=5 or hm>='16:00'
+    if exp and exp<today: return True
+    if horizon=='EOD' and after_close: return True
+    return False
+
+def _expire_trade(tr, note='expired / no quote after close'):
+    n=now_ny()
+    fill=float(tr.get('entry_fill') or 0)
+    pnl=round(-fill*100*int(tr.get('qty') or 1),2)
+    con=db(); con.execute("UPDATE trades SET status='CLOSED',pnl=?,exit_kind='EXPIRED',broker_note=?,exit_filled_at=? WHERE id=?",
+                          (pnl,note,n.isoformat(),tr['id']))
+    con.commit(); con.close()
+    event(f"EXPIRED {tr['strategy_id']} {tr['ticker']} {tr.get('option_symbol')} P&L ${pnl:.2f}")
+
+def _matching_exit_fill(tr, orders):
+    """Only trust the deterministic exit client id. Do not pair sells by symbol."""
+    want=str(tr.get('exit_client_id') or '')
+    fallback=f"x53-{int(tr['id'])}"
+    for o in orders or []:
+        if not isinstance(o,dict) or o.get('side')!='sell' or str(o.get('status') or '')!='filled':
+            continue
+        cid=str(o.get('client_order_id') or '')
+        if cid and cid in (want,fallback):
+            return o
+    return None
+
+def _close_trade_from_broker_exit(tr, order):
+    fp=float(order.get('filled_avg_price') or 0)
+    ft=order.get('filled_at')
+    pnl=(fp-float(tr.get('entry_fill') or 0))*100*int(tr.get('qty') or 1)
+    con=db(); con.execute("""UPDATE trades SET exit_order_id=?,exit_client_id=?,exit_fill=?,exit_filled_at=?,
+                             status='CLOSED',pnl=?,exit_kind=COALESCE(NULLIF(exit_kind,''),'BROKER'),
+                             broker_note=? WHERE id=?""",
+                          (order.get('id'),order.get('client_order_id'),fp,ft,pnl,
+                           'closed from broker sell on startup',tr['id']))
+    con.commit(); con.close()
+    event(f"CLOSED {tr['strategy_id']} {tr['ticker']} P&L ${pnl:.2f} (startup broker sell)")
+
 def startup_reconcile():
-    """Audit Alpaca before the runner is allowed to evaluate or submit anything."""
+    """Alpaca verifies live holdings. Activity (local trades) stays the book.
+
+    Filled buys are recovered only when the broker still holds the contract.
+    Closed history is never rebuilt from buy-side order replay.
+    """
     init_db()
     c=cfg()
     if not (c.get('alpaca_key') and c.get('alpaca_secret')):
@@ -2129,63 +2320,78 @@ def startup_reconcile():
         return True
     reconcile()
     after=(now_ny()-timedelta(days=14)).astimezone(ZoneInfo('UTC')).isoformat()
-    orders=getj(f'{PAPER}/orders',ah(),{'status':'all','after':after,'direction':'desc','limit':500},timeout=15)
+    orders=getj(paper_api_url('/orders'),ah(),{'status':'all','after':after,'direction':'desc','limit':500},timeout=15)
     if not isinstance(orders,list):
         raise RuntimeError('Alpaca orders reconciliation returned an invalid payload')
+    positions=getj(paper_api_url('/positions'),ah(),timeout=15)
+    if not isinstance(positions,list):
+        raise RuntimeError('Alpaca positions reconciliation returned an invalid payload')
+    held=_broker_symbols(positions)
     recovered=0
+    skipped_flat=0
     for order in orders:
         cid=order.get('client_order_id')
         parsed=_client_order_parts(cid)
         if not parsed or order.get('side')!='buy':continue
         con=db(); known=con.execute('SELECT id FROM trades WHERE entry_order_id=? OR entry_client_id=? LIMIT 1',(order.get('id'),cid)).fetchone(); con.close()
         if known:continue
+        broker_status=str(order.get('status') or '')
+        symbol=order.get('symbol')
+        if broker_status in ('canceled','expired','rejected'):
+            continue
+        if broker_status=='filled':
+            if symbol not in held:
+                skipped_flat+=1
+                continue
+            status='OPEN'
+        else:
+            status='ENTRY_SUBMITTED'
         day,sid,ticker=parsed
         submitted=parse_ny(order.get('submitted_at') or order.get('created_at')) or now_ny()
         trade_date=(datetime.strptime(day,'%Y%m%d').date().isoformat() if day else submitted.date().isoformat())
-        direction,expiry=_option_direction_expiry(order.get('symbol'))
-        broker_status=str(order.get('status') or '')
-        status='OPEN' if broker_status=='filled' else ('ERROR' if broker_status in ('canceled','expired','rejected') else 'ENTRY_SUBMITTED')
+        direction,expiry=_option_direction_expiry(symbol)
         horizon='EOD' if sid in MIDDAY_STRATEGY_IDS else 'OVERNIGHT'
         exit_due=trade_date if horizon=='EOD' else next_trading_date(trade_date)
         con=db(); con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,
                                  entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,status,broker_note,horizon,window)
                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                              (sid,ticker,direction,order.get('symbol'),int(float(order.get('qty') or 0)),submitted.isoformat(),trade_date,expiry,
+                              (sid,ticker,direction,symbol,int(float(order.get('qty') or 0)),submitted.isoformat(),trade_date,expiry,
                                order.get('id'),cid,float(order.get('filled_avg_price') or 0) or None,order.get('filled_at'),exit_due,status,
                                'recovered by startup reconciliation',horizon,sid if horizon=='EOD' else '15:45'))
         con.commit(); con.close(); recovered+=1
         event(f'Recovered broker order {cid} into the local trade ledger','WARN')
     expire_dead_options()
-    positions=getj(f'{PAPER}/positions',ah(),timeout=15)
-    broker_symbols={p.get('symbol') for p in positions if isinstance(p,dict)} if isinstance(positions,list) else set()
-    con=db(); local_open=[dict(x) for x in con.execute("SELECT id,option_symbol FROM trades WHERE status='OPEN'").fetchall()]; con.close()
-    missing=[str(t['id']) for t in local_open if t.get('option_symbol') not in broker_symbols]
+    today=now_ny().date().isoformat()
+    con=db(); local_open=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()]; con.close()
+    missing=[]
+    for tr in local_open:
+        if tr.get('option_symbol') in held:
+            continue
+        sell=_matching_exit_fill(tr, orders)
+        if sell:
+            _close_trade_from_broker_exit(tr, sell)
+            continue
+        due=(tr.get('exit_due_date') or '')[:10]
+        eod_due_passed=(tr.get('horizon') or 'OVERNIGHT')=='EOD' and due and due<today
+        if _option_is_worthless(tr) or eod_due_passed:
+            _expire_trade(tr, 'broker flat after Activity still OPEN')
+            continue
+        missing.append(str(tr['id']))
     if missing:
         event('Startup reconciliation: local OPEN trades absent from Alpaca positions: '+','.join(missing),'ERROR')
         raise RuntimeError('startup reconciliation found missing broker positions for local trades: '+','.join(missing))
     meta_set('startup_reconciled_at',now_ny().isoformat())
     meta_set('startup_recovered_orders',recovered)
-    event(f'Startup reconciliation complete: {len(orders)} orders checked, {recovered} recovered')
+    meta_set('startup_skipped_flat_buys',skipped_flat)
+    event(f'Startup reconciliation complete: {len(orders)} orders checked, {recovered} recovered, {skipped_flat} filled buys ignored (broker already flat)')
     return True
 
 def expire_dead_options():
     """0DTE still OPEN after the close is worthless — do not keep sending market sells."""
-    n=now_ny(); hm=n.strftime('%H:%M'); today=n.date().isoformat()
-    if n.weekday()>=5: after_close=True
-    else: after_close=hm>='16:00'
     con=db(); rows=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()]; con.close()
     for tr in rows:
-        exp=(tr.get('expiry') or '')[:10]
-        horizon=tr.get('horizon') or 'OVERNIGHT'
-        dead=bool(exp and exp<today)
-        eod_done=horizon=='EOD' and after_close
-        if not (dead or eod_done): continue
-        fill=float(tr.get('entry_fill') or 0)
-        pnl=round(-fill*100*int(tr.get('qty') or 1),2)
-        con=db(); con.execute("UPDATE trades SET status='CLOSED',pnl=?,exit_kind='EXPIRED',broker_note=?,exit_filled_at=? WHERE id=?",
-                              (pnl,'expired / no quote after close',n.isoformat(),tr['id']))
-        con.commit(); con.close()
-        event(f"EXPIRED {tr['strategy_id']} {tr['ticker']} {tr.get('option_symbol')} P&L ${pnl:.2f}")
+        if _option_is_worthless(tr):
+            _expire_trade(tr)
 
 def submit_due_exits():
     expire_dead_options()
@@ -2287,6 +2493,8 @@ def runner_loop(heartbeat_callback=None):
             if heartbeat_callback: heartbeat_callback(n)
             if not keys_ok():
                 time.sleep(30); continue
+            try: maybe_snapshot_account()
+            except Exception as e: event(f'Account snapshot: {e}','WARN')
             reconcile(); submit_due_exits()
             try: refresh_excursions_and_stops()
             except Exception as e: event(f'Manage open: {e}','WARN')
@@ -2405,6 +2613,9 @@ def manifest():return send_from_directory(STATIC,'manifest.webmanifest')
 def sw():return send_from_directory(STATIC,'sw.js')
 @app.get('/api/status')
 def status():
+    return jsonify(status_payload())
+
+def status_payload():
     c=cfg()
     rh=runner_health()
     con=db()
@@ -2417,7 +2628,8 @@ def status():
     if ing:
         try: stale=(now_ny()-datetime.fromisoformat(ing)).total_seconds()
         except Exception: stale=None
-    return jsonify({
+    snap=stored_account()
+    return {
         'configured':keys_ok(),
         'paper_only':True,'broker_orders_enabled':broker_orders_enabled(),
         'broker_config_enabled':c.get('broker_orders_enabled') is True,
@@ -2436,10 +2648,11 @@ def status():
         'rate_budget':{'calls_60s':rate,'ok':rate<80},
         'unread_errors':unread,
         'thresholds':thresh(),
+        'account_snapshot_at':snap.get('snapshot_at') or snap.get('ts'),
         'cache':{'hits':_API_STATS['hits'],'misses':_API_STATS['misses'],'http_calls':_API_STATS['calls'],
                  'hit_rate':(_API_STATS['hits']/max(1,_API_STATS['hits']+_API_STATS['misses'])),
                  'local_bars':bars,'api_log_rows':calls}
-    })
+    }
 
 def runner_health(max_age=90):
     hb=meta_get('heartbeat'); age=None
@@ -2469,7 +2682,7 @@ def test():
     out={'alpaca':False,'fred':False,'paper_account':False,'errors':[]}
     try:out['alpaca']=bool(getj(f'{MD}/v2/stocks/SPY/snapshot',ah(),{'feed':'iex'}))
     except Exception as e:out['errors'].append('Alpaca data: '+str(e))
-    try:out['paper_account']=bool(getj(f'{PAPER}/account',ah()))
+    try:out['paper_account']=bool(getj(paper_api_url('/account'),ah()))
     except Exception as e:out['errors'].append('Paper account: '+str(e))
     try:out['fred']=latest_vix()[1] is not None
     except Exception as e:out['errors'].append('FRED: '+str(e))
@@ -2478,18 +2691,18 @@ def test():
     return jsonify(out)
 
 def broker_account():
-    a=getj_cached(f"{PAPER}/account",ah(),ttl=20,key='broker:account')
+    a=getj_cached(paper_api_url('/account'),ah(),ttl=20,key='broker:account')
     return {k:a.get(k) for k in ("id","status","currency","cash","portfolio_value","equity",
                                  "last_equity","buying_power","options_buying_power","daytrade_count",
                                  "pattern_day_trader","trading_blocked")}
 
 def broker_positions():
-    p=getj_cached(f"{PAPER}/positions",ah(),ttl=15,key='broker:positions') or []
+    p=getj_cached(paper_api_url('/positions'),ah(),ttl=15,key='broker:positions') or []
     return p if isinstance(p,list) else []
 
 @app.get('/api/account')
 def account():
-    try: return jsonify(broker_account())
+    try: return jsonify(live_or_stored_account())
     except Exception as e: return jsonify({"error":str(e)}),500
 
 @app.get('/api/positions')
@@ -2537,8 +2750,11 @@ def market_chart(sym):
 
 @app.get('/api/dashboard')
 def dashboard():
+    return jsonify(dashboard_payload())
+
+def dashboard_payload():
     hit=mem_get('ui:dash',12)
-    if hit is not None: return jsonify(hit)
+    if hit is not None: return hit
     con=db()
     trades=[dict(x) for x in con.execute("SELECT * FROM trades ORDER BY id ASC").fetchall()]
     sigs=[dict(x) for x in con.execute("SELECT * FROM signals ORDER BY id ASC").fetchall()]
@@ -2602,7 +2818,7 @@ def dashboard():
         }
     }
     mem_set('ui:dash',payload)
-    return jsonify(payload)
+    return payload
 
 
 def _historical_state(sym,date,cutoff="15:45"):
@@ -3017,15 +3233,35 @@ def strategies():
     con.close(); return jsonify({'strategies':result})
 @app.get('/api/trades')
 def trades():
-    con=db(); rows=[dict(x) for x in con.execute('SELECT * FROM trades ORDER BY id DESC LIMIT 200').fetchall()]; con.close()
-    pos={}
-    try:
-        for x in broker_positions(): pos[x.get('symbol')]=x
-    except Exception: pass
-    out=[]
-    for r in rows:
-        out.append(attach_broker_mark(dict(r), pos))
-    return jsonify({'trades':out})
+    days=request.args.get('days')
+    try: days=int(days) if days not in (None,'') else DESK_WINDOW_DAYS
+    except (TypeError,ValueError): days=DESK_WINDOW_DAYS
+    out,cutoff=desk_trades(days)
+    return jsonify({'trades':out,'window_days':days,'cutoff':cutoff,'as_of':now_ny().isoformat()})
+
+@app.get('/api/bootstrap')
+def bootstrap():
+    """One round-trip for the title-screen desk load: 30-day book + last known balance."""
+    days=request.args.get('days')
+    try: days=int(days) if days not in (None,'') else DESK_WINDOW_DAYS
+    except (TypeError,ValueError): days=DESK_WINDOW_DAYS
+    days=max(1,min(days,365))
+    cutoff=desk_cutoff(days)
+    acct=live_or_stored_account()
+    rows,trade_cutoff=desk_trades(days)
+    dash=dict(dashboard_payload())
+    dash['curve']=[x for x in (dash.get('curve') or []) if (x.get('date') or '')>=cutoff]
+    dash['dailyPnl']=[x for x in (dash.get('dailyPnl') or []) if (x.get('date') or '')>=cutoff]
+    dash['balanceCurve']=balance_curve(days)
+    dash['window_days']=days
+    dash['cutoff']=cutoff
+    return jsonify({
+        'window_days':days,'cutoff':trade_cutoff,'as_of':now_ny().isoformat(),
+        'status':status_payload(),
+        'account':acct,
+        'trades':rows,
+        'dashboard':dash,
+    })
 
 def build_trade_pack(tr, pos=None):
     tr=dict(tr); date=tr.get('trade_date') or now_ny().date().isoformat(); sym=tr.get('ticker')

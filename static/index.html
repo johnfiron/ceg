@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#000000">
 <title>ASH TERMINAL V10</title>
-<link rel="manifest" href="/manifest.webmanifest">
+<link rel="manifest" href="manifest.webmanifest">
 <style>
 :root{
   --bg:#000;
@@ -337,7 +337,7 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
 <div class="app">
   <div class="topbar">
     <div class="brand"><div class="brandOrb"></div><div class="brandText"><b>ASH TERMINAL</b><span>V10 · OPEN SWING · EXPLAIN</span></div></div>
-    <div class="actions"><button type="button" class="icon" aria-label="Refresh data" title="Refresh data" onclick="refreshAll()">↻</button><button type="button" class="icon" aria-label="Open settings" title="Open settings" onclick="go('settings',this)">⚙</button></div>
+    <div class="actions"><a id="familyVaultLink" class="icon hidden" aria-label="Back to Family Vault" title="Back to Family Vault" href="/trading-lab" style="text-decoration:none">⌂</a><button type="button" class="icon" aria-label="Refresh data" title="Refresh data" onclick="refreshAll()">↻</button><button type="button" class="icon" aria-label="Open settings" title="Open settings" onclick="go('settings',this)">⚙</button></div>
   </div>
 
   <div id="setup" class="panel setup hidden">
@@ -510,7 +510,7 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
         <div class="sub" id="debriefMsg" style="margin-top:6px"></div>
       </div>
       <div class="panel"><div class="panelHead"><h2>Lab snapshots</h2><button class="btn" onclick="saveSnap()">SAVE NOW</button></div><div id="snapList"></div></div>
-      <div class="panel"><div class="panelHead"><h2>Research controls</h2></div><button class="btn primary" onclick="preview()">Run all 12 now (preview only)</button> <button class="btn" onclick="ingestNow()">Ingest live tape</button> <button class="btn" onclick="backup()">Create local backup</button> <button class="btn" onclick="location.href='/api/export'">Export research pack</button><pre id="previewOut" class="sub"></pre></div>
+      <div class="panel"><div class="panelHead"><h2>Research controls</h2></div><button class="btn primary" onclick="preview()">Run all 12 now (preview only)</button> <button class="btn" onclick="ingestNow()">Ingest live tape</button> <button class="btn" onclick="backup()">Create local backup</button> <button class="btn" onclick="location.href=ashUrl('/api/export')">Export research pack</button><pre id="previewOut" class="sub"></pre></div>
     </section>
 
     <section class="page" id="activity">
@@ -582,7 +582,7 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
   <button class="btn" style="margin-top:8px" onclick="saveNtfy()">SAVE NTFY</button>
   <div class="sub" style="margin:10px 0">SQLite copies into data/backups on exit. Restore replaces the live DB.</div>
   <button class="btn" onclick="backup()">Create local backup</button>
-  <a class="btn" href="/journal" target="_blank" style="display:inline-block;text-decoration:none;margin-left:6px">Journal PDF</a>
+  <a class="btn" href="api/journal" target="_blank" style="display:inline-block;text-decoration:none;margin-left:6px">Journal PDF</a>
   <div id="backupList" style="margin-top:8px"></div>
 </div>
     </section>
@@ -630,7 +630,10 @@ function td(label,html,cls){return `<td data-label="${label}"${cls?` class="${cl
 let STATE={},layout=4,lens='CEG';
 let replay={bars:[],i:0,timer:null,playing:false,signals:[],inspect:null};
 let surfaceRot={x:-.38,y:.68,drag:false,lx:0,ly:0},surfacePoints=[];
-async function api(p,o={}){let r=await fetch(p,{headers:{'Content-Type':'application/json'},...o});let j=await r.json();if(!r.ok)throw Error(j.error||JSON.stringify(j));return j}
+const ASH_BASE=location.pathname==='/ash'||location.pathname.startsWith('/ash/')?'/ash':'';
+const ashUrl=p=>ASH_BASE+p;
+if(ASH_BASE)$('familyVaultLink').classList.remove('hidden');
+async function api(p,o={}){let r=await fetch(ashUrl(p),{headers:{'Content-Type':'application/json'},...o});let j=await r.json();if(!r.ok)throw Error(j.error||JSON.stringify(j));return j}
 
 // ---------- title engine: path-A, plate light, flakes / candles ----------
 function introPick(key,allowed,fallback){let v=localStorage.getItem(key);return allowed.includes(v)?v:fallback}
@@ -1382,13 +1385,13 @@ function reportIntroTarget(){
   if(cssW<200||cssW>520)return;
   let dpr=devicePixelRatio||1,w=Math.round(cssW*dpr),h=Math.round(cssH*dpr);
   if(w>1440){let s=1440/w;w=1440;h=Math.round(h*s)}
-  fetch('/api/intro-target',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({w,h,dpr:1,cssW,cssH,srcDpr:dpr})}).catch(()=>{})
+  fetch(ashUrl('/api/intro-target'),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({w,h,dpr:1,cssW,cssH,srcDpr:dpr})}).catch(()=>{})
 }
 async function lockRecordView(){
   let w=Number(INTRO_Q.get('w'))||0,h=Number(INTRO_Q.get('h'))||0,dpr=Number(INTRO_Q.get('dpr'))||0;
   if(!w||!h){
     try{
-      let t=await fetch('/api/intro-target').then(r=>r.json());
+      let t=await fetch(ashUrl('/api/intro-target')).then(r=>r.json());
       w=Number(t.w)||0;h=Number(t.h)||0;dpr=Number(t.dpr)||0
     }catch(e){}
   }
@@ -1419,7 +1422,7 @@ async function startIntroRecord(){
   let blob=new Blob(chunks,{type:'video/webm'});
   recordHud('saving '+introFile()+' · '+(blob.size/1e6).toFixed(1)+'mb');
   try{
-    let r=await fetch('/api/intro-save?name='+encodeURIComponent(introFile()),{method:'POST',headers:{'Content-Type':'video/webm'},body:blob});
+    let r=await fetch(ashUrl('/api/intro-save?name='+encodeURIComponent(introFile())),{method:'POST',headers:{'Content-Type':'video/webm'},body:blob});
     let j=await r.json().catch(()=>({}));
     if(!r.ok)throw Error(j.error||r.status);
     recordHud('saved '+introFile()+' · press ENTER')
@@ -1433,13 +1436,13 @@ async function startIntroRecord(){
 async function introVideoExists(){
   try{
     let c=new AbortController();setTimeout(()=>c.abort(),1500);
-    let r=await fetch('/static/'+introFile(),{method:'HEAD',signal:c.signal});
+    let r=await fetch(ashUrl('/static/'+introFile()),{method:'HEAD',signal:c.signal});
     return r.ok
   }catch(e){return false}
 }
 function startIntroVideo(){
   let v=$('introVideo');
-  v.src='/static/'+introFile();
+  v.src=ashUrl('/static/'+introFile());
   v.style.display='block';
   intro.style.display='none';
   let loopStart=0,printOn=false,leaving=false;
@@ -1497,6 +1500,7 @@ function finishIntro(){
     try{fg.clearRect(0,0,innerWidth,innerHeight)}catch(e){}
     for(let bmp of decodeCache.values()){try{bmp.close()}catch(e){}}
     decodeCache.clear();decodeWait.clear();reelBlobs=[];lastBmp=null
+    paintDeskFromCache()
   }
   if(RECORD||REDUCE_MOTION){
     $('bootText').classList.add('show');
@@ -2159,9 +2163,9 @@ function ensureState(){
 }
 function aborted(e){return e&&e.name==='AbortError'}
 async function refreshHome(signal){
-  let[d,a,tr,live,status]=await Promise.all([api('/api/dashboard',{signal}),api('/api/account',{signal}),api('/api/trades',{signal}),api('/api/live',{signal}),api('/api/status',{signal})]);
-  Object.assign(STATE,{d,a,tr,live,status});STATE.updated.home=STATE.updated.market=STATE.updated.model=STATE.updated.desk=Date.now();applyStatus(status);
-  if((d.totals?.open||0)>0){
+  let b=await api('/api/bootstrap?days=30',{signal});
+  applyBootstrap(b,false);writeDeskCache(b);
+  if((b.dashboard?.totals?.open||0)>0){
     let[ws,board]=await Promise.all([api('/api/workspace',{signal}),api('/api/trade_board',{signal})]);
     Object.assign(STATE,{ws,tradeBoard:board})
   }else{
@@ -2178,7 +2182,7 @@ async function refreshStrategies(signal){
   Object.assign(STATE,{d,ov,dr});STATE.updated.model=Date.now()
 }
 async function refreshActivity(signal){
-  let[tr,si,ev,tradeBoard]=await Promise.all([api('/api/trades',{signal}),api('/api/signals',{signal}),api('/api/events',{signal}),api('/api/trade_board',{signal})]);
+  let[tr,si,ev,tradeBoard]=await Promise.all([api('/api/trades?days=30',{signal}),api('/api/signals',{signal}),api('/api/events',{signal}),api('/api/trade_board',{signal})]);
   Object.assign(STATE,{tr,si,ev,tradeBoard})
 }
 async function refreshResearch(signal){
@@ -2326,7 +2330,9 @@ function renderChartOverview(){
   if($('marketGrid'))$('marketGrid').innerHTML=Object.entries(d.tickerStats||{}).map(([t,x])=>`<div class=market role=button tabindex=0 onclick="openTicker('${t}')" onkeydown="activateClick(event)" aria-label="Open ${t} chart"><b>${t}</b><small>${x.closed} tests · ${pct(x.winRate)} win</small><div class="${x.pnl>=0?'up':'down'} num" style="margin-top:7px;font-weight:900">${signedMoney(x.pnl)}</div></div>`).join('')||'<div class=sub>No closed paper tests yet.</div>'
 }
 function renderHome(){
-  let d=STATE.d||{totals:{},curve:[]},a=STATE.a||{},live=STATE.live||{},t=(STATE.rm&&STATE.rm.today)||{},cov=live.session_complete_pct,clk=live.clock||(STATE.rm&&STATE.rm.clock);
+  let d=STATE.d||{totals:{},curve:[]},a=STATE.a||{},live=STATE.live||{},status=STATE.status||{},t=(STATE.rm&&STATE.rm.today)||{};
+  let cov=live.session_complete_pct!=null?live.session_complete_pct:status.session_complete_pct;
+  let clk=live.clock||status.clock||(STATE.rm&&STATE.rm.clock);
   let sess=sessionBlotter(STATE.tr||{trades:[]},(d.totals||{}).sessionDate),realized=d.totals?.realizedToday!=null?d.totals.realizedToday:sess.realized,u=sess.openPnl,session=realized+u,brokerDay=Number(a.equity||0)-Number(a.last_equity||0);
   $('portfolioValue').textContent=money(a.portfolio_value||a.equity);
   $('portfolioDelta').innerHTML=`Today <b class="${session>=0?'up':'down'}">${signedMoney(session)}</b> · cash ${money(a.cash)} · open P&amp;L <b class="${u>=0?'up':'down'}">${signedMoney(u)}</b> · broker day ${signedMoney(brokerDay)}`;
@@ -2528,7 +2534,56 @@ function syncIntroUI(){
   document.querySelectorAll('#introGateTabs .tab').forEach(x=>x.classList.toggle('active',x.dataset.gate===introPick('ashIntroGate',['finger','auto'],'finger')));
   document.querySelectorAll('#ashIdleTabs .tab').forEach(x=>x.classList.toggle('active',x.dataset.idle===introPick('ashIdle',['on','pause'],'on')))
 }
-async function boot(){let s=await api('/api/status');applyStatus(s);if(!s.configured)keysGate(false);else{keysGate(true);await refreshAll()}}
+async function boot(){
+  let cached=readDeskCache();
+  if(cached)applyBootstrap(cached,true);
+  let s=(cached&&cached.status)||await api('/api/status');
+  applyStatus(s);
+  if(!s.configured){keysGate(false);return}
+  keysGate(true);
+  try{await primeDesk()}catch(e){await refreshAll()}
+  if(introDone)await renderPage(activePageId())
+}
+function readDeskCache(){
+  try{
+    let d=JSON.parse(localStorage.getItem('ashDeskCache')||'');
+    if(!d||!d.as_of)return null;
+    return d
+  }catch(e){return null}
+}
+function writeDeskCache(payload){
+  if(!payload||!payload.as_of)return;
+  try{localStorage.setItem('ashDeskCache',JSON.stringify(payload))}catch(e){}
+}
+function applyBootstrap(b,fromCache){
+  if(!b)return;
+  ensureState();
+  if(b.status){STATE.status=b.status;applyStatus(b.status)}
+  if(b.account)STATE.a=b.account;
+  if(b.trades)STATE.tr={trades:Array.isArray(b.trades)?b.trades:(b.trades.trades||[]),window_days:b.window_days,cutoff:b.cutoff};
+  if(b.dashboard)STATE.d=b.dashboard;
+  STATE.deskWindow={days:b.window_days||30,cutoff:b.cutoff,asOf:b.as_of,cached:!!fromCache};
+  STATE.updated.home=STATE.updated.market=STATE.updated.model=STATE.updated.desk=Date.now()
+}
+function paintDeskFromCache(){
+  if(document.body.classList.contains('needs-keys'))return;
+  if(!(STATE.d||STATE.a||STATE.tr))return;
+  if(activePageId()==='home')renderHome()
+}
+let deskPrime=null;
+function primeDesk(){
+  if(deskPrime)return deskPrime;
+  deskPrime=(async()=>{
+    let cached=readDeskCache();
+    if(cached)applyBootstrap(cached,true);
+    let b=await api('/api/bootstrap?days=30');
+    applyBootstrap(b,false);writeDeskCache(b);
+    api('/api/live').then(live=>{STATE.live=live;STATE.updated.market=Date.now();if(introDone)paintDeskFromCache()}).catch(()=>{});
+    if(introDone)paintDeskFromCache();
+    return b
+  })();
+  return deskPrime
+}
 function spark(c,bars){
   if(!c)return;
   let box=c.getBoundingClientRect();
@@ -2650,7 +2705,7 @@ addEventListener('resize',()=>{
   fitAmbient();fitFx();if(resizeRaf)cancelAnimationFrame(resizeRaf);
   resizeRaf=requestAnimationFrame(()=>{resizeRaf=0;let page=activePageId();if(page==='home'&&STATE.d)renderHome();else if(page==='charts'){renderChartOverview();renderMulti()}else if(page==='strategies'&&STATE.d)renderModels();else if(page==='replay'&&replay.bars.length)renderReplay();else if(page==='research'){if(STATE.rm)histChart($('stretchChart'),STATE.rm.stretch_bins||[]);drawSurface()}else if(page==='activity'&&STATE.tradeBoard)renderTradeBoard('tradeBoard')})
 });
-syncIntroUI();setDensity(localStorage.getItem('ashDensity')||'lab');boot();
+syncIntroUI();setDensity(localStorage.getItem('ashDensity')||'lab');primeDesk().catch(()=>{});boot();
 function haltLockedScroll(e){
   if(!document.body.classList.contains('needs-keys'))return;
   if(e.target.closest&&e.target.closest('input,textarea,select'))return;
@@ -2659,7 +2714,7 @@ function haltLockedScroll(e){
 addEventListener('wheel',haltLockedScroll,{passive:false});
 addEventListener('touchmove',haltLockedScroll,{passive:false});
 setInterval(()=>{if(!document.body.classList.contains('needs-keys')&&!$('terminal').classList.contains('hidden'))refreshAll(activePageId()).catch(()=>{})},30000);
-if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
+if('serviceWorker' in navigator)navigator.serviceWorker.register(ashUrl('/sw.js'),{scope:ASH_BASE+'/'||'/'}).catch(()=>{});
 </script>
 </body>
 </html>
