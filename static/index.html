@@ -175,7 +175,7 @@ textarea{min-height:70px}
 .settingsGrid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .bottomNav{
   position:fixed;z-index:110;bottom:max(9px,env(safe-area-inset-bottom,0px));left:50%;transform:translateX(-50%);width:min(96%,780px);
-  display:grid;grid-template-columns:repeat(6,1fr);padding:6px;border-radius:21px;border:1px solid #292929;
+  display:grid;grid-template-columns:repeat(5,1fr);padding:6px;border-radius:21px;border:1px solid #292929;
   background:rgba(4,4,4,.91);backdrop-filter:blur(19px);box-shadow:0 24px 60px #000
 }
 .nav{border:0;background:transparent;color:var(--muted);padding:8px 4px;border-radius:14px;font-size:var(--t-label);font-weight:900;letter-spacing:.06em;text-transform:uppercase;min-height:44px}
@@ -263,7 +263,14 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
 .surfacePhoneSummary{display:block}
 .keys{font-size:var(--t-meta);color:var(--muted);line-height:1.6}
 .sampleWarn{font-size:var(--t-label);letter-spacing:.08em;color:#f1b94e;font-weight:900;text-transform:uppercase}
-.muted{color:var(--muted)}
+.thread{margin-top:10px;padding-top:8px;border-top:1px solid #1f1f1f}
+.threadPost{margin:8px 0}
+.threadKind{font-size:var(--t-label);font-weight:800;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
+.threadBody{font-size:var(--t-body);color:var(--text-mid);line-height:1.5;margin:4px 0 0}
+.threadComposer{display:grid;gap:8px;margin-top:8px}
+.threadInput{min-height:72px}
+.commentSnippet{font-size:var(--t-meta);color:var(--text-mid);margin-top:4px;line-height:1.45}
+.actWriteMsg{font-size:var(--t-meta);color:var(--amber);margin-top:8px;min-height:1.2em}
 @media(max-width:850px){.covGrid{grid-template-columns:repeat(2,1fr)}}
 .fadeIn{animation:fadeIn .35s ease both}@keyframes fadeIn{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:none}}
 @media(max-width:850px){
@@ -336,7 +343,7 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
 
 <div class="app">
   <div class="topbar">
-    <div class="brand"><div class="brandOrb"></div><div class="brandText"><b>ASH TERMINAL</b><span>V10 · OPEN SWING · EXPLAIN</span></div></div>
+    <div class="brand"><div class="brandOrb"></div><div class="brandText"><b>ASH TERMINAL</b><span id="brandStamp">V10</span></div></div>
     <div class="actions"><a id="familyVaultLink" class="icon hidden" aria-label="Back to Family Vault" title="Back to Family Vault" href="/trading-lab" style="text-decoration:none">⌂</a><button type="button" class="icon" aria-label="Refresh data" title="Refresh data" onclick="refreshAll()">↻</button><button type="button" class="icon" aria-label="Open settings" title="Open settings" onclick="go('settings',this)">⚙</button></div>
   </div>
 
@@ -371,7 +378,6 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
           <div class="explainWhy" id="explainWhy"></div>
           <div class="sessionBooks" id="explainBooks"></div>
         </div>
-        <div class="sub" id="labNote" style="margin-bottom:8px">Fire rate and Wilson intervals first. Sample is unique days, not same-day fills.</div>
       </div>
       <div class="panel hero">
         <div class="eyebrow">PAPER PORTFOLIO</div>
@@ -402,7 +408,6 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
 
     <section class="page" id="charts">
       <div class="panel"><div class="panelHead"><h2>Live tape</h2><span class="chip">LOCAL READ</span></div><div class="sub" id="liveStatus" style="margin-bottom:8px">Waiting for ingest…</div><div id="liveGrid" class="liveGrid"></div></div>
-      <div class="panel"><div class="panelHead"><h2>Forward paper results by ticker</h2><span class="chip">BROKER FILLS</span></div><div id="marketGrid" class="marketGrid"></div></div>
       <div class="panel">
         <div class="panelHead"><h2>Daily price workspace</h2><div class="tabrow" id="chartLayoutTabs"><button class="tab active" data-layout="1" onclick="setLayout(1,this)">1</button><button class="tab" data-layout="2" onclick="setLayout(2,this)">2</button><button class="tab" data-layout="4" onclick="setLayout(4,this)">2×2</button><button class="tab" data-layout="6" onclick="setLayout(6,this)">3×2</button></div></div>
         <div id="multiCharts" class="grid2"></div>
@@ -412,7 +417,14 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
           <div id="mtfCharts" class="mtfGrid"></div>
         </div>
       </div>
-      <div class="panel"><div class="panelHead"><h2>Strategy Lens</h2><div class="tabrow" id="lensTabs"></div></div><div class="sub" id="lensDesc"></div></div>
+      <details class="panel">
+        <summary>Forward paper by ticker</summary>
+        <div class="detailBody"><div id="marketGrid" class="marketGrid"></div></div>
+      </details>
+      <details class="panel">
+        <summary>Strategy Lens</summary>
+        <div class="detailBody"><div class="tabrow" id="lensTabs"></div><div class="sub" id="lensDesc"></div></div>
+      </details>
     </section>
 
     <section class="page" id="replay">
@@ -449,8 +461,14 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
     <section class="page" id="strategies">
       <div class="panel"><div class="panelHead"><h2>Forward paper P&amp;L by strategy</h2><span class="chip">LIVE PAPER DATA</span></div><div id="strategyBars" class="signedBars"></div><div id="strategyBarsSummary" class="chartSummary"></div></div>
       <div id="strategyGrid" class="strategyGrid"></div>
-      <div class="panel"><div class="panelHead"><h2>Signal overlap matrix</h2><span class="chip">ENSEMBLE RESEARCH</span></div><div id="overlapMatrix"></div></div>
-      <div class="panel"><div class="panelHead"><h2>Historical model vs forward paper</h2><span class="chip">DRIFT MONITOR</span></div><div class="tableWrap"><table><thead><tr><th>Strategy</th><th>Fire rate</th><th>Forward N</th><th>Win 95% CI</th><th>Expectancy</th><th>Historical ref</th><th>Sample</th></tr></thead><tbody id="driftRows"></tbody></table></div></div>
+      <details class="panel">
+        <summary>Signal overlap matrix</summary>
+        <div class="detailBody"><div id="overlapMatrix"></div></div>
+      </details>
+      <details class="panel">
+        <summary>Historical model vs forward paper</summary>
+        <div class="detailBody"><div class="tableWrap"><table><thead><tr><th>Strategy</th><th>Fire rate</th><th>Forward N</th><th>Win 95% CI</th><th>Expectancy</th><th>Historical ref</th><th>Sample</th></tr></thead><tbody id="driftRows"></tbody></table></div></div>
+      </details>
     </section>
 
     <section class="page" id="research">
@@ -463,6 +481,8 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
         <div class="panel"><div class="panelHead"><h2>Session coverage</h2><span class="chip">FULL RTH · GAPS ONLY</span></div><div id="labCovGrid" class="covGrid"></div></div>
         <div class="panel"><div class="panelHead"><h2>Miss reasons</h2><span class="chip">PARETO</span></div><div id="reasonPareto"></div></div>
       </div>
+      <details class="panel" id="labMore"><summary>More research</summary>
+      <div class="detailBody">
       <div class="panel">
         <div class="panelHead"><h2>Where MVR fires versus misses</h2><span class="chip">ATR FROM VWAP</span></div>
         <div class="chart"><canvas id="stretchChart" aria-label="MVR fires and misses by ATR distance from VWAP" aria-describedby="mvrStats"></canvas></div>
@@ -511,16 +531,44 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
       </div>
       <div class="panel"><div class="panelHead"><h2>Lab snapshots</h2><button class="btn" onclick="saveSnap()">SAVE NOW</button></div><div id="snapList"></div></div>
       <div class="panel"><div class="panelHead"><h2>Research controls</h2></div><button class="btn primary" onclick="preview()">Run all 12 now (preview only)</button> <button class="btn" onclick="ingestNow()">Ingest live tape</button> <button class="btn" onclick="backup()">Create local backup</button> <button class="btn" onclick="location.href=ashUrl('/api/export')">Export research pack</button><pre id="previewOut" class="sub"></pre></div>
+      </div>
+      </details>
     </section>
 
     <section class="page" id="activity">
-      <div class="panel"><div class="panelHead"><h2>Trade graphs</h2><div class="tabrow"><span class="chip">CANDLES · VWAP · ENTRY</span><button class="chip" onclick="reconcile()">RECONCILE</button></div></div>
-        <div class="legend"><span><i style="background:#f1b94e"></i>VWAP</span><span><i style="background:#73bfff"></i>OPENING RANGE</span><span><i style="background:#4ee693"></i>ENTRY / CALL</span><span><i style="background:#ff626c"></i>PUT / EXIT</span></div>
+      <div class="panel">
+        <div class="panelHead"><h2>Session</h2><span class="chip" id="actSessionChip">BOOK</span></div>
+        <div id="sessionThread"></div>
+        <div class="threadComposer">
+          <label for="dqAct1">What actually happened vs the setup?</label>
+          <textarea id="dqAct1" maxlength="800"></textarea>
+          <label for="dqAct2">What would you not repeat?</label>
+          <textarea id="dqAct2" maxlength="800"></textarea>
+          <label for="dqAct3">What will you measure tomorrow?</label>
+          <textarea id="dqAct3" maxlength="800"></textarea>
+          <button class="btn primary" onclick="postSessionDebrief()">POST DEBRIEF</button>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panelHead"><h2>Open fills</h2><button type="button" class="btn" onclick="reconcile()">RECONCILE</button></div>
+        <div id="actWriteMsg" class="actWriteMsg"></div>
+        <div class="tableWrap"><table><thead><tr><th>ID</th><th>Strategy</th><th>Ticker</th><th>Side</th><th>Contract</th><th>Status</th><th>Entry</th><th>Mark</th><th>P&amp;L</th><th>Note</th></tr></thead><tbody id="openTradeRows"></tbody></table></div>
+        <div class="legend" style="margin-top:10px"><span><i style="background:#f1b94e"></i>VWAP</span><span><i style="background:#73bfff"></i>OPENING RANGE</span><span><i style="background:#4ee693"></i>ENTRY / CALL</span><span><i style="background:#ff626c"></i>PUT / EXIT</span></div>
         <div id="tradeBoard" class="tradeBoard" style="margin-top:10px"></div>
       </div>
-      <div class="panel"><div class="panelHead"><h2>Paper trades</h2></div><div class="tableWrap"><table><thead><tr><th>ID</th><th>Strategy</th><th>Ticker</th><th>Side</th><th>Contract</th><th>Status</th><th>Entry</th><th>Mark</th><th>P&L</th></tr></thead><tbody id="tradeRows"></tbody></table></div></div>
-      <div class="panel"><div class="panelHead"><h2>Signal tape</h2></div><div class="tableWrap"><table><thead><tr><th>Time</th><th>Strategy</th><th>Ticker</th><th>Direction</th><th>Window</th><th>Execution</th><th>Details</th></tr></thead><tbody id="signalRows"></tbody></table></div></div>
-      <div class="panel"><div class="panelHead"><h2>Event stream</h2><span class="chip" id="errChip">ERRORS</span></div><div id="errorTax"></div><div id="events"></div></div>
+      <div class="panel">
+        <div class="panelHead"><h2>Closed fills</h2></div>
+        <div class="tableWrap"><table><thead><tr><th>ID</th><th>Strategy</th><th>Ticker</th><th>Side</th><th>Contract</th><th>Status</th><th>Entry</th><th>Mark</th><th>P&amp;L</th><th>Note</th></tr></thead><tbody id="tradeRows"></tbody></table></div>
+        <div id="closedThreads"></div>
+      </div>
+      <details class="panel">
+        <summary>Signal tape</summary>
+        <div class="detailBody"><div class="tableWrap"><table><thead><tr><th>Time</th><th>Strategy</th><th>Ticker</th><th>Direction</th><th>Window</th><th>Execution</th><th>Details</th></tr></thead><tbody id="signalRows"></tbody></table></div></div>
+      </details>
+      <details class="panel">
+        <summary>Event stream <span class="chip" id="errChip">ERRORS</span></summary>
+        <div class="detailBody"><div id="errorTax"></div><div id="events"></div></div>
+      </details>
     </section>
 
     <section class="page" id="settings">
@@ -564,7 +612,7 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
   </div>
   <div class="metric"><span>Wake lock binary</span><b id="wakeLock">—</b></div>
   <div class="metric"><span>Install</span><b>Add to Home Screen / PWA from the browser menu</b></div>
-  <div class="keys">h home · c charts · r replay · m models · l lab · a activity · s settings · i ingest · Shift+R reconcile</div>
+  <div class="keys">h home · a activity · c charts · m models · l lab · s settings · i ingest · Shift+R reconcile</div>
 </div>
 <div class="panel"><h2>Data integrity</h2><div id="integrityBox"></div>
   <div class="metric"><span>Runner watchdog</span><b id="wdLine"><span class="wdPulse" id="wdPulse"></span>—</b></div>
@@ -591,11 +639,10 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
 
 <nav class="bottomNav hidden" id="nav" aria-label="Primary">
   <button class="nav active" data-page="home" aria-current="page" onclick="go('home',this)"><b>◉</b>Home</button>
+  <button class="nav" data-page="activity" onclick="go('activity',this);markSeen()"><b>≡</b>Activity<span class="navBadge hidden" id="actBadge"></span></button>
   <button class="nav" data-page="charts" onclick="go('charts',this)"><b>⌁</b>Charts</button>
-  <button class="nav" data-page="replay" onclick="go('replay',this)"><b>▷</b>Replay</button>
   <button class="nav" data-page="strategies" onclick="go('strategies',this)"><b>▦</b>Models</button>
   <button class="nav" data-page="research" onclick="go('research',this)"><b>⌬</b>Lab</button>
-  <button class="nav" data-page="activity" onclick="go('activity',this);markSeen()"><b>≡</b>Activity<span class="navBadge hidden" id="actBadge"></span></button>
 </nav>
 
 <script>
@@ -1946,7 +1993,7 @@ function cutOrigin(source,id){
   return r&&r.width?{x:r.left+r.width/2,y:r.top+r.height/2}:{x:innerWidth*.5,y:innerHeight-70}
 }
 function cutSide(from,to){
-  let order=['home','charts','replay','strategies','research','activity','settings'],a=order.indexOf(from),b=order.indexOf(to);
+  let order=['home','activity','charts','strategies','research','settings','replay'],a=order.indexOf(from),b=order.indexOf(to);
   return a<0||b<0||a===b?1:(b>a?1:-1)
 }
 async function go(id,source){
@@ -2159,7 +2206,7 @@ let refreshAbort=null,detailAbort=null,refreshSerial=0;
 function activePageId(){return document.querySelector('.page.active')?.id||'home'}
 function ensureState(){
   STATE.ov=STATE.ov||{ids:[],matrix:{}};STATE.dr=STATE.dr||{rows:[]};STATE.tradeBoard=STATE.tradeBoard||{trades:[]};
-  STATE.rm=STATE.rm||{today:{}};STATE.ws=STATE.ws||{};STATE.updated=STATE.updated||{}
+  STATE.rm=STATE.rm||{today:{}};STATE.ws=STATE.ws||{};STATE.updated=STATE.updated||{};STATE.comments=STATE.comments||[]
 }
 function aborted(e){return e&&e.name==='AbortError'}
 async function refreshHome(signal){
@@ -2182,8 +2229,14 @@ async function refreshStrategies(signal){
   Object.assign(STATE,{d,ov,dr});STATE.updated.model=Date.now()
 }
 async function refreshActivity(signal){
-  let[tr,si,ev,tradeBoard]=await Promise.all([api('/api/trades?days=30',{signal}),api('/api/signals',{signal}),api('/api/events',{signal}),api('/api/trade_board',{signal})]);
-  Object.assign(STATE,{tr,si,ev,tradeBoard})
+  let[tr,si,ev,tradeBoard,co]=await Promise.all([
+    api('/api/trades?days=30',{signal}),
+    api('/api/signals',{signal}),
+    api('/api/events',{signal}),
+    api('/api/trade_board',{signal}),
+    api('/api/comments?days=30',{signal}).catch(()=>({comments:[]}))
+  ]);
+  Object.assign(STATE,{tr,si,ev,tradeBoard,comments:co.comments||[]})
 }
 async function refreshResearch(signal){
   let[d,live,rm,ws]=await Promise.all([api('/api/dashboard',{signal}),api('/api/live',{signal}),api('/api/research_metrics',{signal}),api('/api/workspace',{signal})]);
@@ -2199,7 +2252,7 @@ async function renderPage(page,signal){
   else if(page==='charts')renderChartOverview();
   else if(page==='strategies'&&STATE.d)renderModels();
   else if(page==='research'&&STATE.rm)await renderResearch(signal);
-  else if(page==='activity'&&STATE.tr&&STATE.si&&STATE.ev){renderActivity();await renderTradeBoard('tradeBoard')}
+  else if(page==='activity'&&STATE.tr&&STATE.si&&STATE.ev){renderActivity();await renderTradeBoard('tradeBoard',true)}
   else if(page==='settings'&&STATE.status){renderHealth(STATE.status);renderOps()}
 }
 async function refreshAll(page=activePageId(),shouldRender=true){
@@ -2275,8 +2328,21 @@ function renderExplain(){
   if($('explainHead'))$('explainHead').textContent=ex.headline||'What’s going on';
   if($('explainBody'))$('explainBody').innerHTML=(ex.paragraphs&&ex.paragraphs.length)?ex.paragraphs.map(p=>`<p>${p}</p>`).join(''):'<p>The runner is up. Home paints the session clock first, then this box fills in from the live tape.</p>';
   if($('explainWhy'))$('explainWhy').innerHTML=(ex.why_not||[]).map(x=>`<div>${x}</div>`).join('');
-  if($('explainBooks'))$('explainBooks').innerHTML=(ex.books||[]).map(b=>`<div class=sessionBook aria-label="${b.id} ${b.when||''}: ${b.what||''}"><b>${b.id}</b><span>${b.when||''}</span></div>`).join('');
-  if($('explainBookDetails'))$('explainBookDetails').innerHTML=(ex.books||[]).map(b=>`<div class=explainBook><b>${b.id}</b><span>${b.when||''}</span><p>${b.what||''}</p></div>`).join('')||'<div class=sub>No active model book in this window.</div>';
+  let clk=(STATE.live&&STATE.live.clock)||(STATE.status&&STATE.status.clock)||{};
+  let live=new Set(clk.current||[]);
+  let books=ex.books||[];
+  let pills=live.size?books.filter(b=>live.has(b.id)):books.slice(0,0);
+  if($('explainBooks'))$('explainBooks').innerHTML=pills.map(b=>`<div class=sessionBook aria-label="${b.id} ${b.when||''}: ${b.what||''}"><b>${b.id}</b><span>${b.when||''}</span></div>`).join('');
+  if($('explainBookDetails'))$('explainBookDetails').innerHTML=books.map(b=>`<div class=explainBook><b>${b.id}</b><span>${b.when||''}</span><p>${b.what||''}</p></div>`).join('')||'<div class=sub>No active model book in this window.</div>';
+}
+function brandStamp(clk){
+  if(!clk)return 'V10';
+  if(clk.phase==='WEEKEND') return 'V10 · WEEKEND';
+  if(clk.phase==='CLOSED') return 'V10 · CLOSED';
+  if(clk.phase==='PRE') return 'V10 · PRE';
+  let cur=clk.current||[];
+  if(cur.length) return 'V10 · '+cur.join(' · ');
+  return 'V10 · '+(clk.phase||'WATCH');
 }
 function sampleCls(s){return s==='STABLE'?'up':s==='UNDERPOWERED'?'amber':'muted'}
 function histChart(c,bins){
@@ -2339,12 +2405,12 @@ function renderHome(){
   $('portfolioValue').textContent=money(a.portfolio_value||a.equity);
   $('portfolioDelta').innerHTML=`Today <b class="${session>=0?'up':'down'}">${signedMoney(session)}</b> · cash ${money(a.cash)} · open P&amp;L <b class="${u>=0?'up':'down'}">${signedMoney(u)}</b> · broker day ${signedMoney(brokerDay)}`;
   let midday=live.midday||[],fires=t.fires??midday.filter(x=>x.eligible).length,opportunities=t.opportunities??midday.length;
-  $('homeKpis').innerHTML=[['Realized',signedMoney(realized),realized],['Open P&L',signedMoney(u),u],['Session tape',pct(cov)],['Today fires',`${fires} / ${opportunities}`]].map(([label,value,n])=>`<div class=kpi><span>${label}</span><b${n==null?'':` class="${Number(n)>=0?'up':'down'}"`}>${value}</b></div>`).join('');
+  $('homeKpis').innerHTML=[['Realized',signedMoney(realized),realized],['Open P&L',signedMoney(u),u],['Session tape',pct(cov),null],['Today fires',`${fires} / ${opportunities}`,null]].map(([label,value,n])=>`<div class=kpi><span>${label}</span><b${n==null||n===''?'':` class="${Number(n)>=0?'up':'down'}"`}>${value}</b></div>`).join('');
   renderEquityChart(d.curve||[]);
   $('covChip').textContent=clk?.phase|| (cov==null?'SESSION TAPE':`TAPE ${pct(cov)}`);
   if($('sessionClock'))$('sessionClock').textContent=clockLabel(clk);
+  if($('brandStamp'))$('brandStamp').textContent=brandStamp(clk);
   renderExplain();
-  if($('labNote'))$('labNote').textContent=clk?.current?.length?'Scan is live — watch distance-to-fire, not P&L.':'Between windows. Same-day fills count as one day of sample, not N independent tests.';
   $('labStrip').innerHTML=[['Fires',fires],['Misses',t.misses??Math.max(0,opportunities-fires)],['Top miss',t.top_miss||'expand to load'],['Next',clk?.next?clk.next.id+' '+clk.next.start:(clk?.phase||'—')]].map(([label,value])=>`<div class=kpi><span>${label}</span><b>${value}</b></div>`).join('');
   $('todayReasons').innerHTML=reasonBars(t.reasons||[]);
   renderWatchlist();renderHomeOpenTrades();renderOps();renderHomeSummaries()
@@ -2354,7 +2420,7 @@ function renderWatchlist(){
   let rows=(STATE.live&&STATE.live.watchlist)||[];
   el.innerHTML=rows.length?rows.slice(0,4).map(x=>{
     let s=x.setup||{};
-    return `<div class=liveRow><div class=strategyTop><b>${x.sym}</b><span class="${s.fired?'up':'amber'}">${setupChip(s)}</span></div>
+    return `<div class=liveRow role=button tabindex=0 onclick="openTicker('${x.sym}')" onkeydown="activateClick(event)" aria-label="Open ${x.sym} chart"><div class=strategyTop><b>${x.sym}</b><span>${setupChip(s)}</span></div>
       ${setupBar(s)}
       <div class=liveMeta>${setupWatchMeta(s,x)}</div>
       ${s.book_label?`<div class=liveMeta>${s.book_label}</div>`:''}</div>`
@@ -2396,7 +2462,80 @@ function paintLiveSparks(){
   })
 }
 function strategyCard(x){let opt=x.opt?`${x.opt.dte||''} ${x.opt.moneyness||''}`.trim():'';let sample=x.sample||'COLLECTING';let wr=x.winLo!=null?`${pct(x.winLo)}–${pct(x.winHi)}`:(x.closed?pct(x.wins/x.closed):'—');let note=(STATE.ws&&STATE.ws.notes&&STATE.ws.notes[x.id])||{};let plain=x.plain||note.plain||x.desc||'';return `<div class=strategy><div class=strategyTop><b>${x.id}</b><span class=origin>${x.session||x.origin}</span></div><h3>${x.name}</h3><p>${plain}</p><p>${x.horizon||'—'} · ${opt||x.author} · fire ${x.fires||0}/${x.opportunities||0} · ${x.nDays||0}d</p><div class=metric><span>Fire rate</span><b>${x.opportunities?pct(x.fireRate):'—'}</b></div><div class=metric><span>Win 95% CI</span><b>${wr}</b></div><div class=metric><span>Expectancy</span><b class="${Number(x.expectancy||0)>=0?'up':'down'}">${x.expectancy==null?'—':signedMoney(x.expectancy)}</b></div><div class=metric><span>Sample</span><b class="${sampleCls(sample)}">${sample}${x.nDays?` · ${x.nDays}d`:''}</b></div></div>`}
-function renderActivity(){let{tr,si,ev}=STATE;$('tradeRows').innerHTML=tr.trades.map(x=>{let pnl=tradeRowPnl(x);return `<tr>${td('ID',x.id,'num')}${td('Strategy',x.strategy_id)}${td('Ticker',x.ticker)}${td('Side',x.direction)}${td('Contract',x.option_symbol||'—')}${td('Status',x.status)}${td('Entry',x.entry_fill==null?'—':money(x.entry_fill),'num')}${td('Mark',x.mark==null?'—':money(x.mark),'num')}${td('P&L',pnl==null?'—':signedMoney(pnl),`num ${Number(pnl||0)>=0?'up':'down'}`)}</tr>`}).join('');$('signalRows').innerHTML=si.signals.map(x=>`<tr>${td('Time',new Date(x.ts).toLocaleString())}${td('Strategy',x.strategy_id)}${td('Ticker',x.ticker)}${td('Direction',x.direction)}${td('Window',x.window||x.horizon||'15:45')}${td('Execution',signalExec(x))}${td('Details',x.details)}</tr>`).join('');$('events').innerHTML=ev.events.map(x=>`<div class=metric><span>${new Date(x.ts).toLocaleString()} · ${x.level}</span><b>${x.message}</b></div>`).join('')}
+function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function lastCommentFor(targetType,targetId){
+  let rows=(STATE.comments||[]).filter(p=>p.target_type===targetType&&String(p.target_id)===String(targetId));
+  return rows.length?rows[rows.length-1]:null
+}
+function commentsForTrade(id){
+  let trade=(STATE.tr&&STATE.tr.trades||[]).find(t=>String(t.id)===String(id));
+  let rows=(STATE.comments||[]).filter(p=>{
+    if(p.target_type==='trade'&&String(p.target_id)===String(id)) return true;
+    if(p.target_type==='session'&&trade&&p.target_id===trade.trade_date) return true;
+    if(p.target_type==='signal'&&trade&&p.strategy_id===trade.strategy_id&&p.ticker===trade.ticker&&p.trade_date===trade.trade_date) return true;
+    return false
+  });
+  rows.sort((a,b)=>a.id-b.id);
+  return rows
+}
+function threadHTML(posts,target,kinds){
+  kinds=kinds||['INTENT','EXIT'];
+  let list=(posts||[]).map(p=>`<div class=threadPost><div class=threadKind>${escapeHtml(p.kind)} · ${p.ts?new Date(p.ts).toLocaleString():''}</div><p class=threadBody>${escapeHtml(p.body)}</p></div>`).join('')||'<div class=sub>No notes yet.</div>';
+  let chips=kinds.map((k,i)=>`<button type=button class="tab${i===0?' active':''}" data-kind="${k}" onclick="pickCommentKind(this)">${k}</button>`).join('');
+  return `<div class=thread data-type="${target.type}" data-id="${target.id}">${list}<div class=threadComposer><div class=tabrow>${chips}</div><textarea class=threadInput maxlength="800" aria-label="Comment"></textarea><button type=button class="btn" onclick="submitComment(this)">POST</button></div></div>`
+}
+function pickCommentKind(el){el.parentElement.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===el))}
+async function submitComment(btn){
+  let box=btn.closest('.thread'); if(!box)return;
+  let kind=(box.querySelector('.tab.active')||{}).dataset.kind||'INTENT';
+  let body=(box.querySelector('.threadInput')||{}).value||'';
+  try{
+    await api('/api/comments',{method:'POST',body:JSON.stringify({kind,target_type:box.dataset.type,target_id:box.dataset.id,body})});
+    await reloadComments();
+    if(activePageId()==='activity'){renderActivity();renderTradeBoard('tradeBoard',true)}
+  }catch(e){if($('actWriteMsg'))$('actWriteMsg').textContent=e.message}
+}
+async function postSessionDebrief(){
+  let date=(STATE.d&&STATE.d.totals&&STATE.d.totals.sessionDate)||(STATE.tr&&STATE.tr.as_of&&String(STATE.tr.as_of).slice(0,10))||new Date().toLocaleDateString('en-CA');
+  let prompts=[['dqAct1','What actually happened vs the setup?'],['dqAct2','What would you not repeat?'],['dqAct3','What will you measure tomorrow?']];
+  try{
+    for(let [id,label] of prompts){
+      let text=($(id).value||'').trim();
+      if(!text) continue;
+      await api('/api/comments',{method:'POST',body:JSON.stringify({kind:'DEBRIEF',target_type:'session',target_id:date,body:label+' '+text})});
+      $(id).value='';
+    }
+    await reloadComments();
+    if(activePageId()==='activity'){renderActivity();renderTradeBoard('tradeBoard',true)}
+  }catch(e){if($('actWriteMsg'))$('actWriteMsg').textContent=e.message}
+}
+async function reloadComments(){
+  try{let j=await api('/api/comments?days=30');STATE.comments=j.comments||[]}catch(e){STATE.comments=STATE.comments||[]}
+}
+function commentSnippet(t){
+  let last=lastCommentFor('trade',t.id); if(!last) return '—';
+  let line=(last.body||'').slice(0,80); return `${last.kind} · ${line}`
+}
+function tradeTableRow(x){
+  let pnl=tradeRowPnl(x);
+  return `<tr>${td('ID',x.id,'num')}${td('Strategy',x.strategy_id)}${td('Ticker',x.ticker)}${td('Side',x.direction)}${td('Contract',x.option_symbol||'—')}${td('Status',x.status)}${td('Entry',x.entry_fill==null?'—':money(x.entry_fill),'num')}${td('Mark',x.mark==null?'—':money(x.mark),'num')}${td('P&L',pnl==null?'—':signedMoney(pnl),`num ${Number(pnl||0)>=0?'up':'down'}`)}${td('Note',commentSnippet(x))}</tr>`
+}
+function renderActivity(){
+  let{tr,si,ev}=STATE; tr=tr||{trades:[]}; si=si||{signals:[]}; ev=ev||{events:[]};
+  let trades=tr.trades||[];
+  let open=trades.filter(x=>OPEN_ST.has(x.status));
+  let closed=trades.filter(x=>!OPEN_ST.has(x.status));
+  if($('openTradeRows'))$('openTradeRows').innerHTML=open.map(tradeTableRow).join('')||'';
+  if($('tradeRows'))$('tradeRows').innerHTML=closed.map(tradeTableRow).join('')||'';
+  if($('signalRows'))$('signalRows').innerHTML=(si.signals||[]).map(x=>`<tr>${td('Time',new Date(x.ts).toLocaleString())}${td('Strategy',x.strategy_id)}${td('Ticker',x.ticker)}${td('Direction',x.direction)}${td('Window',x.window||x.horizon||'15:45')}${td('Execution',signalExec(x))}${td('Details',x.details)}</tr>`).join('');
+  if($('events'))$('events').innerHTML=(ev.events||[]).map(x=>`<div class=metric><span>${new Date(x.ts).toLocaleString()} · ${x.level}</span><b>${x.message}</b></div>`).join('');
+  let date=(trades[0]&&trades[0].trade_date)||'';
+  let sessionPosts=(STATE.comments||[]).filter(p=>p.target_type==='session'&&(!date||p.target_id===date||p.trade_date===date));
+  let intentN=(STATE.comments||[]).filter(p=>p.kind==='INTENT'||p.kind==='EXIT').length;
+  if($('actSessionChip'))$('actSessionChip').textContent=intentN?`${intentN} NOTES`:'BOOK';
+  if($('sessionThread'))$('sessionThread').innerHTML=(sessionPosts.length?sessionPosts.map(p=>`<div class=threadPost><div class=threadKind>${escapeHtml(p.kind)} · ${p.ts?new Date(p.ts).toLocaleString():''}</div><p class=threadBody>${escapeHtml(p.body)}</p></div>`).join(''):'<div class=sub>No session debrief yet.</div>');
+  if($('closedThreads'))$('closedThreads').innerHTML=closed.slice(0,12).map(t=>`<div class=panel style="margin:10px 0 0">${escapeHtml(t.strategy_id)} ${escapeHtml(t.ticker)} ${escapeHtml(t.direction)}${threadHTML(commentsForTrade(t.id),{type:'trade',id:t.id},t.status==='CLOSED'?['INTENT','EXIT']:['INTENT','EXIT'])}</div>`).join('');
+}
 function tradeCardHTML(pack,target){
   let t=pack.trade||{}, pnl=pack.livePnl, open=t.status==='OPEN'||t.status==='ENTRY_SUBMITTED'||t.status==='EXIT_SUBMITTED';
   let exitHint=t.horizon==='EOD'?'EXIT 3:50 PM':'EXIT NEXT OPEN';
@@ -2420,7 +2559,7 @@ function tradeCardHTML(pack,target){
       <div class=metric><span>Fill latency</span><b>${pack.latencySec==null?'—':Math.round(pack.latencySec)+'s'}</b></div>
     </div>
     <div class=sub>${(pack.checklist&&pack.checklist.items||[]).map(i=>(i.ok?'✓ ':'✗ ')+i.label).join(' · ')}</div>
-    <input aria-label="Comment for ${t.strategy_id} ${t.ticker} trade" placeholder="comment" value="${(t.comment||'').replace(/"/g,'')}" onchange="commentTrade(${t.id},this.value)">
+    ${threadHTML(commentsForTrade(t.id),{type:'trade',id:t.id},open?['INTENT']:['INTENT','EXIT'])}
   </div>`
 }
 function tradeChart(c,pack,opts={}){
@@ -2526,7 +2665,16 @@ function resetSurface(){surfaceRot.x=-.38;surfaceRot.y=.68;drawSurface()}
 const sc=$('surfaceCanvas');sc.addEventListener('pointerdown',e=>{surfaceRot.drag=true;surfaceRot.lx=e.clientX;surfaceRot.ly=e.clientY;sc.setPointerCapture?.(e.pointerId)});sc.addEventListener('pointerup',e=>{surfaceRot.drag=false;sc.releasePointerCapture?.(e.pointerId)});sc.addEventListener('pointercancel',()=>surfaceRot.drag=false);sc.addEventListener('pointermove',e=>{if(!surfaceRot.drag)return;rotateSurface((e.clientY-surfaceRot.ly)*.008,(e.clientX-surfaceRot.lx)*.008);surfaceRot.lx=e.clientX;surfaceRot.ly=e.clientY});sc.addEventListener('keydown',e=>{if(e.key==='ArrowLeft'){rotateSurface(0,-.12);e.preventDefault()}else if(e.key==='ArrowRight'){rotateSurface(0,.12);e.preventDefault()}else if(e.key==='ArrowUp'){rotateSurface(-.1,0);e.preventDefault()}else if(e.key==='ArrowDown'){rotateSurface(.1,0);e.preventDefault()}else if(e.key.toLowerCase()==='r'){resetSurface();e.preventDefault()}})
 async function preview(){$('previewOut').textContent='Evaluating 3:45 models + opening/midday sleeves from local tape...';try{$('previewOut').textContent=JSON.stringify(await api('/api/preview',{method:'POST',body:'{}'}),null,2)}catch(e){$('previewOut').textContent='ERROR: '+e.message}}
 async function ingestNow(){$('previewOut').textContent='Ingesting IEX into local SQLite + data/live...';try{$('previewOut').textContent=JSON.stringify(await api('/api/ingest',{method:'POST',body:'{}'}),null,2);await refreshAll()}catch(e){$('previewOut').textContent='ERROR: '+e.message}}
-async function reconcile(){await api('/api/reconcile',{method:'POST',body:'{}'});refreshAll()}
+async function reconcile(){
+  try{
+    await api('/api/reconcile',{method:'POST',body:'{}'});
+    if($('actWriteMsg'))$('actWriteMsg').textContent='';
+    refreshAll()
+  }catch(e){
+    if($('actWriteMsg'))$('actWriteMsg').textContent=e.message;
+    if($('guestBanner'))$('guestBanner').classList.remove('hidden')
+  }
+}
 async function backup(){let j=await api('/api/backup',{method:'POST',body:'{}'});alert('Backup created: '+j.file)}
 function setIntroTheme(name){
   localStorage.setItem('ashIntroTheme',name);
@@ -2623,6 +2771,7 @@ function applyStatus(s){
   STATE.status=s;ensureState();
   if($('staleBanner'))$('staleBanner').classList.toggle('hidden',!(s.data_stale||s.watchdog_stale));
   if($('guestBanner'))$('guestBanner').classList.toggle('hidden',!s.guest);
+  if($('brandStamp')&&s.clock)$('brandStamp').textContent=brandStamp(s.clock);
   if($('wakeLock'))$('wakeLock').textContent=s.wake_lock?'PRESENT':'not found';
   let n=s.unread_errors||0,b=$('actBadge'); if(b){b.textContent=n||'';b.classList.toggle('hidden',!n)}
   let stale=!!(s.watchdog_stale||s.data_stale), age=s.heartbeat_age;
@@ -2667,7 +2816,6 @@ async function saveThresholds(){
   try{$('thPreview').textContent=JSON.stringify(await api('/api/thresholds',{method:'POST',body:JSON.stringify(body)}),null,2)}catch(e){$('thPreview').textContent=e.message}
 }
 async function saveSnap(){await api('/api/lab_snapshot',{method:'POST',body:JSON.stringify({label:'manual'})});renderLabExtras()}
-async function commentTrade(id,v){await api('/api/trades/'+id,{method:'PATCH',body:JSON.stringify({comment:v})})}
 async function markSeen(){try{await api('/api/events/seen',{method:'POST',body:'{}'});let b=$('actBadge');if(b)b.classList.add('hidden')}catch(e){}}
 async function loadLiveReplay(){
   let t=$('replayTicker').value,d=$('replayDate').value;$('replayStatus').textContent='';
@@ -2675,7 +2823,12 @@ async function loadLiveReplay(){
   try{let j=await api(`/api/replay_live/${t}?date=${d}`);replay.bars=j.bars;replay.i=1;replay.inspect=null;replay.signals=(j.evals||[]).filter(e=>e.eligible).map(e=>({strategy_id:e.strategy_id,direction:e.direction,directionWorked:null}));replay.context={live:true};renderReplay();$('replayStatus').textContent=`${replay.bars.length} local minutes · ${(j.evals||[]).length} journal rows`}
   catch(e){$('replayStatus').textContent='ERROR: '+e.message;chartEmpty($('replayChart'));chartEmpty($('replayVolume'))}
 }
-function setDensity(name){localStorage.setItem('ashDensity',name);document.body.classList.toggle('density-monitor',name==='monitor')}
+function setDensity(name){
+  if(name) localStorage.setItem('ashDensity',name);
+  let saved=localStorage.getItem('ashDensity');
+  let use=saved||((innerWidth<=850&&activePageId()!=='research')?'monitor':'lab');
+  document.body.classList.toggle('density-monitor',use==='monitor')
+}
 let chartFocus=null,xhair=null,chartAbort=null,chartSerial=0;
 async function renderMulti(){
   if(activePageId()!=='charts')return;
@@ -2721,9 +2874,9 @@ addEventListener('keydown',e=>{
 let resizeRaf=0;
 addEventListener('resize',()=>{
   fitAmbient();fitFx();if(resizeRaf)cancelAnimationFrame(resizeRaf);
-  resizeRaf=requestAnimationFrame(()=>{resizeRaf=0;let page=activePageId();if(page==='home'&&STATE.d)renderHome();else if(page==='charts'){renderChartOverview();renderMulti()}else if(page==='strategies'&&STATE.d)renderModels();else if(page==='replay'&&replay.bars.length)renderReplay();else if(page==='research'){if(STATE.rm)histChart($('stretchChart'),STATE.rm.stretch_bins||[]);drawSurface()}else if(page==='activity'&&STATE.tradeBoard)renderTradeBoard('tradeBoard')})
+  resizeRaf=requestAnimationFrame(()=>{resizeRaf=0;let page=activePageId();if(page==='home'&&STATE.d)renderHome();else if(page==='charts'){renderChartOverview();renderMulti()}else if(page==='strategies'&&STATE.d)renderModels();else if(page==='replay'&&replay.bars.length)renderReplay();else if(page==='research'){if(STATE.rm)histChart($('stretchChart'),STATE.rm.stretch_bins||[]);drawSurface()}else if(page==='activity'&&STATE.tradeBoard)renderTradeBoard('tradeBoard',true)})
 });
-syncIntroUI();setDensity(localStorage.getItem('ashDensity')||'lab');primeDesk().catch(()=>{});boot();
+syncIntroUI();setDensity();primeDesk().catch(()=>{});boot();
 function haltLockedScroll(e){
   if(!document.body.classList.contains('needs-keys'))return;
   if(e.target.closest&&e.target.closest('input,textarea,select'))return;

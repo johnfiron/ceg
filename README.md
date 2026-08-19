@@ -7,8 +7,8 @@ Open http://127.0.0.1:8765
 ## What it is
 
 - Session clock and plain-language explain on Home
+- Activity is the paper book (open/closed fills + comment threads). Replay stays in the file, hidden from the dock.
 - Fifteen models: 3:45 overnight (CEG, VCT, XED, …) and midday sleeves (OPN, OSF, ORB, VRC, MVR)
-- Replay with directional hit rate — not historical option P&L
 - Lab: shadow book, debrief, snapshots, research metrics
 - Title door: flakes or candles × white / market / pink. Identity default is **flakes + white**. Path-drawn A is shipped; do not rebuild it.
 
