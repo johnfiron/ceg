@@ -4,4 +4,4 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/opt/ash/repo/deploy/deploy-main.sh
+ExecStart=/usr/local/sbin/ash-deploy-main

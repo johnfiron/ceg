@@ -70,6 +70,12 @@ class SafetyTests(unittest.TestCase):
         self.assertIn('fetch(ashUrl(p)',html)
         self.assertIn("serviceWorker.register(ashUrl('/sw.js')",html)
         self.assertIn('href="manifest.webmanifest"',html)
+        self.assertIn("xhair=bars[index]?.t??null",html)
+        self.assertNotIn("[{date:null,cumPnl:0}]",html)
+        self.assertIn("Date.now()-(chartDataAt[t]||0)>60000",html)
+        self.assertIn("s.filter(x=>(x.closed||0)>0)",html)
+        self.assertIn("['SPY','QQQ','IWM'].includes(t)?'INDEX':'EQUITY'",html)
+        self.assertIn('amber squares = flat',html)
 
     def _paper_cfg(self):
         app.CFG.write_text(json.dumps({
@@ -128,6 +134,47 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(row['exit_fill'],3.6)
         self.assertAlmostEqual(row['pnl'],-210.0)
 
+    def test_ledger_repair_pairs_legacy_duplicate_contracts_once_in_time_order(self):
+        self._wipe_trades()
+        con=app.db()
+        for tid,fill,entered in ((1,2.0,'2026-08-18T14:11:28Z'),(2,1.6,'2026-08-18T14:18:32Z')):
+            con.execute("""INSERT INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,
+                           expiry,entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,status,pnl,exit_kind)
+                           VALUES(?,'ORB','QQQ','PUT','QQQ260818P00718000',1,?,'2026-08-18','2026-08-18',
+                           ?,?, ?,?,'2026-08-18','CLOSED',?,'EXPIRED')""",
+                        (tid,entered,f'buy{tid}',f'a53-orb-qqq-{tid}',fill,entered,-fill*100))
+        con.commit(); con.close()
+        sells=[
+            {'id':'sell1','client_order_id':'x53-orb-qqq-1','side':'sell','status':'filled',
+             'symbol':'QQQ260818P00718000','filled_avg_price':'1.03','filled_at':'2026-08-18T14:26:40Z'},
+            {'id':'sell2','client_order_id':'x53-orb-qqq-2','side':'sell','status':'filled',
+             'symbol':'QQQ260818P00718000','filled_avg_price':'0.96','filled_at':'2026-08-18T14:33:52Z'},
+        ]
+        plan=app.broker_ledger_repair_plan(sells)
+        self.assertEqual([(x['trade_id'],x['exit_order_id'],x['pnl']) for x in plan],
+                         [(1,'sell1',-97.0),(2,'sell2',-64.0)])
+        self.assertEqual(app.apply_broker_ledger_repair(plan),{'updated':2,'inserted':0})
+        con=app.db(); rows=con.execute('SELECT id,exit_order_id,pnl,exit_kind FROM trades ORDER BY id').fetchall(); con.close()
+        self.assertEqual([(r['id'],r['exit_order_id'],r['pnl'],r['exit_kind']) for r in rows],
+                         [(1,'sell1',-97.0,'BROKER_REPAIR'),(2,'sell2',-64.0,'BROKER_REPAIR')])
+
+    def test_ledger_repair_recovers_missing_closed_round_trip(self):
+        self._wipe_trades()
+        buy={'id':'buy1','client_order_id':'a53-20260819-orb-iwm','side':'buy','status':'filled',
+             'symbol':'IWM260819P00302000','qty':'1','filled_qty':'1','filled_avg_price':'0.75',
+             'submitted_at':'2026-08-19T14:12:43Z','filled_at':'2026-08-19T14:12:44Z'}
+        sell={'id':'sell1','client_order_id':'x53-9','side':'sell','status':'filled',
+              'symbol':'IWM260819P00302000','qty':'1','filled_qty':'1','filled_avg_price':'0.45',
+              'submitted_at':'2026-08-19T14:28:02Z','filled_at':'2026-08-19T14:28:03Z'}
+        plan=app.broker_ledger_repair_plan([buy,sell])
+        self.assertEqual(len(plan),1)
+        self.assertEqual(plan[0]['action'],'insert')
+        self.assertEqual(plan[0]['pnl'],-30.0)
+        self.assertEqual(app.apply_broker_ledger_repair(plan),{'updated':0,'inserted':1})
+        con=app.db(); row=con.execute('SELECT strategy_id,ticker,status,pnl,exit_order_id FROM trades').fetchone(); con.close()
+        self.assertEqual((row['strategy_id'],row['ticker'],row['status'],row['pnl'],row['exit_order_id']),
+                         ('ORB','IWM','CLOSED',-30.0,'sell1'))
+
     def test_startup_fails_closed_when_live_open_is_unexplained(self):
         self._paper_cfg(); self._wipe_trades()
         con=app.db()
@@ -170,6 +217,56 @@ class SafetyTests(unittest.TestCase):
             got=app.live_or_stored_account()
         self.assertEqual(got.get('source'),'snapshot')
         self.assertEqual(got.get('equity'),100000)
+
+    def test_dashboard_omits_unknown_closed_pnl_from_every_aggregate(self):
+        self._wipe_trades(); app._MEM_CACHE.clear()
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,status,pnl,trade_date,exit_filled_at)
+                       VALUES('MVR','QQQ','CLOSED',NULL,'2026-08-18','2026-08-18T16:00:00Z')""")
+        con.execute("""INSERT INTO trades(strategy_id,ticker,status,pnl,trade_date,exit_filled_at)
+                       VALUES('MVR','QQQ','CLOSED',10,'2026-08-19','2026-08-19T16:00:00Z')""")
+        con.commit(); con.close()
+        with mock.patch.object(app,'compute_research_metrics',return_value={'strategies':[]}):
+            payload=app.dashboard_payload()
+        mvr=next(x for x in payload['strategies'] if x['id']=='MVR')
+        self.assertEqual((mvr['closed'],mvr['wins'],mvr['pnl']),(1,1,10.0))
+        self.assertEqual(payload['totals']['realizedPnl'],10.0)
+        self.assertEqual(len(payload['curve']),1)
+
+    def test_dashboard_books_overnight_pnl_on_new_york_exit_date(self):
+        self._wipe_trades(); app._MEM_CACHE.clear()
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,status,pnl,trade_date,exit_filled_at)
+                       VALUES('CEG','SPY','CLOSED',25,'2026-08-18','2026-08-19T13:35:00Z')""")
+        con.commit(); con.close()
+        frozen=app.datetime(2026,8,19,12,0,tzinfo=app.NY)
+        with mock.patch.object(app,'now_ny',return_value=frozen), \
+             mock.patch.object(app,'compute_research_metrics',return_value={'strategies':[]}):
+            payload=app.dashboard_payload()
+        self.assertEqual(payload['dailyPnl'],[{'date':'2026-08-19','pnl':25.0}])
+        self.assertEqual(payload['curve'][0]['date'],'2026-08-19')
+        self.assertEqual(payload['totals']['realizedToday'],25.0)
+
+    def test_model_drift_forward_n_excludes_open_and_unknown_pnl(self):
+        self._wipe_trades()
+        con=app.db()
+        con.execute("INSERT INTO trades(strategy_id,ticker,status,pnl,trade_date) VALUES('MVR','QQQ','OPEN',NULL,'2026-08-19')")
+        con.execute("INSERT INTO trades(strategy_id,ticker,status,pnl,trade_date) VALUES('MVR','QQQ','CLOSED',NULL,'2026-08-19')")
+        con.execute("INSERT INTO trades(strategy_id,ticker,status,pnl,trade_date) VALUES('MVR','QQQ','CLOSED',12,'2026-08-19')")
+        con.commit(); con.close()
+        rows=app.app.test_client().get('/api/model_drift').get_json()['rows']
+        mvr=next(x for x in rows if x['id']=='MVR')
+        self.assertEqual((mvr['n'],mvr['live_win_rate'],mvr['live_avg_pnl']),(1,1.0,12.0))
+
+    def test_daily_chart_cache_requires_requested_session_depth(self):
+        con=app.db(); con.execute("DELETE FROM live_bars WHERE ticker='SPY' AND timeframe='1Day'")
+        for i in range(25):
+            con.execute("""INSERT INTO live_bars(ingested_at,trade_date,ticker,timeframe,t,o,h,l,c,v)
+                           VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                        (app.now_ny().isoformat(),f'2026-07-{(i%25)+1:02d}','SPY','1Day',f'2026-07-{(i%25)+1:02d}',1,1,1,1,1))
+        con.commit(); con.close()
+        self.assertIn('SPY',app.daily_cache_missing(['SPY'],90))
+        self.assertNotIn('SPY',app.daily_cache_missing(['SPY'],20))
 
     def test_option_contract_refuses_next_day_as_0dte(self):
         frozen=app.datetime(2026,8,19,11,0,tzinfo=app.NY)

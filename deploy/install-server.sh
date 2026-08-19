@@ -22,11 +22,14 @@ install -m 0644 /opt/ash/repo/deploy/systemd/ash-deploy.service /etc/systemd/sys
 install -m 0644 /opt/ash/repo/deploy/systemd/ash-deploy.timer /etc/systemd/system/ash-deploy.timer
 install -m 0644 /opt/ash/repo/deploy/systemd/ash-backup.service /etc/systemd/system/ash-backup.service
 install -m 0644 /opt/ash/repo/deploy/systemd/ash-backup.timer /etc/systemd/system/ash-backup.timer
+install -m 0644 /opt/ash/repo/deploy/systemd/ash-runner-upgrade.service /etc/systemd/system/ash-runner-upgrade.service
+install -m 0644 /opt/ash/repo/deploy/systemd/ash-runner-upgrade.timer /etc/systemd/system/ash-runner-upgrade.timer
+install -m 0755 /opt/ash/repo/deploy/deploy-main.sh /usr/local/sbin/ash-deploy-main
+install -m 0755 /opt/ash/repo/deploy/restart-pending-runner.sh /usr/local/sbin/ash-restart-pending-runner
 install -d /etc/systemd/journald.conf.d
 install -m 0644 /opt/ash/repo/deploy/journald/ash-retention.conf /etc/systemd/journald.conf.d/ash-retention.conf
-chmod 0755 /opt/ash/repo/deploy/deploy-main.sh
 systemctl daemon-reload
-/opt/ash/repo/deploy/deploy-main.sh
-systemctl enable --now ash.target ash-deploy.timer ash-backup.timer
+/usr/local/sbin/ash-deploy-main
+systemctl enable --now ash.target ash-deploy.timer ash-backup.timer ash-runner-upgrade.timer
 systemctl restart systemd-journald.service
 echo "Installed. Edit /etc/ash/config.production.json, then restart ash-runner.service."

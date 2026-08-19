@@ -410,6 +410,21 @@ def parse_ny(ts):
         return dt.astimezone(NY)
     except Exception: return None
 
+def realized_date(trade):
+    """New York session date on which a closed trade actually realized P/L."""
+    dt=parse_ny((trade or {}).get('exit_filled_at'))
+    if dt:return dt.date().isoformat()
+    return str((trade or {}).get('trade_date') or '')[:10]
+
+def realized_sort_key(trade):
+    dt=parse_ny((trade or {}).get('exit_filled_at'))
+    if dt:stamp=dt.timestamp()
+    else:
+        try:
+            stamp=datetime.strptime(realized_date(trade),'%Y-%m-%d').replace(tzinfo=NY).timestamp()
+        except Exception:stamp=0
+    return stamp,int((trade or {}).get('id') or 0)
+
 def years_to_expiry(expiry):
     try:
         exp=datetime.strptime(str(expiry)[:10],'%Y-%m-%d').replace(hour=16,minute=0,tzinfo=NY)
@@ -897,35 +912,36 @@ def opening_range(bars):
     if not or_bars:return None,None,0
     return max(float(b['h']) for b in or_bars), min(float(b['l']) for b in or_bars), sum(float(b.get('v') or 0) for b in or_bars)
 
-def daily_cache_missing(symbols=None):
+def daily_cache_missing(symbols=None,min_sessions=90):
     symbols=symbols or ALL_TICKERS
     date=now_ny().date().isoformat()
     con=db(); missing=[]
     for sym in symbols:
         n=con.execute("SELECT COUNT(*) n FROM live_bars WHERE ticker=? AND timeframe='1Day' AND trade_date<?",(sym,date)).fetchone()['n']
-        if (n or 0)<20: missing.append(sym)
+        if (n or 0)<max(20,int(min_sessions)): missing.append(sym)
     con.close()
     return missing
 
-def ensure_daily_cache(symbols=None):
+def ensure_daily_cache(symbols=None,min_sessions=90):
     if not keys_ok(): return
     symbols=symbols or ALL_TICKERS
     date=now_ny().date().isoformat()
-    missing=daily_cache_missing(symbols)
+    min_sessions=max(20,min(365,int(min_sessions)))
+    missing=daily_cache_missing(symbols,min_sessions)
     if not missing and meta_get('daily_cache_'+date)=='1': return
     fetch_syms=missing or list(symbols)
-    start=(now_ny().date()-timedelta(days=80)).isoformat()+'T00:00:00Z'
+    start=(now_ny().date()-timedelta(days=max(120,min_sessions*2))).isoformat()+'T00:00:00Z'
     end=now_ny().isoformat()
     try:
         multi=fetch_bars_multi(fetch_syms,start,end,'1Day','iex')
         for sym,bars in multi.items(): upsert_live_bars(sym,'1Day',bars)
-        if not daily_cache_missing(symbols): meta_set('daily_cache_'+date,'1')
+        if not daily_cache_missing(symbols,min_sessions): meta_set('daily_cache_'+date,'1')
     except Exception as e:
         event(f'Daily cache ingest: {e}','WARN')
         for sym in fetch_syms:
             try: upsert_live_bars(sym,'1Day',fetch_bars(sym,start,end,'1Day','iex'))
             except Exception as e2: event(f'Daily cache {sym}: {e2}','WARN')
-        if not daily_cache_missing(symbols): meta_set('daily_cache_'+date,'1')
+        if not daily_cache_missing(symbols,min_sessions): meta_set('daily_cache_'+date,'1')
 
 def ensure_minute_history(symbols=None,days=25):
     """Once per day, backfill recent 1Min history into SQLite so 15:45 RVOL does not re-download 38 days."""
@@ -1987,7 +2003,15 @@ def backup_db(tag='exit'):
         BACKUP_DIR.mkdir(exist_ok=True)
         stamp=now_ny().strftime('%Y%m%d_%H%M%S')
         dst=BACKUP_DIR/f'arena_{tag}_{stamp}.db'
-        if DB.exists(): shutil.copy2(DB,dst)
+        if DB.exists():
+            # SQLite's online backup API takes a consistent snapshot while the
+            # runner continues writing. Copying the database file directly can
+            # miss committed pages that still live in the WAL.
+            src=sqlite3.connect(f'file:{DB}?mode=ro',uri=True,timeout=30)
+            out=sqlite3.connect(dst,timeout=30)
+            try: src.backup(out)
+            finally:
+                out.close(); src.close()
         return str(dst)
     except Exception as e:
         event(f'backup: {e}','WARN'); return None
@@ -2312,17 +2336,159 @@ def _expire_trade(tr, note='expired / no quote after close'):
     con.commit(); con.close()
     event(f"EXPIRED {tr['strategy_id']} {tr['ticker']} {tr.get('option_symbol')} P&L ${pnl:.2f}")
 
-def _matching_exit_fill(tr, orders):
-    """Only trust the deterministic exit client id. Do not pair sells by symbol."""
+def _broker_order_time(order):
+    return parse_ny(order.get('filled_at') or order.get('submitted_at') or order.get('created_at'))
+
+def _matching_exit_fill(tr, orders, used_order_ids=None, allow_generic=False):
+    """Find one broker sell for a local ticket without reusing another ticket's exit.
+
+    Current exits use ``x53-<local id>``. Pre-hardening releases used
+    ``x53-<strategy>-<ticker>-<timestamp>``; those fills are still authoritative
+    when strategy, ticker, symbol, and chronology agree. Generic x53 matching is
+    reserved for repairing a broker round trip whose local row was lost.
+    """
+    used=set(used_order_ids or ())
     want=str(tr.get('exit_client_id') or '')
-    fallback=f"x53-{int(tr['id'])}"
-    for o in orders or []:
-        if not isinstance(o,dict) or o.get('side')!='sell' or str(o.get('status') or '')!='filled':
+    fallback=f"x53-{int(tr['id'])}" if tr.get('id') is not None else ''
+    symbol=str(tr.get('option_symbol') or '')
+    entry_at=parse_ny(tr.get('entry_filled_at') or tr.get('signal_ts'))
+
+    candidates=[]
+    for order in orders or []:
+        if not isinstance(order,dict) or order.get('side')!='sell' or str(order.get('status') or '')!='filled':
             continue
-        cid=str(o.get('client_order_id') or '')
-        if cid and cid in (want,fallback):
-            return o
+        oid=str(order.get('id') or '')
+        if not oid or oid in used or order.get('filled_avg_price') is None:
+            continue
+        if symbol and str(order.get('symbol') or '')!=symbol:
+            continue
+        filled_at=_broker_order_time(order)
+        if entry_at and filled_at and filled_at<entry_at:
+            continue
+        candidates.append(order)
+
+    def earliest(rows):
+        return min(rows,key=lambda o:(_broker_order_time(o) or datetime.max.replace(tzinfo=NY),str(o.get('id') or ''))) if rows else None
+
+    exact=[o for o in candidates if str(o.get('client_order_id') or '') in (want,fallback) and str(o.get('client_order_id') or '')]
+    if exact:return earliest(exact)
+
+    sid=str(tr.get('strategy_id') or '').lower()
+    ticker=str(tr.get('ticker') or '').lower()
+    legacy_prefix=f'x53-{sid}-{ticker}-' if sid and ticker else ''
+    legacy=[o for o in candidates if legacy_prefix and str(o.get('client_order_id') or '').lower().startswith(legacy_prefix)]
+    if legacy:return earliest(legacy)
+
+    if allow_generic:
+        generic=[o for o in candidates if str(o.get('client_order_id') or '').lower().startswith('x53-')]
+        return earliest(generic)
     return None
+
+def broker_ledger_repair_plan(orders):
+    """Build a deterministic, broker-sourced repair plan without changing SQLite."""
+    broker_orders=[o for o in (orders or []) if isinstance(o,dict)]
+    con=db(); trades=[dict(r) for r in con.execute('SELECT * FROM trades ORDER BY id').fetchall()]; con.close()
+    used_exits={str(t.get('exit_order_id')) for t in trades if t.get('exit_order_id')}
+    plan=[]
+
+    # Replace guessed full-premium expirations when Alpaca has the actual sell.
+    guessed=sorted(
+        (t for t in trades if t.get('status')=='CLOSED' and t.get('exit_kind')=='EXPIRED' and not t.get('exit_order_id')),
+        key=lambda t:(parse_ny(t.get('entry_filled_at') or t.get('signal_ts')) or datetime.min.replace(tzinfo=NY),int(t.get('id') or 0)),
+    )
+    for tr in guessed:
+        sell=_matching_exit_fill(tr,broker_orders,used_exits)
+        if not sell:continue
+        oid=str(sell.get('id') or ''); used_exits.add(oid)
+        exit_fill=float(sell.get('filled_avg_price') or 0)
+        pnl=(exit_fill-float(tr.get('entry_fill') or 0))*100*int(tr.get('qty') or 1)
+        plan.append({
+            'action':'update','trade_id':int(tr['id']),'strategy_id':tr.get('strategy_id'),'ticker':tr.get('ticker'),
+            'entry_order_id':tr.get('entry_order_id'),'exit_order_id':oid,
+            'exit_client_id':sell.get('client_order_id'),'exit_fill':exit_fill,'exit_filled_at':sell.get('filled_at'),
+            'pnl':round(pnl,8),'old_pnl':tr.get('pnl'),
+        })
+
+    # Recover completed app-managed round trips that disappeared with a local DB
+    # replacement. A buy is only rebuilt when an app-managed broker sell proves
+    # that the position was closed; flat buys without a matching sell stay out.
+    known_entries={str(t.get('entry_order_id')) for t in trades if t.get('entry_order_id')}
+    known_clients={str(t.get('entry_client_id')) for t in trades if t.get('entry_client_id')}
+    buys=sorted(
+        (o for o in broker_orders if o.get('side')=='buy' and str(o.get('status') or '')=='filled'
+         and str(o.get('client_order_id') or '').startswith('a53-')),
+        key=lambda o:(_broker_order_time(o) or datetime.min.replace(tzinfo=NY),str(o.get('id') or '')),
+    )
+    for buy in buys:
+        oid=str(buy.get('id') or ''); cid=str(buy.get('client_order_id') or '')
+        if oid in known_entries or cid in known_clients:continue
+        parsed=_client_order_parts(cid)
+        if not parsed:continue
+        day,sid,ticker=parsed
+        submitted=parse_ny(buy.get('submitted_at') or buy.get('created_at')) or now_ny()
+        trade_date=(datetime.strptime(day,'%Y%m%d').date().isoformat() if day else submitted.date().isoformat())
+        direction,expiry=_option_direction_expiry(buy.get('symbol'))
+        probe={
+            'strategy_id':sid,'ticker':ticker,'option_symbol':buy.get('symbol'),
+            'entry_filled_at':buy.get('filled_at'),'signal_ts':submitted.isoformat(),
+        }
+        sell=_matching_exit_fill(probe,broker_orders,used_exits,allow_generic=True)
+        if not sell:continue
+        exit_oid=str(sell.get('id') or ''); used_exits.add(exit_oid)
+        qty=int(float(buy.get('filled_qty') or buy.get('qty') or 0))
+        if qty<=0:continue
+        entry_fill=float(buy.get('filled_avg_price') or 0)
+        exit_fill=float(sell.get('filled_avg_price') or 0)
+        horizon='EOD' if sid in MIDDAY_STRATEGY_IDS else 'OVERNIGHT'
+        exit_due=trade_date if horizon=='EOD' else next_trading_date(trade_date)
+        plan.append({
+            'action':'insert','strategy_id':sid,'ticker':ticker,'direction':direction,
+            'option_symbol':buy.get('symbol'),'qty':qty,'signal_ts':submitted.isoformat(),'trade_date':trade_date,
+            'expiry':expiry,'entry_order_id':oid,'entry_client_id':cid,'entry_fill':entry_fill,
+            'entry_filled_at':buy.get('filled_at'),'exit_due_date':exit_due,'exit_order_id':exit_oid,
+            'exit_client_id':sell.get('client_order_id'),'exit_fill':exit_fill,'exit_filled_at':sell.get('filled_at'),
+            'status':'CLOSED','pnl':round((exit_fill-entry_fill)*100*qty,8),'horizon':horizon,
+            'window':sid if horizon=='EOD' else '15:45',
+        })
+    return plan
+
+def apply_broker_ledger_repair(plan):
+    """Apply a reviewed repair plan in one short transaction."""
+    updated=inserted=0
+    con=db()
+    try:
+        con.execute('BEGIN IMMEDIATE')
+        for item in plan or []:
+            if item.get('action')=='update':
+                cur=con.execute('''UPDATE trades SET exit_order_id=?,exit_client_id=?,exit_fill=?,exit_filled_at=?,
+                                   status='CLOSED',pnl=?,exit_kind='BROKER_REPAIR',broker_note=?
+                                   WHERE id=? AND exit_order_id IS NULL AND exit_kind='EXPIRED' ''',
+                                (item.get('exit_order_id'),item.get('exit_client_id'),item.get('exit_fill'),
+                                 item.get('exit_filled_at'),item.get('pnl'),'corrected from Alpaca sell fill',item.get('trade_id')))
+                updated+=cur.rowcount
+            elif item.get('action')=='insert':
+                exists=con.execute('SELECT id FROM trades WHERE entry_order_id=? OR entry_client_id=? LIMIT 1',
+                                   (item.get('entry_order_id'),item.get('entry_client_id'))).fetchone()
+                if exists:continue
+                con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,
+                               entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,exit_order_id,
+                               exit_client_id,exit_fill,exit_filled_at,status,pnl,broker_note,horizon,window,exit_kind)
+                               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                            (item.get('strategy_id'),item.get('ticker'),item.get('direction'),item.get('option_symbol'),
+                             item.get('qty'),item.get('signal_ts'),item.get('trade_date'),item.get('expiry'),
+                             item.get('entry_order_id'),item.get('entry_client_id'),item.get('entry_fill'),
+                             item.get('entry_filled_at'),item.get('exit_due_date'),item.get('exit_order_id'),
+                             item.get('exit_client_id'),item.get('exit_fill'),item.get('exit_filled_at'),'CLOSED',
+                             item.get('pnl'),'recovered closed round trip from Alpaca',item.get('horizon'),
+                             item.get('window'),'BROKER_REPAIR'))
+                inserted+=1
+        con.commit()
+    except Exception:
+        con.rollback(); raise
+    finally:
+        con.close()
+    mem_set('ui:dash',None)
+    return {'updated':updated,'inserted':inserted}
 
 def _close_trade_from_broker_exit(tr, order):
     fp=float(order.get('filled_avg_price') or 0)
@@ -2664,6 +2830,8 @@ def status_payload():
         'broker_config_enabled':c.get('broker_orders_enabled') is True,
         'broker_runtime_armed':broker_runtime_armed(),
         'environment':ENVIRONMENT,
+        'release':ROOT.name,
+        'runner_release':meta_get('runner_release'),
         'heartbeat':meta_get('heartbeat'),'last_eval':meta_get('last_eval'),
         'last_ingest':ing,'last_ingest_source':meta_get('last_ingest_source'),
         'last_midday_eval':meta_get('last_midday_eval'),'last_midday_scan':meta_get('last_midday_scan'),
@@ -2751,10 +2919,10 @@ def market_chart(sym):
     sym=sym.upper()
     if sym not in ALL_TICKERS:return jsonify({"error":"unsupported ticker"}),400
     days=max(20,min(365,int(request.args.get("days","90"))))
-    ensure_daily_cache([sym])
+    ensure_daily_cache([sym],days)
     try:
         bars=load_local_bars_since(sym,'1Day',(now_ny().date()-timedelta(days=days*2)).isoformat())
-        if len(bars)<min(20,days):
+        if len(bars)<days:
             end=now_ny(); start=end-timedelta(days=days*2)
             fetched=fetch_bars(sym,start.isoformat(),end.isoformat(),"1Day","iex")
             upsert_live_bars(sym,'1Day',fetched)
@@ -2793,7 +2961,7 @@ def dashboard_payload():
     # Strategy aggregates + paper equity curve from realized P&L.
     strat={}
     for s in STRATEGIES:
-        rows=[t for t in trades if t.get("strategy_id")==s["id"] and t.get("status")=="CLOSED"]
+        rows=[t for t in trades if t.get("strategy_id")==s["id"] and t.get("status")=="CLOSED" and t.get("pnl") is not None]
         pnls=[float(t.get("pnl") or 0) for t in rows]
         wins=sum(1 for p in pnls if p>0)
         strat[s["id"]]={
@@ -2810,12 +2978,12 @@ def dashboard_payload():
         row.update({k:extra.get(k) for k in ('opportunities','fires','misses','fireRate','winLo','winHi','expectancy','profitFactor','sample','nDays')})
 
     closed=[t for t in trades if t.get("status")=="CLOSED" and t.get("pnl") is not None]
-    closed.sort(key=lambda x:(x.get("exit_filled_at") or x.get("trade_date") or "",x.get("id",0)))
+    closed.sort(key=realized_sort_key)
     curve=[];cum=0.0
     daily={}
     for t in closed:
         pnl=float(t.get("pnl") or 0);cum+=pnl
-        dt=(t.get("exit_filled_at") or t.get("trade_date") or "")[:10]
+        dt=realized_date(t)
         curve.append({"date":dt,"pnl":pnl,"cumPnl":cum,"strategy":t.get("strategy_id"),"ticker":t.get("ticker")})
         daily[dt]=daily.get(dt,0)+pnl
 
@@ -2828,7 +2996,7 @@ def dashboard_payload():
                           "winRate":sum(1 for p in pp if p>0)/len(pp) if pp else None}
 
     today=now_ny().date().isoformat()
-    closed_today=[t for t in closed if (t.get('trade_date') or '')==today]
+    closed_today=[t for t in closed if realized_date(t)==today]
     realized_today=sum(float(t.get('pnl') or 0) for t in closed_today)
     payload={
         "strategies":list(strat.values()),
@@ -3181,8 +3349,8 @@ def model_drift():
     out=[]
     refs={"CEG":{"hist_win_rate":0.596,"hist_avg_underlying":0.005,"note":"Canonical 3:45 point-in-time reference"}}
     for st in STRATEGIES:
-        rr=con.execute("""SELECT COUNT(*) n,
-             SUM(CASE WHEN status='CLOSED' AND pnl>0 THEN 1 ELSE 0 END) wins,
+        rr=con.execute("""SELECT SUM(CASE WHEN status='CLOSED' AND pnl IS NOT NULL THEN 1 ELSE 0 END) n,
+             SUM(CASE WHEN status='CLOSED' AND pnl IS NOT NULL AND pnl>0 THEN 1 ELSE 0 END) wins,
              AVG(CASE WHEN status='CLOSED' THEN pnl END) avgp
              FROM trades WHERE strategy_id=?""",(st["id"],)).fetchone()
         n=rr["n"] or 0
@@ -3258,7 +3426,7 @@ def export_bundle():
 def strategies():
     con=db(); result=[]
     for s in STRATEGIES:
-        r=con.execute("SELECT COUNT(*) n,SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) closed,SUM(CASE WHEN status='CLOSED' AND pnl>0 THEN 1 ELSE 0 END) wins,SUM(CASE WHEN status='CLOSED' THEN pnl ELSE 0 END) pnl,AVG(CASE WHEN status='CLOSED' THEN pnl END) avgp FROM trades WHERE strategy_id=?",(s['id'],)).fetchone(); sig=con.execute('SELECT COUNT(*) n FROM signals WHERE strategy_id=?',(s['id'],)).fetchone()['n']; result.append({**s,'stats':{**dict(r),'signals':sig}})
+        r=con.execute("SELECT COUNT(*) n,SUM(CASE WHEN status='CLOSED' AND pnl IS NOT NULL THEN 1 ELSE 0 END) closed,SUM(CASE WHEN status='CLOSED' AND pnl IS NOT NULL AND pnl>0 THEN 1 ELSE 0 END) wins,SUM(CASE WHEN status='CLOSED' AND pnl IS NOT NULL THEN pnl ELSE 0 END) pnl,AVG(CASE WHEN status='CLOSED' THEN pnl END) avgp FROM trades WHERE strategy_id=?",(s['id'],)).fetchone(); sig=con.execute('SELECT COUNT(*) n FROM signals WHERE strategy_id=?',(s['id'],)).fetchone()['n']; result.append({**s,'stats':{**dict(r),'signals':sig}})
     con.close(); return jsonify({'strategies':result})
 @app.get('/api/trades')
 def trades():
@@ -3482,7 +3650,7 @@ def build_workspace():
     boot={sid:bootstrap_expectancy(pn) for sid,pn in by_sid.items()}
     daily={}
     for t in closed:
-        d=(t.get('exit_filled_at') or t.get('trade_date') or '')[:10]
+        d=realized_date(t)
         daily.setdefault(d,{}).setdefault(t.get('strategy_id'),0)
         daily[d][t.get('strategy_id')]=daily[d][t.get('strategy_id')]+float(t.get('pnl') or 0)
     ids=[s['id'] for s in STRATEGIES]
@@ -3492,8 +3660,8 @@ def build_workspace():
         for b in ids:
             xs=[]; ys=[]
             for d in dates:
-                if a in daily[d] and b in daily[d]:
-                    xs.append(daily[d][a]); ys.append(daily[d][b])
+                if a in daily[d] or b in daily[d]:
+                    xs.append(daily[d].get(a,0.0)); ys.append(daily[d].get(b,0.0))
             if len(xs)>=4:
                 try:
                     mx,my=avg(xs),avg(ys)
@@ -3502,7 +3670,7 @@ def build_workspace():
                     corr[a][b]=round(num/den,3) if den else None
                 except Exception: corr[a][b]=None
     wf=[]
-    all_closed=sorted(closed, key=lambda t:(t.get('exit_filled_at') or t.get('trade_date') or '', t.get('id') or 0))
+    all_closed=sorted(closed, key=realized_sort_key)
     pnls=[float(t.get('pnl') or 0) for t in all_closed]
     for i in range(5,len(pnls)):
         train=pnls[:i]; test=pnls[i]
@@ -3649,8 +3817,8 @@ def mtf(sym):
     m1=rth_bars(load_local_bars(sym,date,'1Min'))
     st=local_intraday_state(sym,date) or {}
     m5=st.get('bars5') or []
-    ensure_daily_cache([sym])
-    d1=load_local_bars_since(sym,'1Day',(now_ny().date()-timedelta(days=120)).isoformat())[-90:]
+    ensure_daily_cache([sym],90)
+    d1=load_local_bars_since(sym,'1Day',(now_ny().date()-timedelta(days=180)).isoformat())[-90:]
     def slim(arr):
         out=[]
         for b in arr:
