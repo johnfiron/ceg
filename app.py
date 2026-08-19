@@ -2,12 +2,18 @@ from flask import Flask, request, jsonify, send_from_directory, send_file, Respo
 from pathlib import Path
 from datetime import datetime, timedelta, date as date_cls
 from zoneinfo import ZoneInfo
-import requests, sqlite3, json, os, time, math, statistics, threading, traceback, subprocess, shutil, zipfile, io, random, hashlib, atexit, hmac, re
+import requests, sqlite3, json, os, time, math, statistics, threading, traceback, subprocess, shutil, zipfile, io, random, hashlib, hmac, re
 
 ROOT=Path(__file__).resolve().parent
-STATIC=ROOT/'static'; DATA=ROOT/'data'; DB=DATA/'arena.db'; CFG=ROOT/'config.json'
+ENVIRONMENT=(os.environ.get('CEG_ENV') or 'development').strip().lower()
+if ENVIRONMENT not in ('development','production','test'):
+    raise RuntimeError('CEG_ENV must be development, production, or test')
+STATIC=ROOT/'static'
+DATA=Path(os.environ.get('CEG_DATA_DIR') or (ROOT/'data'/ENVIRONMENT)).expanduser()
+DB=Path(os.environ.get('CEG_DB_PATH') or (DATA/'arena.db')).expanduser()
+CFG=Path(os.environ.get('CEG_CONFIG_FILE') or (ROOT/f'config.{ENVIRONMENT}.json')).expanduser()
 LIVE_DIR=DATA/'live'
-DATA.mkdir(exist_ok=True); LIVE_DIR.mkdir(exist_ok=True)
+DATA.mkdir(parents=True,exist_ok=True); LIVE_DIR.mkdir(parents=True,exist_ok=True)
 NY=ZoneInfo('America/New_York')
 PAPER='https://paper-api.alpaca.markets/v2'
 MD='https://data.alpaca.markets'
@@ -18,8 +24,6 @@ ALL_TICKERS=list(dict.fromkeys(TICKERS+MIDDAY_TICKERS))
 EOD_STRATEGY_IDS=['CEG','VCT','XED','LAR','RSI2','BB','MACD','DON','STO','KEL']
 MIDDAY_STRATEGY_IDS=['OPN','OSF','ORB','VRC','MVR']
 OPEN_TRADE_STATUSES=('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED')
-RUNNER_STARTED=False
-WATCHDOG_STARTED=False
 _HIST_THREAD=None
 NOTES=ROOT/'notes.md'
 BACKUP_DIR=DATA/'backups'
@@ -275,6 +279,10 @@ def cfg():
         except:pass
     return {}
 
+def broker_orders_enabled():
+    """Fail closed. Missing, malformed, and non-boolean values never enable orders."""
+    return cfg().get('broker_orders_enabled') is True
+
 def keys_ok():
     c=cfg()
     return bool(c.get('alpaca_key') and c.get('alpaca_secret') and c.get('fred_key') and c.get('keys_ok'))
@@ -427,6 +435,31 @@ def postj(url,payload,timeout=8):
     if not r.ok: raise RuntimeError(f'{r.status_code} {r.reason}: {r.text[:300]}')
     return r.json()
 
+def broker_order_by_client_id(client_id):
+    if not client_id:return None
+    try:
+        return getj(f'{PAPER}/orders:by_client_order_id',ah(),{'client_order_id':client_id},timeout=8)
+    except Exception:
+        return None
+
+def place_broker_order(payload):
+    """Submit an Alpaca paper order once, recovering the same client id after a crash."""
+    if not broker_orders_enabled():
+        raise RuntimeError('broker orders are disabled')
+    client_id=(payload or {}).get('client_order_id')
+    if not client_id:
+        raise RuntimeError('broker order requires a client_order_id')
+    existing=broker_order_by_client_id(client_id)
+    if existing:return existing
+    try:
+        return postj(f'{PAPER}/orders',payload)
+    except Exception:
+        # The request can succeed at Alpaca while the response is lost locally.
+        # Re-querying the deterministic id closes that crash window.
+        existing=broker_order_by_client_id(client_id)
+        if existing:return existing
+        raise
+
 def mem_get(key,ttl):
     hit=_MEM_CACHE.get(key)
     if hit and time.time()-hit[0]<ttl:
@@ -529,11 +562,16 @@ def init_db():
     con.commit(); con.close()
 
 def event(msg,level='INFO'):
-    print(f'[{level}] {msg}',flush=True)
     try:
         con=db(); con.execute('INSERT INTO events(ts,level,message,code) VALUES(?,?,?,?)',(now_ny().isoformat(),level,msg,classify_error(msg) if level in ('WARN','ERROR') else None)); con.commit(); con.close()
-    except Exception as e:
-        print(f'[WARN] event log failed: {e}',flush=True)
+    except Exception:
+        pass
+    try:
+        print(f'[{level}] {msg}',flush=True)
+    except (BrokenPipeError, OSError):
+        # A detached terminal must never kill the trading runner. Persistent events
+        # above remain available even if stdout has disappeared.
+        pass
 
 def meta_get(k):
     con=db(); r=con.execute('SELECT v FROM meta WHERE k=?',(k,)).fetchone(); con.close(); return r['v'] if r else None
@@ -1800,9 +1838,9 @@ def orders_allowed():
         return True
 
 def submit_exit(tr, kind='SCHEDULE'):
-    client=f"x53-{tr['strategy_id'].lower()}-{tr['ticker'].lower()}-{int(time.time())}"[:48]
+    client=f"x53-{int(tr['id'])}"[:48]
     qty=int(tr['qty'] or 1)
-    o=postj(f'{PAPER}/orders',{'symbol':tr['option_symbol'],'qty':str(qty),'side':'sell','type':'market','time_in_force':'day','client_order_id':client})
+    o=place_broker_order({'symbol':tr['option_symbol'],'qty':str(qty),'side':'sell','type':'market','time_in_force':'day','client_order_id':client})
     con=db(); con.execute("UPDATE trades SET exit_order_id=?,exit_client_id=?,status='EXIT_SUBMITTED',exit_kind=? WHERE id=?",
                           (o.get('id'),client,kind,tr['id'])); con.commit(); con.close()
     event(f"Exit {kind} {tr['strategy_id']} {tr['ticker']} {tr['option_symbol']}")
@@ -1823,8 +1861,8 @@ def refresh_excursions_and_stops():
             if qty>=2:
                 half=qty//2
                 try:
-                    client=f"s53-{tr['strategy_id'].lower()}-{tr['ticker'].lower()}-{int(time.time())}"[:48]
-                    postj(f'{PAPER}/orders',{'symbol':tr['option_symbol'],'qty':str(half),'side':'sell','type':'market','time_in_force':'day','client_order_id':client})
+                    client=f"s53-{int(tr['id'])}"[:48]
+                    place_broker_order({'symbol':tr['option_symbol'],'qty':str(half),'side':'sell','type':'market','time_in_force':'day','client_order_id':client})
                     con=db(); con.execute('UPDATE trades SET qty=?,scaled_qty=? WHERE id=?',(qty-half,half,tr['id'])); con.commit(); con.close()
                     event(f"Scale-out {tr['strategy_id']} {tr['ticker']} x{half}")
                 except Exception as e:
@@ -1969,11 +2007,11 @@ def submit_entry(sig,states):
     bp=bp_block(q.get('ask'), qty)
     if bp:
         extra['skip_reason']=bp; log_shadow(sig,'SKIP_BP',extra); return 'SKIP_BP',extra
-    if not c.get('broker_orders_enabled',True):return 'SIGNAL_ONLY',extra
+    if not broker_orders_enabled():return 'SIGNAL_ONLY',extra
     if not orders_allowed():
         extra['skip_reason']='guest LAN read-only'; log_shadow(sig,'SKIP_GUEST',extra); return 'SKIP_GUEST',extra
-    client=f'a53-{sid.lower()}-{ticker.lower()}-{int(time.time())}'[:48]
-    o=postj(f'{PAPER}/orders',{'symbol':option,'qty':str(qty),'side':'buy','type':'market','time_in_force':'day','client_order_id':client})
+    client=f'a53-{date.replace("-","")}-{sid.lower()}-{ticker.lower()}'[:48]
+    o=place_broker_order({'symbol':option,'qty':str(qty),'side':'buy','type':'market','time_in_force':'day','client_order_id':client})
     exit_due=now_ny().date().isoformat() if horizon=='EOD' else next_trading_date(now_ny().date().isoformat())
     con=db(); con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,entry_order_id,entry_client_id,exit_due_date,status,broker_note,horizon,window,entry_bid,entry_ask,entry_spread,contract_score,checklist,cluster_n,atm_spot,entry_iv,entry_delta,entry_gamma,ab_book,greeks)
                              VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
@@ -2059,6 +2097,72 @@ def reconcile():
         elif st in ('canceled','expired','rejected'):
             con=db(); con.execute("UPDATE trades SET status='ERROR',broker_note=? WHERE id=?",(f'order {st}',tr['id'])); con.commit(); con.close()
             event(f"Order {st} {tr['strategy_id']} {tr['ticker']} {tr['option_symbol']}",'WARN')
+
+def _client_order_parts(client_id):
+    parts=str(client_id or '').split('-')
+    if len(parts)<4 or parts[0]!='a53':return None
+    if len(parts[1])==8 and parts[1].isdigit():
+        return parts[1],parts[2].upper(),parts[3].upper()
+    # Legacy a53-SID-TICKER-timestamp ids.
+    return None,parts[1].upper(),parts[2].upper()
+
+def _option_direction_expiry(symbol):
+    m=re.search(r'(\d{6})([CP])\d{8}$',str(symbol or ''))
+    if not m:return None,None
+    try: expiry=datetime.strptime(m.group(1),'%y%m%d').date().isoformat()
+    except ValueError: expiry=None
+    return ('CALL' if m.group(2)=='C' else 'PUT'),expiry
+
+def startup_reconcile():
+    """Audit Alpaca before the runner is allowed to evaluate or submit anything."""
+    init_db()
+    c=cfg()
+    if not (c.get('alpaca_key') and c.get('alpaca_secret')):
+        if broker_orders_enabled():
+            raise RuntimeError('broker orders enabled but Alpaca paper credentials are missing')
+        event(f'Startup reconciliation skipped ({ENVIRONMENT}: no Alpaca credentials; broker orders disabled)')
+        meta_set('startup_reconciled_at',now_ny().isoformat())
+        return True
+    reconcile()
+    after=(now_ny()-timedelta(days=14)).astimezone(ZoneInfo('UTC')).isoformat()
+    orders=getj(f'{PAPER}/orders',ah(),{'status':'all','after':after,'direction':'desc','limit':500},timeout=15)
+    if not isinstance(orders,list):
+        raise RuntimeError('Alpaca orders reconciliation returned an invalid payload')
+    recovered=0
+    for order in orders:
+        cid=order.get('client_order_id')
+        parsed=_client_order_parts(cid)
+        if not parsed or order.get('side')!='buy':continue
+        con=db(); known=con.execute('SELECT id FROM trades WHERE entry_order_id=? OR entry_client_id=? LIMIT 1',(order.get('id'),cid)).fetchone(); con.close()
+        if known:continue
+        day,sid,ticker=parsed
+        submitted=parse_ny(order.get('submitted_at') or order.get('created_at')) or now_ny()
+        trade_date=(datetime.strptime(day,'%Y%m%d').date().isoformat() if day else submitted.date().isoformat())
+        direction,expiry=_option_direction_expiry(order.get('symbol'))
+        broker_status=str(order.get('status') or '')
+        status='OPEN' if broker_status=='filled' else ('ERROR' if broker_status in ('canceled','expired','rejected') else 'ENTRY_SUBMITTED')
+        horizon='EOD' if sid in MIDDAY_STRATEGY_IDS else 'OVERNIGHT'
+        exit_due=trade_date if horizon=='EOD' else next_trading_date(trade_date)
+        con=db(); con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,
+                                 entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,status,broker_note,horizon,window)
+                                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                              (sid,ticker,direction,order.get('symbol'),int(float(order.get('qty') or 0)),submitted.isoformat(),trade_date,expiry,
+                               order.get('id'),cid,float(order.get('filled_avg_price') or 0) or None,order.get('filled_at'),exit_due,status,
+                               'recovered by startup reconciliation',horizon,sid if horizon=='EOD' else '15:45'))
+        con.commit(); con.close(); recovered+=1
+        event(f'Recovered broker order {cid} into the local trade ledger','WARN')
+    expire_dead_options()
+    positions=getj(f'{PAPER}/positions',ah(),timeout=15)
+    broker_symbols={p.get('symbol') for p in positions if isinstance(p,dict)} if isinstance(positions,list) else set()
+    con=db(); local_open=[dict(x) for x in con.execute("SELECT id,option_symbol FROM trades WHERE status='OPEN'").fetchall()]; con.close()
+    missing=[str(t['id']) for t in local_open if t.get('option_symbol') not in broker_symbols]
+    if missing:
+        event('Startup reconciliation: local OPEN trades absent from Alpaca positions: '+','.join(missing),'ERROR')
+        raise RuntimeError('startup reconciliation found missing broker positions for local trades: '+','.join(missing))
+    meta_set('startup_reconciled_at',now_ny().isoformat())
+    meta_set('startup_recovered_orders',recovered)
+    event(f'Startup reconciliation complete: {len(orders)} orders checked, {recovered} recovered')
+    return True
 
 def expire_dead_options():
     """0DTE still OPEN after the close is worthless — do not keep sending market sells."""
@@ -2170,12 +2274,13 @@ def maybe_notify(text):
             requests.post(url, data=text.encode(), headers={'Title':'ASH Terminal'}, timeout=6)
         except Exception: pass
 
-def runner_loop():
+def runner_loop(heartbeat_callback=None):
     event('Persistent paper runner started')
     while True:
         try:
             n=now_ny(); hm=n.strftime('%H:%M'); date=n.date().isoformat()
             meta_set('heartbeat',n.isoformat()); meta_set('runner_pid',str(os.getpid()))
+            if heartbeat_callback: heartbeat_callback(n)
             if not keys_ok():
                 time.sleep(30); continue
             reconcile(); submit_due_exits()
@@ -2212,34 +2317,8 @@ def runner_loop():
                 notify_once(f'debrief_nudge_{date}', 'Session closed. Three debrief questions are waiting in Lab.')
                 meta_set('debrief_nudge_'+date,'1')
         except Exception as e:
-            try: event('Runner cycle error: '+str(e)+'\n'+traceback.format_exc()[-1000:],'ERROR')
-            except Exception: print('Runner cycle error:',e,flush=True)
+            event('Runner cycle error: '+str(e)+'\n'+traceback.format_exc()[-1000:],'ERROR')
         time.sleep(30)
-
-def watchdog_loop():
-    event('Runner watchdog started')
-    while True:
-        time.sleep(45)
-        try:
-            hb=meta_get('heartbeat')
-            age=None
-            if hb:
-                dt=parse_ny(hb)
-                if dt: age=(now_ny()-dt).total_seconds()
-            stale=bool(age is None or age>90)
-            meta_set('watchdog_stale','1' if stale else '0')
-            meta_set('heartbeat_age', str(int(age)) if age is not None else '')
-            if stale:
-                event(f'Watchdog: heartbeat age {age}s — runner may be stuck; start.sh will respawn if the process died','WARN')
-        except Exception as e:
-            print('watchdog',e,flush=True)
-
-def start_runner():
-    global RUNNER_STARTED, WATCHDOG_STARTED
-    if not RUNNER_STARTED:
-        RUNNER_STARTED=True; threading.Thread(target=runner_loop,daemon=True).start()
-    if not WATCHDOG_STARTED:
-        WATCHDOG_STARTED=True; threading.Thread(target=watchdog_loop,daemon=True).start()
 
 INTRO_TARGET=DATA/'intro_target.json'
 INTRO_NAME_RE=re.compile(r'^intro-[a-z0-9-]+\.webm$')
@@ -2323,6 +2402,7 @@ def sw():return send_from_directory(STATIC,'sw.js')
 @app.get('/api/status')
 def status():
     c=cfg()
+    rh=runner_health()
     con=db()
     bars=con.execute("SELECT COUNT(*) n FROM live_bars").fetchone()['n']
     calls=con.execute("SELECT COUNT(*) n FROM api_log").fetchone()['n'] if con.execute("SELECT name FROM sqlite_master WHERE name='api_log'").fetchone() else 0
@@ -2335,15 +2415,16 @@ def status():
         except Exception: stale=None
     return jsonify({
         'configured':keys_ok(),
-        'paper_only':True,'broker_orders_enabled':c.get('broker_orders_enabled',True),
+        'paper_only':True,'broker_orders_enabled':broker_orders_enabled(),
+        'environment':ENVIRONMENT,
         'heartbeat':meta_get('heartbeat'),'last_eval':meta_get('last_eval'),
         'last_ingest':ing,'last_ingest_source':meta_get('last_ingest_source'),
         'last_midday_eval':meta_get('last_midday_eval'),'last_midday_scan':meta_get('last_midday_scan'),
         'live_tickers':MIDDAY_TICKERS,'time_ny':now_ny().isoformat(),
         'session_complete_pct':float(cov_pct) if cov_pct not in (None,'') else None,
         'clock':session_clock(),'stale_sec':stale,'data_stale':bool(stale is not None and stale>90),
-        'watchdog_stale':meta_get('watchdog_stale')=='1',
-        'heartbeat_age':float(meta_get('heartbeat_age') or 0) if meta_get('heartbeat_age') not in (None,'') else stale,
+        'watchdog_stale':not rh['ok'],
+        'heartbeat_age':rh['runner_heartbeat_age_sec'],
         'guest':not orders_allowed(),
         'wake_lock':bool(shutil.which('termux-wake-lock')),
         'rate_budget':{'calls_60s':rate,'ok':rate<80},
@@ -2353,13 +2434,27 @@ def status():
                  'hit_rate':(_API_STATS['hits']/max(1,_API_STATS['hits']+_API_STATS['misses'])),
                  'local_bars':bars,'api_log_rows':calls}
     })
+
+def runner_health(max_age=90):
+    hb=meta_get('heartbeat'); age=None
+    if hb:
+        dt=parse_ny(hb)
+        if dt: age=max(0.0,(now_ny()-dt).total_seconds())
+    healthy=bool(age is not None and age<=max_age)
+    return {'ok':healthy,'runner_heartbeat':hb,'runner_heartbeat_age_sec':age,
+            'max_age_sec':max_age,'environment':ENVIRONMENT,'web_pid':os.getpid()}
+
+@app.get('/api/health')
+def health():
+    payload=runner_health()
+    return jsonify(payload),(200 if payload['ok'] else 503)
 @app.post('/api/config')
 def setconfig():
     d=request.get_json(force=True) or {}; c=cfg()
     for k in ('alpaca_key','alpaca_secret','fred_key','fomc_dates','ntfy_url','earnings_dates'):
         if k in d:c[k]=d[k]
     if 'allow_lan_orders' in d: c['allow_lan_orders']=bool(d['allow_lan_orders'])
-    c['broker_orders_enabled']=bool(d.get('broker_orders_enabled', c.get('broker_orders_enabled',True))); c['contracts_per_trade']=max(1,min(5,int(d.get('contracts_per_trade',c.get('contracts_per_trade',1)))));
+    c['broker_orders_enabled']=bool(d.get('broker_orders_enabled', c.get('broker_orders_enabled',False))); c['contracts_per_trade']=max(1,min(5,int(d.get('contracts_per_trade',c.get('contracts_per_trade',1)))));
     if any(k in d for k in ('alpaca_key','alpaca_secret','fred_key')):
         c['keys_ok']=False
     save_cfg(c); return jsonify({'ok':True})
@@ -3366,7 +3461,7 @@ def journal_day():
     </body></html>"""
     return Response(html, mimetype='text/html')
 
-init_db(); start_runner()
-atexit.register(lambda: backup_db('exit'))
+init_db()
 if __name__=='__main__':
-    print('ASH Terminal V10: http://0.0.0.0:8765',flush=True); app.run(host='0.0.0.0',port=8765,debug=False,threaded=True)
+    event('ASH Terminal web: http://0.0.0.0:8765')
+    app.run(host='0.0.0.0',port=8765,debug=False,threaded=True)

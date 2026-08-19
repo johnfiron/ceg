@@ -1,0 +1,31 @@
+[Unit]
+Description=ASH web dashboard
+PartOf=ash.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ash
+Group=ash
+WorkingDirectory=/opt/ash/current
+Environment=CEG_ENV=production
+Environment=CEG_DATA_DIR=/var/lib/ash
+Environment=CEG_CONFIG_FILE=/etc/ash/config.production.json
+EnvironmentFile=-/etc/ash/ash.env
+ExecStart=/opt/ash/venv/bin/gunicorn --preload --workers 2 --bind 127.0.0.1:8765 --access-logfile - --error-logfile - app:app
+Restart=on-failure
+RestartSec=5
+UMask=0077
+StateDirectory=ash
+ConfigurationDirectory=ash
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ash
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ash-web
+
+[Install]
+WantedBy=ash.target

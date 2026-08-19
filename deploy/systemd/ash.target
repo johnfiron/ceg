@@ -1,0 +1,7 @@
+[Unit]
+Description=ASH paper trading stack
+Wants=ash-web.service ash-runner.service
+After=network-online.target
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,12 @@
+[Unit]
+Description=Poll ASH main for tested deployments
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+RandomizedDelaySec=20s
+Persistent=true
+Unit=ash-deploy.service
+
+[Install]
+WantedBy=timers.target

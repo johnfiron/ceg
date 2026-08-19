@@ -1,0 +1,34 @@
+[Unit]
+Description=ASH trading runner
+PartOf=ash.target
+After=network-online.target
+
+[Service]
+Type=notify
+NotifyAccess=main
+User=ash
+Group=ash
+WorkingDirectory=/opt/ash/current
+Environment=CEG_ENV=production
+Environment=CEG_DATA_DIR=/var/lib/ash
+Environment=CEG_CONFIG_FILE=/etc/ash/config.production.json
+EnvironmentFile=-/etc/ash/ash.env
+ExecStart=/opt/ash/venv/bin/python runner.py
+Restart=always
+RestartSec=5
+WatchdogSec=100
+TimeoutStartSec=45
+UMask=0077
+StateDirectory=ash
+ConfigurationDirectory=ash
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ash
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ash-runner
+
+[Install]
+WantedBy=ash.target
