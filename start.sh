@@ -1,5 +1,10 @@
 #!/data/data/com.termux/files/usr/bin/bash
 cd "$(dirname "$0")"
+export CEG_ENV=development
+if [ ! -f config.development.json ]; then
+  cp config.development.example.json config.development.json
+  echo "Created config.development.json with broker orders disabled."
+fi
 echo "Starting ASH Terminal V10..."
 if command -v termux-wake-lock >/dev/null 2>&1; then termux-wake-lock || true; fi
 LAN=$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\./ && $i !~ /^127\./){print $i; exit}}')
@@ -8,15 +13,13 @@ if [ -z "$LAN" ]; then
 fi
 echo "Dashboard (this device): http://127.0.0.1:8765"
 if [ -n "$LAN" ]; then echo "Dashboard (LAN):        http://$LAN:8765"; fi
-echo "Watchdog: respawn on crash. Stop with Ctrl-C."
-while true; do
-  python app.py || code=$?
-  code=${code:-0}
-  echo "app.py exited $code at $(date)"
-  if [ "$code" = "0" ] || [ "$code" = "130" ] || [ "$code" = "143" ]; then
-    echo "Clean stop ($code). Not respawning."
-    break
-  fi
-  echo "Respawning in 5s..."
-  sleep 5
-done
+echo "Orders: disabled by default. Web and trading runner are separate processes."
+python runner.py &
+RUNNER_PID=$!
+python app.py &
+WEB_PID=$!
+trap 'kill "$RUNNER_PID" "$WEB_PID" 2>/dev/null || true; wait "$RUNNER_PID" "$WEB_PID" 2>/dev/null || true' EXIT INT TERM
+wait -n "$RUNNER_PID" "$WEB_PID"
+code=$?
+echo "A process exited $code; stopping both so failure is visible."
+exit "$code"
