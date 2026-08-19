@@ -279,9 +279,13 @@ def cfg():
         except:pass
     return {}
 
+def broker_runtime_armed():
+    """Second, process-level interlock. A config/UI change alone cannot arm orders."""
+    return (os.environ.get('CEG_ALLOW_BROKER_ORDERS') or '').strip().lower() in ('1','true','yes')
+
 def broker_orders_enabled():
-    """Fail closed. Missing, malformed, and non-boolean values never enable orders."""
-    return cfg().get('broker_orders_enabled') is True
+    """Fail closed unless both the config and runtime interlocks are explicitly armed."""
+    return cfg().get('broker_orders_enabled') is True and broker_runtime_armed()
 
 def keys_ok():
     c=cfg()
@@ -2416,6 +2420,8 @@ def status():
     return jsonify({
         'configured':keys_ok(),
         'paper_only':True,'broker_orders_enabled':broker_orders_enabled(),
+        'broker_config_enabled':c.get('broker_orders_enabled') is True,
+        'broker_runtime_armed':broker_runtime_armed(),
         'environment':ENVIRONMENT,
         'heartbeat':meta_get('heartbeat'),'last_eval':meta_get('last_eval'),
         'last_ingest':ing,'last_ingest_source':meta_get('last_ingest_source'),

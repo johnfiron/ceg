@@ -12,6 +12,7 @@ WorkingDirectory=/opt/ash/current
 Environment=CEG_ENV=production
 Environment=CEG_DATA_DIR=/var/lib/ash
 Environment=CEG_CONFIG_FILE=/etc/ash/config.production.json
+Environment=CEG_ALLOW_BROKER_ORDERS=false
 EnvironmentFile=-/etc/ash/ash.env
 ExecStart=/opt/ash/venv/bin/python runner.py
 Restart=always

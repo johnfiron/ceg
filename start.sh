@@ -1,6 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/bash
 cd "$(dirname "$0")"
 export CEG_ENV=development
+export CEG_ALLOW_BROKER_ORDERS=false
 if [ ! -f config.development.json ]; then
   cp config.development.example.json config.development.json
   echo "Created config.development.json with broker orders disabled."

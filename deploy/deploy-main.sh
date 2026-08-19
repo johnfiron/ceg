@@ -24,3 +24,11 @@ cd "$release"
 CEG_ENV=test "$ASH_VENV/bin/python" -m unittest discover -s tests -v
 ln -sfn "$release" "$ASH_CURRENT"
 systemctl restart ash.target
+mapfile -t old_releases < <(find "$ASH_RELEASES" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2- | tail -n +4)
+for old_release in "${old_releases[@]}"; do
+  case "$old_release" in
+    "$ASH_RELEASES"/*) git -C "$ASH_REPO" worktree remove --force "$old_release" ;;
+    *) echo "Refusing to remove unexpected release path: $old_release" >&2; exit 1 ;;
+  esac
+done
+git -C "$ASH_REPO" worktree prune
