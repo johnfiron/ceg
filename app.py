@@ -412,9 +412,13 @@ def parse_ny(ts):
 
 def realized_date(trade):
     """New York session date on which a closed trade actually realized P/L."""
-    dt=parse_ny((trade or {}).get('exit_filled_at'))
+    trade=trade or {}
+    if trade.get('exit_kind')=='EXPIRED' and not trade.get('exit_order_id'):
+        economic=str(trade.get('expiry') or trade.get('exit_due_date') or trade.get('trade_date') or '')[:10]
+        if economic:return economic
+    dt=parse_ny(trade.get('exit_filled_at'))
     if dt:return dt.date().isoformat()
-    return str((trade or {}).get('trade_date') or '')[:10]
+    return str(trade.get('trade_date') or '')[:10]
 
 def realized_sort_key(trade):
     dt=parse_ny((trade or {}).get('exit_filled_at'))
@@ -2962,14 +2966,14 @@ def dashboard_payload():
     strat={}
     for s in STRATEGIES:
         rows=[t for t in trades if t.get("strategy_id")==s["id"] and t.get("status")=="CLOSED" and t.get("pnl") is not None]
-        pnls=[float(t.get("pnl") or 0) for t in rows]
+        pnls=[round(float(t.get("pnl") or 0),2) for t in rows]
         wins=sum(1 for p in pnls if p>0)
         strat[s["id"]]={
             "id":s["id"],"name":s["name"],"origin":s["origin"],"author":s["author"],"desc":s["desc"],
             "plain":s.get("plain"),"session":s.get("session"),"horizon":s.get("horizon"),"opt":s.get("opt"),
             "signals":sum(1 for x in sigs if x.get("strategy_id")==s["id"]),
             "closed":len(rows),"wins":wins,"winRate":wins/len(rows) if rows else None,
-            "pnl":sum(pnls),"avgPnl":avg(pnls) if pnls else None
+            "pnl":round(sum(pnls),2),"avgPnl":round(avg(pnls),2) if pnls else None
         }
     rm=compute_research_metrics()
     by={x['id']:x for x in rm.get('strategies') or []}
@@ -2982,22 +2986,22 @@ def dashboard_payload():
     curve=[];cum=0.0
     daily={}
     for t in closed:
-        pnl=float(t.get("pnl") or 0);cum+=pnl
+        pnl=round(float(t.get("pnl") or 0),2);cum=round(cum+pnl,2)
         dt=realized_date(t)
         curve.append({"date":dt,"pnl":pnl,"cumPnl":cum,"strategy":t.get("strategy_id"),"ticker":t.get("ticker")})
-        daily[dt]=daily.get(dt,0)+pnl
+        daily[dt]=round(daily.get(dt,0)+pnl,2)
 
     ticker_stats={}
     names=list(dict.fromkeys(ALL_TICKERS+[t.get("ticker") for t in trades if t.get("ticker")]))
     for tk in names:
         rr=[t for t in closed if t.get("ticker")==tk]
-        pp=[float(t.get("pnl") or 0) for t in rr]
-        ticker_stats[tk]={"closed":len(rr),"pnl":sum(pp),"wins":sum(1 for p in pp if p>0),
+        pp=[round(float(t.get("pnl") or 0),2) for t in rr]
+        ticker_stats[tk]={"closed":len(rr),"pnl":round(sum(pp),2),"wins":sum(1 for p in pp if p>0),
                           "winRate":sum(1 for p in pp if p>0)/len(pp) if pp else None}
 
     today=now_ny().date().isoformat()
     closed_today=[t for t in closed if realized_date(t)==today]
-    realized_today=sum(float(t.get('pnl') or 0) for t in closed_today)
+    realized_today=round(sum(float(t.get('pnl') or 0) for t in closed_today),2)
     payload={
         "strategies":list(strat.values()),
         "curve":curve,
@@ -3009,7 +3013,7 @@ def dashboard_payload():
             "signals":len(sigs),"trades":len(trades),"closed":len(closed),
             "open":sum(1 for t in trades if t.get("status") in OPEN_TRADE_STATUSES),
             "wins":sum(1 for t in closed if float(t.get("pnl") or 0)>0),
-            "realizedPnl":sum(float(t.get("pnl") or 0) for t in closed),
+            "realizedPnl":round(sum(float(t.get("pnl") or 0) for t in closed),2),
             "realizedToday":realized_today,
             "sessionDate":today,
         }
