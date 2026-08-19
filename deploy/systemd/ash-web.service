@@ -13,9 +13,11 @@ Environment=CEG_DATA_DIR=/var/lib/ash
 Environment=CEG_CONFIG_FILE=/etc/ash/config.production.json
 Environment=CEG_ALLOW_BROKER_ORDERS=false
 EnvironmentFile=-/etc/ash/ash.env
-ExecStart=/opt/ash/venv/bin/gunicorn --preload --workers 1 --bind 127.0.0.1:8765 --access-logfile - --error-logfile - app:app
+ExecStart=/opt/ash/venv/bin/gunicorn --chdir /opt/ash/current --workers 1 --bind 127.0.0.1:8765 --access-logfile - --error-logfile - app:app
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
+TimeoutStopSec=60
 UMask=0077
 StateDirectory=ash
 ConfigurationDirectory=ash

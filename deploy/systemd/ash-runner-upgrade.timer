@@ -1,0 +1,10 @@
+[Unit]
+Description=Restart ASH runner after the trading session when an upgrade is pending
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 16:15:00 America/New_York
+Persistent=true
+Unit=ash-runner-upgrade.service
+
+[Install]
+WantedBy=timers.target

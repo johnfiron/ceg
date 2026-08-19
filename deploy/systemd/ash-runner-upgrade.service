@@ -1,0 +1,7 @@
+[Unit]
+Description=Apply a deferred tested ASH runner release
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ash-restart-pending-runner

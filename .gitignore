@@ -12,6 +12,7 @@ __pycache__/
 data/
 *.db
 .venv/
+.test-venv/
 
 # OS
 .DS_Store

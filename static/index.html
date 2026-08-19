@@ -402,7 +402,7 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
 
     <section class="page" id="charts">
       <div class="panel"><div class="panelHead"><h2>Live tape</h2><span class="chip">LOCAL READ</span></div><div class="sub" id="liveStatus" style="margin-bottom:8px">Waiting for ingest…</div><div id="liveGrid" class="liveGrid"></div></div>
-      <div class="panel"><div class="panelHead"><h2>Markets</h2><span class="chip">IEX LIVE · LOCAL TAPE</span></div><div id="marketGrid" class="marketGrid"></div></div>
+      <div class="panel"><div class="panelHead"><h2>Forward paper results by ticker</h2><span class="chip">BROKER FILLS</span></div><div id="marketGrid" class="marketGrid"></div></div>
       <div class="panel">
         <div class="panelHead"><h2>Daily price workspace</h2><div class="tabrow" id="chartLayoutTabs"><button class="tab active" data-layout="1" onclick="setLayout(1,this)">1</button><button class="tab" data-layout="2" onclick="setLayout(2,this)">2</button><button class="tab" data-layout="4" onclick="setLayout(4,this)">2×2</button><button class="tab" data-layout="6" onclick="setLayout(6,this)">3×2</button></div></div>
         <div id="multiCharts" class="grid2"></div>
@@ -470,7 +470,7 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
         <div class="sub" id="mvrStats" style="margin-top:6px"></div>
       </div>
       <div class="labGrid">
-        <div class="panel"><div class="panelHead"><h2>Paper outcomes by RSI, CP, and RVOL</h2><span class="chip">DESKTOP LAB</span></div><div class="surface surfaceDesktop"><canvas id="surfaceCanvas" tabindex="0" aria-label="Rotatable CEG state space" aria-describedby="surfaceSummary"></canvas></div><div class="chartControls surfaceDesktop"><button class="btn" onclick="rotateSurface(0,-.18)">←</button><button class="btn" onclick="rotateSurface(0,.18)">→</button><button class="btn" onclick="rotateSurface(-.14,0)">↑</button><button class="btn" onclick="rotateSurface(.14,0)">↓</button><button class="btn" onclick="resetSurface()">RESET</button></div><div id="surfaceSummary" class="chartSummary surfacePhoneSummary"></div><div class="sub surfaceDesktop">Circles = winners · crosses = losses · hollow circles = unresolved. Drag or use the buttons to rotate.</div></div>
+        <div class="panel"><div class="panelHead"><h2>CEG paper outcomes by RSI, CP, and RVOL</h2><span class="chip">DESKTOP LAB</span></div><div class="surface surfaceDesktop"><canvas id="surfaceCanvas" tabindex="0" aria-label="Rotatable CEG state space" aria-describedby="surfaceSummary"></canvas></div><div class="chartControls surfaceDesktop"><button class="btn" onclick="rotateSurface(0,-.18)">←</button><button class="btn" onclick="rotateSurface(0,.18)">→</button><button class="btn" onclick="rotateSurface(-.14,0)">↑</button><button class="btn" onclick="rotateSurface(.14,0)">↓</button><button class="btn" onclick="resetSurface()">RESET</button></div><div id="surfaceSummary" class="chartSummary surfacePhoneSummary"></div><div class="sub surfaceDesktop">Circles = winners · crosses = losses · amber squares = flat · hollow circles = unresolved. Drag or use the buttons to rotate.</div></div>
         <div class="panel"><div class="panelHead"><h2>Near misses</h2><span class="chip">THRESHOLD JOURNAL</span></div><div id="nearMisses" class="nearMissList sub"></div></div>
       </div>
       <div class="panel"><div class="panelHead"><h2>Realized P&amp;L by ticker</h2></div><div id="tickerBars" class="signedBars"></div><div id="tickerBarsSummary" class="chartSummary"></div></div>
@@ -494,7 +494,7 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
         <div class="panel"><div class="panelHead"><h2>Min detectable edge</h2><span class="chip">vs 50% · 80% POWER</span></div><div id="mdeBox"></div></div>
         <div class="panel"><div class="panelHead"><h2>Power curve</h2><span class="chip">CI WIDTH vs n</span></div><div id="powerBox"></div></div>
       </div>
-      <div class="panel"><div class="panelHead"><h2>FDR across 12 strategies</h2><span class="chip">BH q=0.10</span></div><div id="fdrBox"></div></div>
+      <div class="panel"><div class="panelHead"><h2>FDR across models</h2><span class="chip">BH q=0.10</span></div><div id="fdrBox"></div></div>
       <div class="grid2">
         <div class="panel"><div class="panelHead"><h2>Leave-one-ticker-out fire rate</h2></div><div id="looBox"></div></div>
         <div class="panel"><div class="panelHead"><h2>Shadow book</h2><span class="chip">SKIPS</span></div><div id="shadowBox"></div></div>
@@ -2282,7 +2282,7 @@ function sampleCls(s){return s==='STABLE'?'up':s==='UNDERPOWERED'?'amber':'muted
 function histChart(c,bins){
   if(!bins||!bins.length){chartEmpty(c);return}
   let{g,w,h}=resize(c);
-  let max=Math.max(1,...bins.map(b=>(b.fire||0)+(b.miss||0)));
+  let max=Math.max(1,...bins.flatMap(b=>[b.fire||0,b.miss||0]));
   let p={l:42,r:8,t:10,b:24},pw=w-p.l-p.r,ph=h-p.t-p.b,bw=pw/bins.length,base=h-p.b,pal=chartPalette();
   g.strokeStyle=pal.line;g.fillStyle=pal.muted;g.font='12px system-ui';g.textAlign='right';g.textBaseline='middle';
   [max,Math.round(max/2),0].forEach((v,i)=>{let y=p.t+ph*i/2;g.beginPath();g.moveTo(p.l,y);g.lineTo(w-p.r,y);g.stroke();g.fillText(String(v),p.l-7,y)});
@@ -2292,12 +2292,14 @@ function histChart(c,bins){
     g.save();g.beginPath();g.rect(mx,base-miss,mw,miss);g.clip();g.strokeStyle='#555';for(let q=-miss;q<mw+miss;q+=6){g.beginPath();g.moveTo(mx+q,base);g.lineTo(mx+q+miss,base-miss);g.stroke()}g.restore();
     g.fillStyle=pal.green;g.fillRect(fx,base-fire,fw,fire);
   });
-  g.strokeStyle='#f1b94e55'; g.setLineDash([3,3]);
-  bins.forEach((b,i)=>{if(Math.abs(b.mid-1.25)<.13||Math.abs(b.mid+1.25)<.13){let x=p.l+i*bw+bw/2;g.beginPath();g.moveTo(x,p.t);g.lineTo(x,base);g.stroke()}});
+  g.strokeStyle='#f1b94eaa'; g.setLineDash([3,3]);
+  let edgeLo=Number(bins[0].lo),edgeHi=Number(bins[bins.length-1].hi);
+  [-1.25,1.25].forEach(v=>{let x=p.l+pw*(v-edgeLo)/Math.max(.001,edgeHi-edgeLo);g.beginPath();g.moveTo(x,p.t);g.lineTo(x,base);g.stroke()});
   g.setLineDash([]);g.fillStyle=pal.mid;g.font='12px system-ui';g.textBaseline='alphabetic';g.textAlign='left';g.fillText('−3 ATR',p.l,h-5);g.textAlign='center';g.fillText('0',p.l+pw/2,h-5);g.textAlign='right';g.fillText('+3 ATR',w-p.r,h-5)
 }
 function renderEquityChart(curve){
-  let c=$('equityChart'),rows=curve&&curve.length?curve:[{date:null,cumPnl:0}];if(!c)return;
+  let c=$('equityChart'),rows=curve||[];if(!c)return;
+  if(!rows.length){chartEmpty(c,{readoutId:'equityReadout',readout:'Awaiting the first broker-confirmed realized fill.',summaryId:'equitySummary',summary:'No realized P&L points yet.'});return}
   let draw=i=>{c._chartIndex=i;line(c,rows,'cumPnl',{timeKey:'date',readoutId:'equityReadout',summaryId:'equitySummary',readoutLabel:'Realized P&L',selectedIndex:i})};
   draw(c._chartIndex==null?rows.length-1:Math.min(c._chartIndex,rows.length-1));
   let p=chartPads(c.getBoundingClientRect().width);bindChartInspect(c,{count:rows.length,left:p.l,right:p.r,onSelect:draw})
@@ -2448,12 +2450,27 @@ async function renderTradeBoard(target,openOnly=false){
     requestAnimationFrame(()=>rows.forEach(p=>{let c=$(`tc${p.trade.id}-${target}`);if(c)renderTradeChartCard(c,p,target)}))
   }catch(e){el.innerHTML=`<div class=sub>Trade charts unavailable: ${e.message}</div>`}
 }
-function renderModels(){if(!STATE.d)return;let s=STATE.d.strategies.slice().filter(x=>localStorage.getItem('hideCollecting')!=='1'||x.sample==='STABLE'||(x.fires||0)>0).sort((a,b)=>(b.fireRate||0)-(a.fireRate||0)||b.pnl-a.pnl);$('strategyGrid').innerHTML=s.map(strategyCard).join('');signedBars($('strategyBars'),s,'pnl','id','strategyBarsSummary');let ids=STATE.ov.ids,m=STATE.ov.matrix,max=1;ids.forEach(a=>ids.forEach(b=>max=Math.max(max,m[a][b])));let html=`<div class=matrix style="grid-template-columns:52px repeat(${ids.length},1fr)"><div></div>${ids.map(x=>`<div class=sub>${x}</div>`).join('')}`;ids.forEach(a=>{html+=`<div class=sub>${a}</div>`;ids.forEach(b=>{let v=m[a][b],q=v/max;html+=`<div class=mx title="${a}+${b}: ${v}" style="background:rgba(238,238,232,${.025+.68*q})">${v}</div>`})});html+='</div>';$('overlapMatrix').innerHTML=html;$('driftRows').innerHTML=STATE.dr.rows.map(x=>{let st=(STATE.d.strategies||[]).find(z=>z.id===x.id)||{};let ci=st.winLo!=null?`${pct(st.winLo)}–${pct(st.winHi)}`:pct(x.live_win_rate);let exp=st.expectancy==null?x.live_avg_pnl:st.expectancy;return `<tr>${td('Strategy',x.id)}${td('Fire rate',pct(st.fireRate),'num')}${td('Forward N',x.n,'num')}${td('Win 95% CI',ci,'num')}${td('Expectancy',signedMoney(exp),`num ${Number(exp||0)>=0?'up':'down'}`)}${td('Historical ref',x.hist_win_rate==null?'collecting':pct(x.hist_win_rate),'num')}${td('Sample',st.sample||(x.n<10?'COLLECTING':x.n<30?'UNDERPOWERED':'STABLE'),sampleCls(st.sample))}</tr>`}).join('')}
-let chartData={};
+function renderModels(){
+  if(!STATE.d)return;
+  let s=STATE.d.strategies.slice().filter(x=>localStorage.getItem('hideCollecting')!=='1'||x.sample==='STABLE'||(x.fires||0)>0).sort((a,b)=>(b.fireRate||0)-(a.fireRate||0)||b.pnl-a.pnl);
+  $('strategyGrid').innerHTML=s.map(strategyCard).join('');
+  signedBars($('strategyBars'),s.filter(x=>(x.closed||0)>0),'pnl','id','strategyBarsSummary');
+  let ids=STATE.ov.ids,m=STATE.ov.matrix,max=1;
+  ids.forEach(a=>ids.forEach(b=>max=Math.max(max,m[a][b])));
+  let html=`<div class=matrix style="grid-template-columns:52px repeat(${ids.length},1fr)"><div></div>${ids.map(x=>`<div class=sub>${x}</div>`).join('')}`;
+  ids.forEach(a=>{html+=`<div class=sub>${a}</div>`;ids.forEach(b=>{let v=m[a][b],q=v/max;html+=`<div class=mx title="${a}+${b}: ${v}" style="background:rgba(238,238,232,${.025+.68*q})">${v}</div>`})});
+  html+='</div>';$('overlapMatrix').innerHTML=html;
+  $('driftRows').innerHTML=STATE.dr.rows.map(x=>{let st=(STATE.d.strategies||[]).find(z=>z.id===x.id)||{};let ci=st.winLo!=null?`${pct(st.winLo)}–${pct(st.winHi)}`:pct(x.live_win_rate);let exp=st.expectancy==null?x.live_avg_pnl:st.expectancy;return `<tr>${td('Strategy',x.id)}${td('Fire rate',pct(st.fireRate),'num')}${td('Forward N',x.n,'num')}${td('Win 95% CI',ci,'num')}${td('Expectancy',signedMoney(exp),`num ${Number(exp||0)>=0?'up':'down'}`)}${td('Historical ref',x.hist_win_rate==null?'collecting':pct(x.hist_win_rate),'num')}${td('Sample',st.sample||(x.n<10?'COLLECTING':x.n<30?'UNDERPOWERED':'STABLE'),sampleCls(st.sample))}</tr>`}).join('')
+}
+let chartData={},chartDataAt={};
 function setLayout(n,el){layout=n;xhair=null;document.querySelectorAll('#chartLayoutTabs .tab').forEach(x=>x.classList.remove('active'));if(el)el.classList.add('active');renderMulti()}
 function setLens(id,el){lens=id;document.querySelectorAll('#lensTabs .tab').forEach(x=>x.classList.remove('active'));if(el)el.classList.add('active');let x=(STATE.d?.strategies||[]).find(s=>s.id===id);$('lensDesc').textContent=x?`${x.name} — ${x.plain||x.desc}`:''}
 async function loadReplay(){
   let t=$('replayTicker').value,d=$('replayDate').value;$('replayStatus').textContent='';
+  if(!['SPY','QQQ','IWM'].includes(t)){
+    $('replayStatus').textContent='3:45 historical replay supports SPY, QQQ, and IWM. Use LOAD INTRADAY for '+t+'.';
+    chartEmpty($('replayChart'),{readoutId:'replayReadout',readout:'Historical 3:45 model not available for '+t+'.'});chartEmpty($('replayVolume'));return
+  }
   startWait($('replayChart'),{busy:true});startWait($('replayVolume'),{busy:true});
   try{let j=await api(`/api/replay/${t}?date=${d}`);replay.bars=j.bars;replay.i=1;replay.inspect=null;replay.signals=j.signals;replay.context=j.context;renderReplay();$('replayStatus').textContent=`${replay.bars.length} minute bars · ${j.signals.length} strategy signal(s) at 3:45`}
   catch(e){$('replayStatus').textContent='ERROR: '+e.message;chartEmpty($('replayChart'));chartEmpty($('replayVolume'))}
@@ -2489,7 +2506,7 @@ async function renderResearch(signal){
   if($('stretchChart'))histChart($('stretchChart'),rm.stretch_bins||[]);
   if($('mvrStats')){let m=rm.mvr||{};$('mvrStats').textContent=`Fire RSI ${m.rsi_fire_avg??'—'} (n=${m.n_fire||0}) · miss RSI ${m.rsi_miss_avg??'—'} (n=${m.n_miss||0}) · session tape ${pct(rm.session_complete_pct)}`}
   renderLabExtras(signal);
-  if(STATE.d)signedBars($('tickerBars'),Object.entries(STATE.d.tickerStats).map(([ticker,x])=>({ticker,pnl:x.pnl})),'pnl','ticker','tickerBarsSummary');
+  if(STATE.d)signedBars($('tickerBars'),Object.entries(STATE.d.tickerStats).filter(([,x])=>(x.closed||0)>0).map(([ticker,x])=>({ticker,pnl:x.pnl})),'pnl','ticker','tickerBarsSummary');
   let[nm,sf]=await Promise.all([api('/api/near_misses',{signal}),api('/api/research_surface',{signal})]);
   if(activePageId()!=='research')return;
   $('nearMisses').innerHTML=nm.rows.length?nm.rows.slice(0,45).map(x=>`<div class=metric><span>${x.trade_date} · ${x.strategy_id} · ${x.ticker}</span><b>${x.reason}</b></div>`).join(''):'No journaled near misses yet. Opening swing, ORB, VWAP, and the 3:45 freeze all write reasons here.';
@@ -2497,12 +2514,12 @@ async function renderResearch(signal){
 }
 function drawSurface(points=surfacePoints){
   surfacePoints=points||[];
-  let numeric=(key)=>surfacePoints.map(p=>finiteNumber(p[key])).filter(x=>x!=null),rangeText=(key,label)=>{let v=numeric(key),digits=key==='rsi'?1:2;return v.length?`${label} ${Math.min(...v).toFixed(digits)}–${Math.max(...v).toFixed(digits)}`:`${label} —`},wins=surfacePoints.filter(p=>finiteNumber(p.pnl)!=null&&Number(p.pnl)>=0).length,losses=surfacePoints.filter(p=>finiteNumber(p.pnl)!=null&&Number(p.pnl)<0).length,open=surfacePoints.length-wins-losses;
-  chartText('surfaceSummary',surfacePoints.length?`${surfacePoints.length} snapshots · ${wins} winners · ${losses} losses · ${open} unresolved · ${rangeText('rsi','RSI')} · ${rangeText('cp','CP')} · ${rangeText('rvol','RVOL')}`:'Awaiting 3:45 snapshots. The phone view stays numeric until samples exist.');
+  let numeric=(key)=>surfacePoints.map(p=>finiteNumber(p[key])).filter(x=>x!=null),rangeText=(key,label)=>{let v=numeric(key),digits=key==='rsi'?1:2;return v.length?`${label} ${Math.min(...v).toFixed(digits)}–${Math.max(...v).toFixed(digits)}`:`${label} —`},wins=surfacePoints.filter(p=>finiteNumber(p.pnl)!=null&&Number(p.pnl)>0).length,losses=surfacePoints.filter(p=>finiteNumber(p.pnl)!=null&&Number(p.pnl)<0).length,flats=surfacePoints.filter(p=>finiteNumber(p.pnl)===0).length,open=surfacePoints.length-wins-losses-flats;
+  chartText('surfaceSummary',surfacePoints.length?`${surfacePoints.length} snapshots · ${wins} winners · ${losses} losses · ${flats} flat · ${open} unresolved · ${rangeText('rsi','RSI')} · ${rangeText('cp','CP')} · ${rangeText('rvol','RVOL')}`:'Awaiting 3:45 snapshots. The phone view stays numeric until samples exist.');
   let c=$('surfaceCanvas');if(!c||innerWidth<=850)return;if(!surfacePoints.length){chartEmpty(c);return}let{g,w,h}=resize(c);g.fillStyle='#020202';g.fillRect(0,0,w,h);
   function proj(p){let x=((finiteNumber(p.rsi)??50)/100-.25)*220,y=((finiteNumber(p.cp)??.5)-.5)*210,z=((finiteNumber(p.rvol)??1)-1.5)*110,cy=Math.cos(surfaceRot.y),sy=Math.sin(surfaceRot.y),cx=Math.cos(surfaceRot.x),sx=Math.sin(surfaceRot.x),x1=x*cy-z*sy,z1=x*sy+z*cy,y1=y*cx-z1*sx,z2=y*sx+z1*cx,sc=330/(440+z2);return[w/2+x1*sc,h/2+y1*sc,sc]}
   g.strokeStyle='#1e1e1e';for(let i=-2;i<=2;i++){g.beginPath();g.moveTo(w/2-150,h/2+i*24);g.lineTo(w/2+150,h/2+i*24);g.stroke();g.beginPath();g.moveTo(w/2+i*30,h/2-120);g.lineTo(w/2+i*30,h/2+120);g.stroke()}
-  for(let point of surfacePoints){let[x,y,s]=proj(point),r=Math.max(2.5,3.2*s),pnl=finiteNumber(point.pnl);g.lineWidth=1.3;if(pnl==null){g.strokeStyle='#deded8';g.beginPath();g.arc(x,y,r,0,Math.PI*2);g.stroke()}else if(pnl>=0){g.fillStyle='#4ee693';g.beginPath();g.arc(x,y,r,0,Math.PI*2);g.fill()}else{g.strokeStyle='#ff626c';g.beginPath();g.moveTo(x-r,y-r);g.lineTo(x+r,y+r);g.moveTo(x+r,y-r);g.lineTo(x-r,y+r);g.stroke()}}
+  for(let point of surfacePoints){let[x,y,s]=proj(point),r=Math.max(2.5,3.2*s),pnl=finiteNumber(point.pnl);g.lineWidth=1.3;if(pnl==null){g.strokeStyle='#deded8';g.beginPath();g.arc(x,y,r,0,Math.PI*2);g.stroke()}else if(pnl>0){g.fillStyle='#4ee693';g.beginPath();g.arc(x,y,r,0,Math.PI*2);g.fill()}else if(pnl===0){g.fillStyle='#f1b94e';g.fillRect(x-r,y-r,r*2,r*2)}else{g.strokeStyle='#ff626c';g.beginPath();g.moveTo(x-r,y-r);g.lineTo(x+r,y+r);g.moveTo(x+r,y-r);g.lineTo(x-r,y+r);g.stroke()}}
 }
 function rotateSurface(dx,dy){surfaceRot.x+=dx;surfaceRot.y+=dy;drawSurface()}
 function resetSurface(){surfaceRot.x=-.38;surfaceRot.y=.68;drawSurface()}
@@ -2626,7 +2643,7 @@ function renderLabExtras(signal){
   ['mvr_rvol','mvr_stretch','mvr_rsi_lo','mvr_rsi_hi','orb_rvol','max_daily_fires','max_cluster'].forEach(k=>{let el=$('th_'+k); if(el&&th[k]!=null)el.value=th[k]});
   if($('walkForward'))$('walkForward').innerHTML=(ws.walk_forward||[]).slice(-8).map(x=>`<div class=metric><span>n=${x.n} train exp</span><b>${x.train_exp} → next ${x.next}</b></div>`).join('')||'<div class=sub>Need ≥6 closed trades.</div>';
   if($('bootstrapBox'))$('bootstrapBox').innerHTML=Object.entries(ws.bootstrap||{}).filter(([,v])=>v).map(([k,v])=>`<div class=metric><span>${k}</span><b>p50 ${v.p50} · 5–95 ${v.p05}–${v.p95} · P(μ>0) ${pct(v.frac_positive)}</b></div>`).join('')||'<div class=sub>Need ≥3 closed trades.</div>';
-  if($('corrMatrix')&&ws.corr){let ids=ws.corr_ids||[]; let html=`<div class=matrix style="grid-template-columns:40px repeat(${ids.length},1fr)"><div></div>${ids.map(x=>`<div class=sub>${x}</div>`).join('')}`;ids.forEach(a=>{html+=`<div class=sub>${a}</div>`;ids.forEach(b=>{let v=ws.corr[a]&&ws.corr[a][b],q=v==null?0:(v+1)/2;html+=`<div class=mx title="${a}+${b}">${v==null?'':v}</div>`})});html+='</div>';$('corrMatrix').innerHTML=html}
+  if($('corrMatrix')&&ws.corr){let ids=ws.corr_ids||[]; let html=`<div class=matrix style="grid-template-columns:40px repeat(${ids.length},1fr)"><div></div>${ids.map(x=>`<div class=sub>${x}</div>`).join('')}`;ids.forEach(a=>{html+=`<div class=sub>${a}</div>`;ids.forEach(b=>{let v=ws.corr[a]&&ws.corr[a][b],q=v==null?0:Math.min(1,Math.abs(Number(v))),tone=Number(v)>=0?'78,230,147':'255,98,108';html+=`<div class=mx title="${a}+${b}" style="background:rgba(${tone},${v==null?0:.08+.62*q})">${v==null?'':v}</div>`})});html+='</div>';$('corrMatrix').innerHTML=html}
   api('/api/lab_snapshots',{signal}).then(j=>{if(activePageId()==='research')$('snapList').innerHTML=(j.rows||[]).map(x=>`<div class=metric><span>${x.ts} · ${x.label}</span><b>#${x.id}</b></div>`).join('')||'<div class=sub>No snapshots yet.</div>'}).catch(()=>{})
   let rm=STATE.rm||{};
   if($('mdeBox'))$('mdeBox').innerHTML=`<div class=metric><span>n days</span><b>${rm.mde_n||0}</b></div><div class=metric><span>Min detectable edge vs 50%</span><b>${rm.mde==null?'need sample':pct(rm.mde)}</b></div><div class=sub>Wilson CIs still swamp this until nDays≥30.</div>`;
@@ -2666,14 +2683,15 @@ async function renderMulti(){
   let panes=innerWidth<=850?1:layout,all=chartFocus?[chartFocus,'SPY','QQQ','IWM','AAPL','NVDA'].filter((x,i,a)=>a.indexOf(x)===i):['SPY','QQQ','IWM','AAPL','NVDA','TSLA'],tickers=all.slice(0,panes),grid=$('multiCharts');
   document.querySelectorAll('#chartLayoutTabs .tab').forEach(x=>x.classList.toggle('active',Number(x.dataset.layout)===(innerWidth<=850?1:layout)));
   grid.style.gridTemplateColumns=panes===1?'1fr':panes===2?'1fr 1fr':'repeat(2,1fr)';
-  grid.innerHTML=tickers.map((t,i)=>`<div class=panel style="margin:0"><div class=panelHead><h2>${t} · 90 trading days</h2><span class=chip>${i<3?'INDEX':'LIVE'}</span></div><div id="mcr${i}" class=chartReadout></div><div class=miniChart><canvas id="mc${i}" class=chartCanvasInteractive tabindex="0" aria-label="${t} daily candlestick chart" aria-describedby="mcr${i} mcs${i}"></canvas></div><div id="mcs${i}" class=chartSummary></div></div>`).join('');
+  grid.innerHTML=tickers.map((t,i)=>`<div class=panel style="margin:0"><div class=panelHead><h2>${t} · 90 trading days</h2><span class=chip>${['SPY','QQQ','IWM'].includes(t)?'INDEX':'EQUITY'}</span></div><div id="mcr${i}" class=chartReadout></div><div class=miniChart><canvas id="mc${i}" class=chartCanvasInteractive tabindex="0" aria-label="${t} daily candlestick chart" aria-describedby="mcr${i} mcs${i}"></canvas></div><div id="mcs${i}" class=chartSummary></div></div>`).join('');
   tickers.forEach((t,i)=>{let c=$('mc'+i);if(c)startWait(c,{busy:true})});
-  try{await Promise.all(tickers.map(async t=>{if(!chartData[t])chartData[t]=await api('/api/market_chart/'+t+'?days=90',{signal})}))}
+  try{await Promise.all(tickers.map(async t=>{if(!chartData[t]||Date.now()-(chartDataAt[t]||0)>60000){chartData[t]=await api('/api/market_chart/'+t+'?days=90',{signal});chartDataAt[t]=Date.now()}}))}
   catch(e){if(aborted(e))return;grid.innerHTML=`<div class=sub>Daily charts unavailable: ${e.message}</div>`;return}
   if(signal.aborted||serial!==chartSerial||activePageId()!=='charts')return;
-  let drawAll=()=>tickers.forEach((t,i)=>{let bars=chartData[t].bars||[],selected=xhair==null?Math.max(0,bars.length-1):Math.round(xhair*Math.max(0,bars.length-1)),c=$('mc'+i);c._chartIndex=selected;candles(c,bars,bars.length,{intraday:false,selectedIndex:selected,readoutId:'mcr'+i,summaryId:'mcs'+i,label:t})});
+  let selectedForDate=bars=>{if(xhair==null)return Math.max(0,bars.length-1);let exact=bars.findIndex(b=>String(b.t)===String(xhair));if(exact>=0)return exact;let prior=-1;bars.forEach((b,i)=>{if(String(b.t)<=String(xhair))prior=i});return prior>=0?prior:0};
+  let drawAll=()=>tickers.forEach((t,i)=>{let bars=chartData[t].bars||[],selected=selectedForDate(bars),c=$('mc'+i);c._chartIndex=selected;candles(c,bars,bars.length,{intraday:false,selectedIndex:selected,readoutId:'mcr'+i,summaryId:'mcs'+i,label:t})});
   drawAll();
-  tickers.forEach((t,i)=>{let c=$('mc'+i),bars=chartData[t].bars||[],p=chartPads(c.getBoundingClientRect().width);bindChartInspect(c,{count:bars.length,left:p.l,right:p.r,onSelect:index=>{xhair=bars.length<=1?0:index/(bars.length-1);drawAll()}})});
+  tickers.forEach((t,i)=>{let c=$('mc'+i),bars=chartData[t].bars||[],p=chartPads(c.getBoundingClientRect().width);bindChartInspect(c,{count:bars.length,left:p.l,right:p.r,onSelect:index=>{xhair=bars[index]?.t??null;drawAll()}})});
   if(!$('lensTabs').children.length){$('lensTabs').innerHTML=(STATE.d?.strategies||[]).map(x=>`<button class="tab ${x.id===lens?'active':''}" onclick="setLens('${x.id}',this)">${x.id}</button>`).join('');setLens(lens,$('lensTabs').querySelector('.active'))}
   let focus=tickers[0],keys=['m1','m5','d1'],mtfLabel={m1:'1 MINUTE',m5:'5 MINUTE',d1:'DAILY'};
   $('mtfCharts').innerHTML=keys.map((k,i)=>`<div><div class=sub id="mtfSub${i}">${mtfLabel[k]} · ${focus}</div><div id="mtfr${i}" class=chartReadout></div><div class=miniChart><canvas id="mtf${i}" class=chartCanvasInteractive tabindex="0" aria-label="${focus} ${k==='m1'?'one minute':k==='m5'?'five minute':'daily'} candlestick chart" aria-describedby="mtfr${i} mtfs${i}"></canvas></div><div id="mtfs${i}" class=chartSummary></div></div>`).join('');
