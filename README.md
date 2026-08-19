@@ -57,7 +57,8 @@ Production runs from `/opt/ash/current`, stores its SQLite database and backups
 under `/var/lib/ash`, reads `/etc/ash/config.production.json`, and logs to the
 persistent system journal. Two systemd services isolate the dashboard from the
 trading runner. The runner uses systemd's watchdog, so a stale heartbeat causes
-an automatic restart.
+an automatic restart. The supplied web unit uses one Gunicorn worker so the web
+and runner can coexist on a small VM; increase it only after checking memory.
 
 On the server, clone the repository and install once:
 
