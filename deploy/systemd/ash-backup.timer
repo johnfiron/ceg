@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily ASH SQLite backup
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=15m
+Persistent=true
+Unit=ash-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -20,8 +20,13 @@ install -m 0644 /opt/ash/repo/deploy/systemd/ash-web.service /etc/systemd/system
 install -m 0644 /opt/ash/repo/deploy/systemd/ash-runner.service /etc/systemd/system/ash-runner.service
 install -m 0644 /opt/ash/repo/deploy/systemd/ash-deploy.service /etc/systemd/system/ash-deploy.service
 install -m 0644 /opt/ash/repo/deploy/systemd/ash-deploy.timer /etc/systemd/system/ash-deploy.timer
+install -m 0644 /opt/ash/repo/deploy/systemd/ash-backup.service /etc/systemd/system/ash-backup.service
+install -m 0644 /opt/ash/repo/deploy/systemd/ash-backup.timer /etc/systemd/system/ash-backup.timer
+install -d /etc/systemd/journald.conf.d
+install -m 0644 /opt/ash/repo/deploy/journald/ash-retention.conf /etc/systemd/journald.conf.d/ash-retention.conf
 chmod 0755 /opt/ash/repo/deploy/deploy-main.sh
 systemctl daemon-reload
 /opt/ash/repo/deploy/deploy-main.sh
-systemctl enable --now ash.target ash-deploy.timer
+systemctl enable --now ash.target ash-deploy.timer ash-backup.timer
+systemctl restart systemd-journald.service
 echo "Installed. Edit /etc/ash/config.production.json, then restart ash-runner.service."

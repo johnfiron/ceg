@@ -19,6 +19,12 @@ The default environment is `development`. It uses `config.development.json` and
 examples set `broker_orders_enabled` to `false`, and missing or malformed values
 also fail closed. Never commit environment config files or `data/`.
 
+Orders require two independent interlocks: the JSON config must contain the
+literal `true` and the runner process must have
+`CEG_ALLOW_BROKER_ORDERS=true`. Changing the UI/config alone cannot arm orders;
+the production runtime interlock remains false until an operator changes the
+systemd environment and restarts the runner.
+
 The web server and trading runner are separate processes. Importing `app.py`
 initializes the schema but never starts trading. Broker order client IDs are
 deterministic, and the runner audits recent Alpaca paper orders and positions
@@ -85,6 +91,10 @@ immutable release directory, dependencies and safety tests run, and only then is
 `/opt/ash/current` switched and the services restarted. Failed tests leave the
 previous release running. Development happens on `dev`; promote only a tested
 commit to `main`.
+
+`ash-backup.timer` creates a consistent SQLite backup daily and retains 14.
+Deployment keeps the newest three immutable releases. Journald is capped at
+300 MB with a 14-day maximum retention so logs cannot silently fill a small VM.
 
 Useful checks:
 

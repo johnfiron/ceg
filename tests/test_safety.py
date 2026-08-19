@@ -17,20 +17,24 @@ import app
 class SafetyTests(unittest.TestCase):
     def setUp(self):
         app.CFG.unlink(missing_ok=True)
+        os.environ.pop('CEG_ALLOW_BROKER_ORDERS',None)
 
     def test_broker_orders_fail_closed_without_config(self):
         self.assertFalse(app.broker_orders_enabled())
         with self.assertRaisesRegex(RuntimeError,'disabled'):
             app.place_broker_order({'client_order_id':'a53-test','symbol':'SPY','qty':'1'})
 
-    def test_broker_orders_require_literal_true(self):
+    def test_broker_orders_require_config_and_runtime_interlocks(self):
         app.CFG.write_text(json.dumps({'broker_orders_enabled':'true'}))
         self.assertFalse(app.broker_orders_enabled())
         app.CFG.write_text(json.dumps({'broker_orders_enabled':True}))
+        self.assertFalse(app.broker_orders_enabled())
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
         self.assertTrue(app.broker_orders_enabled())
 
     def test_order_retry_recovers_deterministic_client_id(self):
         app.CFG.write_text(json.dumps({'broker_orders_enabled':True}))
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
         expected={'id':'existing','client_order_id':'a53-20260818-ceg-spy'}
         with mock.patch.object(app,'broker_order_by_client_id',side_effect=[None,expected]), \
              mock.patch.object(app,'postj',side_effect=RuntimeError('lost response')) as post:

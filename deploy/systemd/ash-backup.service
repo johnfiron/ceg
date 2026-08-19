@@ -1,10 +1,9 @@
 [Unit]
-Description=ASH web dashboard
-PartOf=ash.target
-After=network-online.target
+Description=ASH consistent SQLite backup
+After=ash-runner.service
 
 [Service]
-Type=simple
+Type=oneshot
 User=ash
 Group=ash
 WorkingDirectory=/opt/ash/current
@@ -13,9 +12,7 @@ Environment=CEG_DATA_DIR=/var/lib/ash
 Environment=CEG_CONFIG_FILE=/etc/ash/config.production.json
 Environment=CEG_ALLOW_BROKER_ORDERS=false
 EnvironmentFile=-/etc/ash/ash.env
-ExecStart=/opt/ash/venv/bin/gunicorn --preload --workers 1 --bind 127.0.0.1:8765 --access-logfile - --error-logfile - app:app
-Restart=on-failure
-RestartSec=5
+ExecStart=/opt/ash/venv/bin/python backup_db.py --retain 14
 UMask=0077
 StateDirectory=ash
 ConfigurationDirectory=ash
@@ -26,7 +23,4 @@ ProtectHome=true
 ReadWritePaths=/var/lib/ash
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=ash-web
-
-[Install]
-WantedBy=ash.target
+SyslogIdentifier=ash-backup
