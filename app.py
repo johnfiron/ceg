@@ -266,8 +266,8 @@ def explain_now(live=None, rm=None, ws=None):
         if why:
             paras.append('Closest names: ' + ' '.join(why[:2]))
     vix=ws.get('vix')
-    if vix is not None:
-        paras.append(f"VIX {float(vix):.1f} — CEG wants ≥15, so capitulation is {'allowed' if float(vix)>=15 else 'blocked'} on that gate.")
+    if vix is not None and float(vix)<15:
+        paras.append(f"VIX {float(vix):.1f} — CEG wants ≥15, so capitulation is blocked on that gate.")
     if ws.get('macro_clear') is False:
         paras.append('Macro calendar is blocking overnight entries (tomorrow is a mapped event).')
     dnt=ws.get('dnt') or live.get('dnt') or {}
@@ -619,10 +619,126 @@ def init_db():
     con.execute('''CREATE TABLE IF NOT EXISTS account_snapshots(
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, equity REAL, cash REAL, portfolio_value REAL,
       last_equity REAL, buying_power REAL, options_buying_power REAL, daytrade_count INTEGER, payload TEXT)''')
+    con.execute('''CREATE TABLE IF NOT EXISTS desk_comments(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, kind TEXT, target_type TEXT, target_id TEXT,
+      trade_date TEXT, strategy_id TEXT, ticker TEXT, window TEXT, body TEXT)''')
     con.execute('CREATE INDEX IF NOT EXISTS idx_account_snapshots_ts ON account_snapshots(ts)')
     con.execute('CREATE INDEX IF NOT EXISTS idx_trades_dates ON trades(trade_date, status, exit_filled_at)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_desk_comments_target ON desk_comments(target_type, target_id)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_desk_comments_date ON desk_comments(trade_date)')
+    _seed_trade_comments(con)
     con.commit(); con.close()
     _log_split_development_ledger()
+
+COMMENT_KINDS=frozenset(('INTENT','EXIT','MISS','DEBRIEF'))
+COMMENT_TARGETS=frozenset(('trade','signal','session'))
+
+def _seed_trade_comments(con):
+    try:
+        rows=con.execute("SELECT id,comment,trade_date,strategy_id,ticker,window FROM trades WHERE IFNULL(comment,'')!=''").fetchall()
+    except Exception:
+        return
+    for r in rows:
+        exists=con.execute("SELECT 1 FROM desk_comments WHERE target_type='trade' AND target_id=?",(str(r['id']),)).fetchone()
+        if exists:
+            continue
+        con.execute(
+            '''INSERT INTO desk_comments(ts,kind,target_type,target_id,trade_date,strategy_id,ticker,window,body)
+               VALUES(?,?,?,?,?,?,?,?,?)''',
+            (now_ny().isoformat(),'INTENT','trade',str(r['id']),r['trade_date'],r['strategy_id'],r['ticker'],r['window'],str(r['comment'])[:800])
+        )
+
+def _comment_row(r):
+    return dict(r)
+
+def _insert_comment(kind,target_type,target_id,body,meta=None):
+    kind=(kind or '').upper()
+    target_type=(target_type or '').lower()
+    body=str(body or '').strip()
+    if kind not in COMMENT_KINDS:
+        raise ValueError('kind must be INTENT, EXIT, MISS, or DEBRIEF')
+    if target_type not in COMMENT_TARGETS:
+        raise ValueError('target_type must be trade, signal, or session')
+    if not body:
+        raise ValueError('body required')
+    if not target_id:
+        raise ValueError('target_id required')
+    meta=meta or {}
+    trade_date=meta.get('trade_date')
+    strategy_id=meta.get('strategy_id')
+    ticker=meta.get('ticker')
+    window=meta.get('window')
+    con=db()
+    if target_type=='trade':
+        tr=con.execute('SELECT id,trade_date,strategy_id,ticker,window FROM trades WHERE id=?',(int(target_id),)).fetchone()
+        if not tr:
+            con.close(); raise ValueError('trade not found')
+        trade_date=tr['trade_date']; strategy_id=tr['strategy_id']; ticker=tr['ticker']; window=tr['window']
+    elif target_type=='signal':
+        sig=con.execute('SELECT id,trade_date,strategy_id,ticker,window FROM signals WHERE id=?',(int(target_id),)).fetchone()
+        if not sig:
+            con.close(); raise ValueError('signal not found')
+        trade_date=sig['trade_date']; strategy_id=sig['strategy_id']; ticker=sig['ticker']; window=sig['window']
+    elif target_type=='session':
+        trade_date=str(target_id)
+    ts=now_ny().isoformat()
+    con.execute(
+        '''INSERT INTO desk_comments(ts,kind,target_type,target_id,trade_date,strategy_id,ticker,window,body)
+           VALUES(?,?,?,?,?,?,?,?,?)''',
+        (ts,kind,target_type,str(target_id),trade_date,strategy_id,ticker,window,body[:800])
+    )
+    cid=con.execute('SELECT last_insert_rowid() x').fetchone()['x']
+    row=con.execute('SELECT * FROM desk_comments WHERE id=?',(cid,)).fetchone()
+    con.commit(); con.close()
+    return _comment_row(row)
+
+def _comments_for(*, trade_id=None, signal_id=None, date=None, related=False, days=30):
+    con=db()
+    if trade_id:
+        trade=con.execute('SELECT * FROM trades WHERE id=?',(int(trade_id),)).fetchone()
+        rows=con.execute("SELECT * FROM desk_comments WHERE target_type='trade' AND target_id=? ORDER BY id",(str(trade_id),)).fetchall()
+        extra=[]
+        if related and trade:
+            sig=con.execute(
+                '''SELECT id FROM signals WHERE trade_date=? AND strategy_id=? AND ticker=? ORDER BY id DESC LIMIT 1''',
+                (trade['trade_date'],trade['strategy_id'],trade['ticker'])
+            ).fetchone()
+            if sig:
+                extra+=con.execute("SELECT * FROM desk_comments WHERE target_type='signal' AND target_id=? ORDER BY id",(str(sig['id']),)).fetchall()
+            extra+=con.execute("SELECT * FROM desk_comments WHERE target_type='session' AND target_id=? ORDER BY id",(trade['trade_date'],)).fetchall()
+        con.close()
+        seen=set(); out=[]
+        for r in list(rows)+list(extra):
+            if r['id'] in seen: continue
+            seen.add(r['id']); out.append(_comment_row(r))
+        out.sort(key=lambda x:x['id'])
+        return out
+    if signal_id:
+        sig=con.execute('SELECT * FROM signals WHERE id=?',(int(signal_id),)).fetchone()
+        rows=list(con.execute("SELECT * FROM desk_comments WHERE target_type='signal' AND target_id=? ORDER BY id",(str(signal_id),)).fetchall())
+        if related and sig:
+            tr=con.execute(
+                '''SELECT id FROM trades WHERE trade_date=? AND strategy_id=? AND ticker=? ORDER BY id DESC LIMIT 1''',
+                (sig['trade_date'],sig['strategy_id'],sig['ticker'])
+            ).fetchone()
+            if tr:
+                rows+=list(con.execute("SELECT * FROM desk_comments WHERE target_type='trade' AND target_id=? ORDER BY id",(str(tr['id']),)).fetchall())
+            rows+=list(con.execute("SELECT * FROM desk_comments WHERE target_type='session' AND target_id=? ORDER BY id",(sig['trade_date'],)).fetchall())
+        con.close()
+        seen=set(); out=[]
+        for r in rows:
+            if r['id'] in seen: continue
+            seen.add(r['id']); out.append(_comment_row(r))
+        out.sort(key=lambda x:x['id'])
+        return out
+    if date:
+        rows=con.execute('SELECT * FROM desk_comments WHERE trade_date=? ORDER BY id',(date,)).fetchall()
+        con.close()
+        return [_comment_row(r) for r in rows]
+    cutoff=desk_cutoff(max(1,min(int(days or 30),365)))
+    rows=con.execute('SELECT * FROM desk_comments WHERE IFNULL(trade_date,"")>=? ORDER BY id DESC LIMIT 400',(cutoff,)).fetchall()
+    con.close()
+    return [_comment_row(r) for r in reversed(list(rows))]
 
 def event(msg,level='INFO'):
     try:
@@ -2804,6 +2920,7 @@ def intro_save():
 def _guest_lan():
     if request.method in ('GET','HEAD','OPTIONS'): return
     if not request.path.startswith('/api/'): return
+    if request.path.startswith('/api/comments'): return
     if orders_allowed(): return
     return jsonify({'error':'guest LAN is read-only; paper orders stay on this device','guest':True}),403
 @app.get('/manifest.webmanifest')
@@ -3856,7 +3973,51 @@ def save_debrief():
         con=db(); con.execute('INSERT INTO lab_snapshots(ts,trade_date,label,payload) VALUES(?,?,?,?)',
                               (now_ny().isoformat(),date,'eod-debrief',json.dumps(payload,default=str))); con.commit(); con.close()
     except Exception as e: event(f'debrief snapshot: {e}','WARN')
+    prompts=(
+        ('q1','What actually happened vs the setup?'),
+        ('q2','What would you not repeat?'),
+        ('q3','What will you measure tomorrow?'),
+    )
+    for key,label in prompts:
+        text=str(d.get(key) or '').strip()
+        if text:
+            try:
+                _insert_comment('DEBRIEF','session',date,f'{label} {text}',{'trade_date':date})
+            except Exception as e:
+                event(f'debrief comment: {e}','WARN')
     return jsonify({'ok':True})
+
+@app.get('/api/comments')
+def get_comments():
+    related=str(request.args.get('related') or '').lower() in ('1','true','yes')
+    try:
+        days=int(request.args.get('days') or 30)
+    except (TypeError,ValueError):
+        days=30
+    try:
+        if request.args.get('trade_id'):
+            rows=_comments_for(trade_id=request.args.get('trade_id'), related=related)
+        elif request.args.get('signal_id'):
+            rows=_comments_for(signal_id=request.args.get('signal_id'), related=related)
+        elif request.args.get('date'):
+            rows=_comments_for(date=request.args.get('date'))
+        else:
+            rows=_comments_for(days=days)
+    except ValueError as e:
+        return jsonify({'error':str(e)}),400
+    return jsonify({'comments':rows})
+
+@app.post('/api/comments')
+def post_comment():
+    d=request.get_json(force=True) or {}
+    try:
+        row=_insert_comment(
+            d.get('kind'), d.get('target_type'), d.get('target_id'), d.get('body'),
+            {'trade_date':d.get('trade_date'),'strategy_id':d.get('strategy_id'),'ticker':d.get('ticker'),'window':d.get('window')}
+        )
+    except ValueError as e:
+        return jsonify({'error':str(e)}),400
+    return jsonify({'ok':True,'comment':row})
 
 @app.get('/api/shadow')
 def shadow_book():

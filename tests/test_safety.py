@@ -315,6 +315,28 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(response.status_code,403)
         self.assertTrue((response.get_json() or {}).get('guest'))
 
+    def test_comments_post_allowed_when_unarmed(self):
+        con=app.db()
+        con.execute("INSERT INTO trades(strategy_id,ticker,direction,status,trade_date) VALUES('ORB','QQQ','CALL','OPEN','2026-08-19')")
+        tid=con.execute('SELECT last_insert_rowid() x').fetchone()['x']
+        con.commit(); con.close()
+        client=app.app.test_client()
+        empty=client.post('/api/comments',json={'kind':'INTENT','target_type':'trade','target_id':tid,'body':'  '})
+        self.assertEqual(empty.status_code,400)
+        ok=client.post('/api/comments',json={'kind':'INTENT','target_type':'trade','target_id':tid,'body':'gap held'})
+        self.assertEqual(ok.status_code,200)
+        rows=client.get(f'/api/comments?trade_id={tid}').get_json()['comments']
+        self.assertEqual(len(rows),1)
+        self.assertEqual(rows[0]['kind'],'INTENT')
+        self.assertEqual(rows[0]['body'],'gap held')
+
+    def test_explain_omits_vix_when_capitulation_allowed(self):
+        with mock.patch.object(app,'session_clock',return_value={'hm':'12:00','phase':'MVR','label':'VWAP reversion fade','current':['MVR'],'next':None,'remaining':30}):
+            blocked=app.explain_now(ws={'vix':12.0})
+            allowed=app.explain_now(ws={'vix':18.0})
+        self.assertTrue(any('blocked' in p.lower() for p in blocked['paragraphs']))
+        self.assertFalse(any('VIX' in p for p in allowed['paragraphs']))
+
 
 if __name__=='__main__':
     unittest.main()
