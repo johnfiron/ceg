@@ -23,12 +23,12 @@ if [ ! -f /etc/ash/config.production.json ]; then
 fi
 chown root:ash-runner /etc/ash/config.production.json
 chmod 0640 /etc/ash/config.production.json
-install -o root -g ash-web -m 0640 /opt/ash/repo/config.production.example.json /etc/ash/config.web.json
+install -o root -g ash-readers -m 0640 /opt/ash/repo/config.production.example.json /etc/ash/config.web.json
 if command -v jq >/dev/null; then
   tmp_web=$(mktemp /etc/ash/config.web.json.XXXXXX)
   jq 'del(.alpaca_key,.alpaca_secret,.fred_key,.ntfy_url) | .broker_orders_enabled=false | .keys_ok=false' \
     /etc/ash/config.web.json > "$tmp_web"
-  chown root:ash-web "$tmp_web"
+  chown root:ash-readers "$tmp_web"
   chmod 0640 "$tmp_web"
   mv -f "$tmp_web" /etc/ash/config.web.json
 fi
