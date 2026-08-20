@@ -40,6 +40,7 @@ fi
 runner_commit=$(basename "$runner_release" 2>/dev/null || true)
 isolation_migration=false
 isolation_rollback_needed=false
+runner_prestarted=false
 migration_backup=
 if ! id ash-runner >/dev/null 2>&1 || ! id ash-web >/dev/null 2>&1 || \
    [ "$(systemctl show ash-runner.service -p User --value 2>/dev/null || true)" = ash ]; then
@@ -99,6 +100,10 @@ if $isolation_migration; then
         install -m 0644 "$migration_backup/paper-orders.conf" /etc/systemd/system/ash-web.service.d/paper-orders.conf
       fi
       if id ash >/dev/null 2>&1; then chown -R ash:ash /var/lib/ash; fi
+      if id ash >/dev/null 2>&1; then
+        chown ash:ash /etc/ash/config.production.json
+        chmod 0600 /etc/ash/config.production.json
+      fi
       systemctl daemon-reload || true
       systemctl restart ash-runner.service ash-web.service || true
     fi
@@ -135,6 +140,10 @@ systemctl daemon-reload
 systemctl enable --now ash-runner-upgrade.timer
 
 ln -sfn "$release" "$ASH_CURRENT"
+if $isolation_migration; then
+  systemctl restart ash-runner.service
+  runner_prestarted=true
+fi
 if $first_graceful_migration; then
   systemctl restart ash-web.service
 elif systemctl is-active --quiet ash-web.service; then
@@ -163,7 +172,9 @@ if ! $isolation_migration && [ -n "$runner_commit" ] && git -C "$ASH_REPO" cat-f
   fi
 fi
 if $runner_changed; then
-  if market_window_open; then
+  if $runner_prestarted; then
+    rm -f "$RUNNER_MARKER"
+  elif market_window_open; then
     printf '%s\n' "$commit" > "$RUNNER_MARKER"
     echo "runner upgrade deferred until 16:15 America/New_York"
   else

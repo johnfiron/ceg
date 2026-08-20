@@ -5,12 +5,14 @@ import fcntl
 import os
 import signal
 import socket
+import sqlite3
 from pathlib import Path
 
-from app import ROOT, backup_db, event, meta_set, now_ny, runner_loop, startup_reconcile
+from app import DB, ROOT, backup_db, event, meta_set, now_ny, runner_loop, startup_reconcile
 
 
 _runner_lock=None
+_db_anchor=None
 
 
 def acquire_runner_lock():
@@ -25,6 +27,17 @@ def acquire_runner_lock():
         raise RuntimeError('another ASH trading runner already holds the process lock')
     handle.seek(0); handle.truncate(); handle.write(str(os.getpid())); handle.flush()
     _runner_lock=handle
+
+
+def acquire_db_anchor():
+    """Keep WAL coordination files present for the OS-read-only web reader."""
+    global _db_anchor
+    _db_anchor=sqlite3.connect(DB,timeout=30,check_same_thread=False)
+    _db_anchor.execute('PRAGMA journal_mode=WAL')
+    _db_anchor.execute('SELECT 1').fetchone()
+    for suffix,mode in (('-shm',0o660),('-wal',0o640)):
+        path=Path(str(DB)+suffix)
+        if path.exists(): os.chmod(path,mode)
 
 
 def systemd_notify(message):
@@ -47,6 +60,7 @@ def heartbeat(now):
 
 def main():
     acquire_runner_lock()
+    acquire_db_anchor()
     signal.signal(signal.SIGTERM,stop)
     signal.signal(signal.SIGINT,stop)
     atexit.register(lambda: backup_db('runner-exit'))
