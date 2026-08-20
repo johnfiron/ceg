@@ -488,6 +488,7 @@ def ah():
     c=cfg(); return {'APCA-API-KEY-ID':c.get('alpaca_key',''),'APCA-API-SECRET-KEY':c.get('alpaca_secret','')}
 
 _MEM_CACHE={}
+_WEB_DB_ANCHOR=None
 _API_STATS={'hits':0,'misses':0,'calls':0}
 
 def _short_path(url):
@@ -577,7 +578,15 @@ def mem_set(key,payload):
     _MEM_CACHE[key]=(time.time(),payload)
 
 def db():
+    global _WEB_DB_ANCHOR
     read_only=WEB_READ_ONLY
+    if read_only and _WEB_DB_ANCHOR is None:
+        # A long-lived read connection keeps SQLite's WAL shared-memory file
+        # present. The web sandbox may update only that coordination file; the
+        # database and WAL remain OS-level read-only and query_only is enforced.
+        _WEB_DB_ANCHOR=sqlite3.connect(f'file:{DB}?mode=ro',uri=True,timeout=30,check_same_thread=False)
+        _WEB_DB_ANCHOR.execute('PRAGMA query_only=ON')
+        _WEB_DB_ANCHOR.execute('SELECT 1').fetchone()
     con=(sqlite3.connect(f'file:{DB}?mode=ro',uri=True,timeout=30,check_same_thread=False)
          if read_only else sqlite3.connect(DB,timeout=30,check_same_thread=False))
     con.row_factory=sqlite3.Row

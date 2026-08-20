@@ -1,7 +1,8 @@
 [Unit]
 Description=ASH web dashboard
 PartOf=ash.target
-After=network-online.target
+After=network-online.target ash-runner.service
+Wants=ash-runner.service
 
 [Service]
 Type=simple
@@ -24,6 +25,7 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=/var/lib/ash /etc/ash/config.web.json
+ReadWritePaths=/var/lib/ash/arena.db-shm
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
