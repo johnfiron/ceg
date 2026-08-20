@@ -132,12 +132,14 @@ fi
 # master stays alive; HUP starts the new worker before retiring the old one.
 install -m 0644 "$release/deploy/systemd/ash-web.service" /etc/systemd/system/ash-web.service
 install -m 0644 "$release/deploy/systemd/ash-runner.service" /etc/systemd/system/ash-runner.service
+install -m 0644 "$release/deploy/systemd/ash-backup.service" /etc/systemd/system/ash-backup.service
+install -m 0644 "$release/deploy/systemd/ash-backup.timer" /etc/systemd/system/ash-backup.timer
 install -m 0644 "$release/deploy/systemd/ash-runner-upgrade.service" /etc/systemd/system/ash-runner-upgrade.service
 install -m 0644 "$release/deploy/systemd/ash-runner-upgrade.timer" /etc/systemd/system/ash-runner-upgrade.timer
 rm -f /etc/systemd/system/ash-web.service.d/paper-orders.conf
 install -m 0755 "$release/deploy/restart-pending-runner.sh" /usr/local/sbin/ash-restart-pending-runner
 systemctl daemon-reload
-systemctl enable --now ash-runner-upgrade.timer
+systemctl enable --now ash-backup.timer ash-runner-upgrade.timer
 
 ln -sfn "$release" "$ASH_CURRENT"
 if $isolation_migration; then
