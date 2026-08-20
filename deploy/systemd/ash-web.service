@@ -5,27 +5,32 @@ After=network-online.target
 
 [Service]
 Type=simple
-User=ash
-Group=ash
+User=ash-web
+Group=ash-readers
 WorkingDirectory=/opt/ash/current
 Environment=CEG_ENV=production
+Environment=CEG_PROCESS_ROLE=web
 Environment=CEG_DATA_DIR=/var/lib/ash
-Environment=CEG_CONFIG_FILE=/etc/ash/config.production.json
+Environment=CEG_CONFIG_FILE=/etc/ash/config.web.json
 Environment=CEG_ALLOW_BROKER_ORDERS=false
-EnvironmentFile=-/etc/ash/ash.env
 ExecStart=/opt/ash/venv/bin/gunicorn --chdir /opt/ash/current --workers 1 --bind 127.0.0.1:8765 --access-logfile - --error-logfile - app:app
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=60
 UMask=0077
-StateDirectory=ash
-ConfigurationDirectory=ash
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/lib/ash
+ReadOnlyPaths=/var/lib/ash /etc/ash/config.web.json
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ash-web

@@ -38,6 +38,19 @@ class SafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'non-paper'):
                 app.paper_api_url('/orders')
 
+    def test_production_web_role_cannot_arm_or_read_broker_credentials(self):
+        app.CFG.write_text(json.dumps({
+            'alpaca_key':'key','alpaca_secret':'secret','broker_orders_enabled':True,
+        }))
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
+        with mock.patch.object(app,'ENVIRONMENT','production'), mock.patch.object(app,'PROCESS_ROLE','web'):
+            self.assertFalse(app.broker_runtime_armed())
+            self.assertFalse(app.broker_orders_enabled())
+            with self.assertRaisesRegex(RuntimeError,'credentials are unavailable'):
+                app.ah()
+            with self.assertRaisesRegex(RuntimeError,'runner-only'):
+                app.place_broker_order({'client_order_id':'web-must-fail'})
+
     def test_order_retry_recovers_deterministic_client_id(self):
         app.CFG.write_text(json.dumps({'broker_orders_enabled':True}))
         os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
@@ -316,6 +329,15 @@ class SafetyTests(unittest.TestCase):
             environ_base={'REMOTE_ADDR':'10.8.0.9'})
         self.assertEqual(response.status_code,403)
         self.assertTrue((response.get_json() or {}).get('guest'))
+
+    def test_journal_escapes_stored_debrief_html(self):
+        con=app.db()
+        con.execute("INSERT INTO debriefs(ts,trade_date,q1,q2,q3) VALUES(?,?,?,?,?)",
+                    ('2026-08-20T16:00:00-04:00','2026-08-20','<img src=x onerror=alert(1)>','',''))
+        con.commit(); con.close()
+        body=app.app.test_client().get('/api/journal?date=2026-08-20').get_data(as_text=True)
+        self.assertNotIn('<img src=x',body)
+        self.assertIn('&lt;img src=x',body)
 
     def test_comments_post_allowed_when_unarmed(self):
         con=app.db()
