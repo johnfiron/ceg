@@ -339,6 +339,349 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue(any('blocked' in p.lower() for p in blocked['paragraphs']))
         self.assertFalse(any('VIX' in p for p in allowed['paragraphs']))
 
+    def _wipe_signals(self):
+        con=app.db(); con.execute('DELETE FROM signals'); con.commit(); con.close()
+
+    def _bar(self, hm, c):
+        hh,mm=map(int, hm.split(':'))
+        t=app.datetime(2026,8,19,hh,mm,tzinfo=app.NY).isoformat()
+        return {'t':t,'o':c,'h':c,'l':c,'c':c,'v':1}
+
+    def _orb_state(self, **kw):
+        st={'c':102.0,'or_high':100.0,'or_low':98.0,'or_width_pct':1.0,'rvol':1.5,'bars':40,
+            'or_outside_at_open':False,'or_first_break':'10:12','or_held_break':False,
+            'prev_close':99.0,'gap_pct':0.01}
+        st.update(kw)
+        return st
+
+    def test_dnt_skips_thin_session_inside_opn_osf(self):
+        wide={'bid':545.82,'ask':550.0,'last':547.39}
+        s={'bars':22,'c':547.0,'session_pct':0.95,'quote':wide,'sym':'META'}
+        self.assertNotIn('thin session', app.do_not_trade_reasons(s, wide, sleeve='OPN'))
+        self.assertNotIn('thin session', app.do_not_trade_reasons(s, wide, sleeve=['OSF']))
+        self.assertIn('thin session', app.do_not_trade_reasons(s, wide, sleeve='ORB'))
+        self.assertNotIn('wide underlying spread', app.do_not_trade_reasons(s, wide, sleeve='ORB'))
+        self.assertNotIn('quote/tape divergence', app.do_not_trade_reasons({**s,'c':547.0}, {'last':540.0}, sleeve='ORB'))
+
+    def test_skip_dnt_is_retryable_entry_is_not(self):
+        self._wipe_signals()
+        con=app.db()
+        con.execute("""INSERT INTO signals(ts,trade_date,strategy_id,ticker,direction,score,details,execution_status)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    ('2026-08-19T09:51:00-04:00','2026-08-19','OSF','NVDA','PUT',1,'{}','SKIP_DNT'))
+        con.execute("""INSERT INTO signals(ts,trade_date,strategy_id,ticker,direction,score,details,execution_status)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    ('2026-08-19T10:12:00-04:00','2026-08-19','ORB','QQQ','PUT',1,'{}','ENTRY_SUBMITTED'))
+        con.commit(); con.close()
+        self.assertFalse(app.already_signaled('2026-08-19','OSF','NVDA'))
+        self.assertTrue(app.already_signaled('2026-08-19','ORB','QQQ'))
+
+    def test_daily_cap_counts_open_risk_not_scratches(self):
+        self._wipe_trades()
+        frozen=app.datetime(2026,8,19,10,38,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,direction,status,trade_date,signal_ts,pnl)
+                       VALUES('ORB','QQQ','PUT','CLOSED','2026-08-19','2026-08-19T10:12:00-04:00',-75)""")
+        con.execute("""INSERT INTO trades(strategy_id,ticker,direction,status,trade_date,signal_ts)
+                       VALUES('ORB','TSLA','CALL','OPEN','2026-08-19','2026-08-19T10:28:00-04:00')""")
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            self.assertEqual(app.daily_fire_count('ORB','2026-08-19'),1)
+            self.assertEqual(app.cluster_count('2026-08-19',20),1)
+        self.assertTrue(app.loser_cooldown('ORB','2026-08-19','QQQ'))
+        self.assertFalse(app.loser_cooldown('ORB','2026-08-19','SPY'))
+
+    def test_orb_requires_three_closes_still_outside(self):
+        orh,orl=100.0,98.0
+        poke=[self._bar('09:50',99), self._bar('10:11',97.5), self._bar('10:12',99)]
+        self.assertIsNone(app.opening_range_held(poke,orh,orl)[0])
+        held=[self._bar('09:50',99), self._bar('10:11',97.4), self._bar('10:12',97.2), self._bar('10:13',97.0)]
+        self.assertEqual(app.opening_range_held(held,orh,orl),('PUT',3))
+        faded=held+[self._bar('10:14',98.5)]
+        self.assertIsNone(app.opening_range_held(faded,orh,orl)[0])
+
+    def test_midday_orb_misses_one_bar_poke(self):
+        frozen=app.datetime(2026,8,19,10,15,tzinfo=app.NY)
+        states={'QQQ':self._orb_state(c=97.0, or_held_break=False)}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            sigs,evals,_=app.midday_signals(states,'ORB')
+        self.assertEqual(sigs,[])
+        miss=next(x for x in evals if x['ticker']=='QQQ')
+        self.assertEqual(miss['eligible'],0)
+        self.assertIn('not held', miss['reason'])
+
+    def test_midday_orb_fires_held_break(self):
+        frozen=app.datetime(2026,8,19,10,15,tzinfo=app.NY)
+        states={'QQQ':self._orb_state(c=97.0, or_held_break=True, or_held_bars=3)}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            sigs,_,_=app.midday_signals(states,'ORB')
+        self.assertEqual(len(sigs),1)
+        self.assertEqual(sigs[0]['direction'],'PUT')
+
+    def test_dnt_still_blocks_halt_earnings_and_incomplete_tape(self):
+        s={'bars':22,'c':100.0,'session_pct':0.5,'halt':True,'sym':'NVDA'}
+        with mock.patch.object(app,'earnings_block',return_value='earnings 2026-08-19'):
+            r=app.do_not_trade_reasons(s, sleeve='OPN')
+        self.assertIn('incomplete tape', r)
+        self.assertIn('halt / no prints', r)
+        self.assertIn('earnings 2026-08-19', r)
+        self.assertNotIn('thin session', r)
+
+    def test_overnight_sleeve_still_sees_thin_session(self):
+        s={'bars':20,'c':100.0,'session_pct':1.0,'sym':'SPY'}
+        self.assertIn('thin session', app.do_not_trade_reasons(s, sleeve='CEG'))
+
+    def test_orb_held_ignores_premarket_and_side_flips(self):
+        orh,orl=100.0,98.0
+        pre=[self._bar('09:31',97.0), self._bar('09:45',96.5), self._bar('09:59',97.2)]
+        self.assertIsNone(app.opening_range_held(pre,orh,orl)[0])
+        two=[self._bar('10:11',97.0), self._bar('10:12',96.8)]
+        self.assertIsNone(app.opening_range_held(two,orh,orl)[0])
+        flip=[self._bar('10:11',97.0), self._bar('10:12',101.0), self._bar('10:13',97.0)]
+        self.assertIsNone(app.opening_range_held(flip,orh,orl)[0])
+        call3=[self._bar('10:11',101.0), self._bar('10:12',101.2), self._bar('10:13',101.4)]
+        self.assertEqual(app.opening_range_held(call3,orh,orl),('CALL',3))
+        then_in=call3+[self._bar('10:14',99.0)]
+        self.assertIsNone(app.opening_range_held(then_in,orh,orl)[0])
+
+    def test_retryable_skips_include_cap_stale_opposite_not_loser(self):
+        self._wipe_signals()
+        con=app.db()
+        for st,tk in (('SKIP_DAILY_CAP','SPY'),('SKIP_STALE_QUOTE','MSFT'),('SKIP_CLUSTER','AMD'),
+                      ('SKIP_OPPOSITE','AMZN'),('SKIP_LOSER','AAPL'),('SKIP_GUEST','NVDA')):
+            con.execute("""INSERT INTO signals(ts,trade_date,strategy_id,ticker,direction,execution_status)
+                           VALUES(?,?,?,?,?,?)""",
+                        ('2026-08-19T10:38:00-04:00','2026-08-19','ORB',tk,'CALL',st))
+        con.commit(); con.close()
+        self.assertFalse(app.already_signaled('2026-08-19','ORB','SPY'))
+        self.assertFalse(app.already_signaled('2026-08-19','ORB','MSFT'))
+        self.assertFalse(app.already_signaled('2026-08-19','ORB','AMD'))
+        self.assertFalse(app.already_signaled('2026-08-19','ORB','AMZN'))
+        self.assertFalse(app.already_signaled('2026-08-19','ORB','NVDA'))
+        self.assertTrue(app.already_signaled('2026-08-19','ORB','AAPL'))
+
+    def test_three_open_orbs_cap_fourth_then_retry_after_scratch(self):
+        self._paper_cfg(); self._wipe_trades()
+        frozen=app.datetime(2026,8,19,10,38,tzinfo=app.NY)
+        con=app.db()
+        for tk in ('QQQ','IWM','TSLA'):
+            con.execute("""INSERT INTO trades(strategy_id,ticker,direction,status,trade_date,signal_ts)
+                           VALUES('ORB',?,'PUT','OPEN','2026-08-19','2026-08-19T10:12:00-04:00')""",(tk,))
+        con.commit(); con.close()
+        states={'SPY':{'c':770.0,'bars':60,'session_pct':0.97,'quote':{'bid':770,'ask':770.02,'last':770.01}}}
+        sig={'strategy_id':'ORB','ticker':'SPY','direction':'CALL','horizon':'EOD','window':'10:38'}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            status,_=self._submit(sig,states)
+        self.assertEqual(status,'SKIP_DAILY_CAP')
+        con=app.db()
+        con.execute("UPDATE trades SET status='CLOSED',pnl=-75 WHERE ticker='QQQ'")
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            self.assertEqual(app.daily_fire_count('ORB','2026-08-19'),2)
+            status,_=self._submit(sig,states)
+        self.assertEqual(status,'ENTRY_SUBMITTED')
+
+    def test_submit_opn_with_22_bars_and_iex_junk_is_not_dnt(self):
+        self._paper_cfg(); self._wipe_trades()
+        frozen=app.datetime(2026,8,19,9,51,tzinfo=app.NY)
+        states={'IWM':{'c':302.22,'bars':22,'session_pct':0.95,'sym':'IWM',
+                       'quote':{'bid':302.46,'ask':302.49,'last':302.47}}}
+        sig={'strategy_id':'OPN','ticker':'IWM','direction':'CALL','horizon':'EOD','window':'09:51'}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            status,extra=self._submit(sig,states)
+        self.assertEqual(status,'ENTRY_SUBMITTED')
+        self.assertEqual(extra.get('dnt') or [], [])
+
+    def test_submit_orb_meta_iex_spread_is_not_dnt(self):
+        self._paper_cfg(); self._wipe_trades()
+        frozen=app.datetime(2026,8,19,10,14,tzinfo=app.NY)
+        states={'META':{'c':546.52,'bars':44,'session_pct':0.97,'sym':'META',
+                        'quote':{'bid':545.82,'ask':550.0,'last':547.39}}}
+        sig={'strategy_id':'ORB','ticker':'META','direction':'CALL','horizon':'EOD','window':'10:14'}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            status,extra=self._submit(sig,states)
+        self.assertEqual(status,'ENTRY_SUBMITTED')
+        self.assertEqual(extra.get('dnt') or [], [])
+
+    def test_loser_on_qqq_does_not_block_spy_submit(self):
+        self._paper_cfg(); self._wipe_trades()
+        frozen=app.datetime(2026,8,19,10,38,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,direction,status,trade_date,signal_ts,pnl)
+                       VALUES('ORB','QQQ','PUT','CLOSED','2026-08-19','2026-08-19T10:12:00-04:00',-75)""")
+        con.commit(); con.close()
+        states={'SPY':{'c':770.0,'bars':60,'session_pct':0.97}}
+        sig={'strategy_id':'ORB','ticker':'SPY','direction':'CALL','horizon':'EOD','window':'10:38'}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            status,_=self._submit(sig,states)
+        self.assertEqual(status,'ENTRY_SUBMITTED')
+
+    def test_replay_aug19_orb_tape_rejects_pokes_holds_tsla(self):
+        book=app.ROOT/'data'/'development'/'arena.db'
+        if not book.exists():
+            self.skipTest('development arena.db not present')
+        import sqlite3
+        from datetime import datetime
+        NY=app.NY
+        con=sqlite3.connect(f'file:{book}?mode=ro', uri=True)
+        con.row_factory=sqlite3.Row
+
+        def rth_of(tk):
+            rows=con.execute("""SELECT t,o,h,l,c,v FROM live_bars
+                                WHERE ticker=? AND trade_date='2026-08-19' AND timeframe='1Min' ORDER BY t""",(tk,)).fetchall()
+            return app.rth_bars([dict(x) for x in rows])
+
+        def held_at(rth, orh, orl, cutoff):
+            slice_=[]
+            last=None
+            for b in rth:
+                hm=datetime.fromisoformat(str(b['t']).replace('Z','+00:00')).astimezone(NY).strftime('%H:%M')
+                if hm>cutoff: break
+                slice_.append(b); last=(hm,float(b['c']))
+            side,n=app.opening_range_held(slice_, orh, orl)
+            return side,n,last
+
+        first_held={}
+        at_fill={}
+        for tk in ('QQQ','IWM','TSLA','META','MSFT','SPY'):
+            rth=rth_of(tk)
+            orh,orl,_=app.opening_range(rth)
+            hit=None
+            for i,b in enumerate(rth):
+                hm=datetime.fromisoformat(str(b['t']).replace('Z','+00:00')).astimezone(NY).strftime('%H:%M')
+                if hm<'10:05' or hm>'10:38': continue
+                side,n=app.opening_range_held(rth[:i+1], orh, orl)
+                if side and hit is None:
+                    hit=(hm,side,n,float(b['c']),orh,orl)
+            first_held[tk]=hit
+            at_fill[tk]=(orh,orl)+held_at(rth,orh,orl,'10:12' if tk!='TSLA' else '10:28')
+        con.close()
+
+        self.assertIsNone(first_held['QQQ'], msg=first_held)
+        self.assertIsNone(at_fill['QQQ'][2])
+        self.assertIsNone(at_fill['IWM'][2], msg='IWM 10:12 fill was a one-bar poke')
+        self.assertEqual(first_held['IWM'][0],'10:15', msg=first_held)
+        self.assertIsNone(at_fill['TSLA'][2], msg='TSLA 10:28 fill was only two closes outside')
+        self.assertEqual(first_held['TSLA'][0],'10:29', msg=first_held)
+        self.assertEqual(first_held['TSLA'][1],'CALL')
+        self.assertEqual(first_held['META'][0],'10:17', msg=first_held)
+        self.assertEqual(first_held['MSFT'][0],'10:19', msg=first_held)
+        self.assertIsNone(first_held['SPY'], msg=first_held)
+        iwm=first_held['IWM']
+        self.assertLess(abs(app.opening_range_excursion(iwm[3],iwm[4],iwm[5])),0.0015)
+        tsla=first_held['TSLA']
+        self.assertGreater(abs(app.opening_range_excursion(tsla[3],tsla[4],tsla[5])),0.0015)
+
+    def test_orb_shallow_hold_does_not_fire(self):
+        frozen=app.datetime(2026,8,19,10,15,tzinfo=app.NY)
+        states={'IWM':self._orb_state(c=301.55, or_high=303.13, or_low=301.76,
+                                     or_held_break=True, or_held_bars=3, bars=40, rvol=1.7)}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            sigs,evals,_=app.midday_signals(states,'ORB')
+        self.assertEqual(sigs,[])
+        miss=next(x for x in evals if x['ticker']=='IWM')
+        self.assertIn('shallow', miss['reason'])
+
+    def test_orb_deep_held_break_still_fires(self):
+        frozen=app.datetime(2026,8,19,10,29,tzinfo=app.NY)
+        states={'TSLA':self._orb_state(c=342.275, or_high=341.14, or_low=335.745,
+                                      or_held_break=True, or_held_bars=3, bars=50, rvol=1.8)}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            sigs,_,_=app.midday_signals(states,'ORB')
+        self.assertEqual(len(sigs),1)
+        self.assertEqual(sigs[0]['ticker'],'TSLA')
+        self.assertEqual(sigs[0]['direction'],'CALL')
+
+    def test_one_lot_does_not_scale_to_flat(self):
+        self._wipe_trades()
+        frozen=app.datetime(2026,8,19,10,32,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,status,trade_date,
+                       entry_filled_at,horizon,atm_spot)
+                       VALUES(1,'ORB','TSLA','CALL','TSLA260819C00340000',1,'OPEN','2026-08-19',
+                       '2026-08-19T10:28:00-04:00','EOD',341.0)""")
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen), \
+             mock.patch.object(app,'mae_mfe_from_tape',return_value=(0.0,0.01)), \
+             mock.patch.object(app,'submit_exit') as ex, \
+             mock.patch.object(app,'local_intraday_state',return_value={'c':343.0,'or_high':341.14,'or_low':335.7}):
+            app.refresh_excursions_and_stops()
+        ex.assert_not_called()
+        con=app.db(); row=con.execute('SELECT status FROM trades WHERE id=1').fetchone(); con.close()
+        self.assertEqual(row['status'],'OPEN')
+
+    def test_option_pnl_rounds_to_cents(self):
+        self.assertEqual(app.option_pnl(1.6,0.96,1),-64.0)
+        self.assertEqual(app.option_pnl(5.7,3.6,1),-210.0)
+
+    def test_fresh_pending_locks_stale_pending_retries(self):
+        self._wipe_signals()
+        frozen=app.datetime(2026,8,19,10,20,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO signals(ts,trade_date,strategy_id,ticker,direction,execution_status)
+                       VALUES(?,?,?,?,?,?)""",
+                    ('2026-08-19T10:19:00-04:00','2026-08-19','ORB','QQQ','PUT','PENDING'))
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            self.assertTrue(app.already_signaled('2026-08-19','ORB','QQQ'))
+        stale=app.datetime(2026,8,19,10,25,tzinfo=app.NY)
+        with mock.patch.object(app,'now_ny',return_value=stale):
+            self.assertFalse(app.already_signaled('2026-08-19','ORB','QQQ'))
+
+    def test_upsert_pending_reuses_skip_dnt_row(self):
+        self._wipe_signals()
+        frozen=app.datetime(2026,8,19,9,55,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO signals(ts,trade_date,strategy_id,ticker,direction,score,details,execution_status)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    ('2026-08-19T09:51:00-04:00','2026-08-19','OSF','NVDA','PUT',1,'{}','SKIP_DNT'))
+        con.commit(); con.close()
+        sig={'strategy_id':'OSF','ticker':'NVDA','direction':'PUT','score':1.2,'details':{'clock':'09:55'},
+             'window':'09:55','horizon':'EOD'}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            app._upsert_pending_signal('2026-08-19',sig)
+        con=app.db()
+        n=con.execute("SELECT COUNT(*) n FROM signals WHERE trade_date='2026-08-19' AND strategy_id='OSF' AND ticker='NVDA'").fetchone()['n']
+        st=con.execute("SELECT execution_status FROM signals WHERE trade_date='2026-08-19' AND strategy_id='OSF' AND ticker='NVDA'").fetchone()['execution_status']
+        con.close()
+        self.assertEqual(n,1)
+        self.assertEqual(st,'PENDING')
+
+    def test_transient_exit_error_keeps_broker_note(self):
+        self._wipe_trades()
+        frozen=app.datetime(2026,8,19,15,55,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,status,trade_date,
+                       exit_due_date,horizon,broker_note)
+                       VALUES(1,'ORB','QQQ','PUT','QQQ260819P00713000',1,'OPEN','2026-08-19',
+                       '2026-08-19','EOD','paper market order')""")
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen), \
+             mock.patch.object(app,'submit_exit',side_effect=BrokenPipeError('[Errno 32] Broken pipe')):
+            app.submit_due_exits()
+        con=app.db(); row=con.execute('SELECT broker_note,status FROM trades WHERE id=1').fetchone(); con.close()
+        self.assertEqual(row['status'],'OPEN')
+        self.assertEqual(row['broker_note'],'paper market order')
+
+    def _submit(self, sig, states):
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
+        app.CFG.write_text(json.dumps({
+            'alpaca_key':'k','alpaca_secret':'s','fred_key':'f','keys_ok':True,
+            'broker_orders_enabled':True,'max_daily_fires':3,'max_cluster':5,
+        }))
+        spot=states[sig['ticker']]['c']
+        opt=f"{sig['ticker']}260819C00001000"
+        with mock.patch.object(app,'option_contract',return_value=(opt,'2026-08-19',spot,'0dte atm',{'dte':'0dte','moneyness':'atm'})), \
+             mock.patch.object(app,'option_quote',return_value={'bid':1.0,'ask':1.05,'spread':0.05,'age_sec':1}), \
+             mock.patch.object(app,'pdt_block',return_value=None), \
+             mock.patch.object(app,'session_coverage',return_value={sig['ticker']:{'pct':0.97}}), \
+             mock.patch.object(app,'place_broker_order',return_value={'id':'ord-test'}), \
+             mock.patch.object(app,'greeks_snap',return_value={'iv':0.2,'delta':0.5,'gamma':0.1}), \
+             mock.patch.object(app,'log_contract'), \
+             mock.patch.object(app,'log_shadow'), \
+             mock.patch.object(app,'event'):
+            return app.submit_entry(sig, states)
+
 
 if __name__=='__main__':
     unittest.main()
