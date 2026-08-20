@@ -115,7 +115,7 @@ if $isolation_migration; then
   install -d -o root -g root -m 0755 /etc/ash
   chown root:ash-runner /etc/ash/config.production.json
   chmod 0640 /etc/ash/config.production.json
-  install -o root -g ash-web -m 0640 "$release/config.production.example.json" /etc/ash/config.web.json
+  install -o root -g ash-readers -m 0640 "$release/config.production.example.json" /etc/ash/config.web.json
   systemctl stop ash-runner.service
   chown -R ash-runner:ash-readers /var/lib/ash
   find /var/lib/ash -type d -exec chmod 2750 {} +
