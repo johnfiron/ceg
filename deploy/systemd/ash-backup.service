@@ -4,18 +4,17 @@ After=ash-runner.service
 
 [Service]
 Type=oneshot
-User=ash
-Group=ash
+User=ash-runner
+Group=ash-runner
+SupplementaryGroups=ash-readers
 WorkingDirectory=/opt/ash/current
 Environment=CEG_ENV=production
+Environment=CEG_PROCESS_ROLE=runner
 Environment=CEG_DATA_DIR=/var/lib/ash
 Environment=CEG_CONFIG_FILE=/etc/ash/config.production.json
 Environment=CEG_ALLOW_BROKER_ORDERS=false
-EnvironmentFile=-/etc/ash/ash.env
 ExecStart=/opt/ash/venv/bin/python backup_db.py --retain 14
 UMask=0077
-StateDirectory=ash
-ConfigurationDirectory=ash
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
