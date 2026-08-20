@@ -49,6 +49,11 @@ ALL_TICKERS=list(dict.fromkeys(TICKERS+MIDDAY_TICKERS))
 EOD_STRATEGY_IDS=['CEG','VCT','XED','LAR','RSI2','BB','MACD','DON','STO','KEL']
 MIDDAY_STRATEGY_IDS=['OPN','OSF','ORB','VRC','MVR']
 OPEN_TRADE_STATUSES=('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED')
+OPENING_DNT_SLEEVES=frozenset(('OPN','OSF'))
+ORB_HELD_CLOSES=3
+RETRYABLE_SIGNAL_STATUSES=('ERROR','SKIP_DNT','SKIP_STALE_QUOTE','SKIP_DAILY_CAP','SKIP_CLUSTER',
+                           'SKIP_CHECKLIST','SKIP_NO_0DTE','SKIP_NO_CONTRACT','SKIP_BP','SKIP_OPPOSITE','SKIP_GUEST')
+PENDING_SIGNAL_STALE_SEC=120
 DESK_WINDOW_DAYS=30
 _HIST_THREAD=None
 NOTES=ROOT/'notes.md'
@@ -68,7 +73,7 @@ STRATEGIES=[
  {'id':'KEL','name':'Keltner Breakout','origin':'Established','author':'Keltner-style','session':'15:45','horizon':'OVERNIGHT','opt':{'dte':'next','moneyness':'otm1'},'desc':'Close beyond EMA20 ± 2×ATR20.','plain':'Late-day trend continuation. Only if the close is clearly outside the Keltner channel.'},
  {'id':'OPN','name':'Opening Swing','origin':'New open','author':'Gap-and-go / opening drive','session':'09:35-09:55','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Trade a gap that is still holding in the first 20 minutes. ATM same-day option so the opening drive can show in P&L.','plain':'If the index gaps ≥0.35% and has not given the gap back by 09:35–09:55, ride that opening swing to the close. CALL on a held gap-up, PUT on a held gap-down. Invalidation: price back through yesterday’s close.'},
  {'id':'OSF','name':'Opening Swing Failure','origin':'New open','author':'Failed drive fade','session':'09:50-10:25','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Fade a gap/drive that has already reversed through the prior close. ATM 0DTE.','plain':'The open tried to swing and failed. If a ≥0.35% gap has already crossed back through yesterday’s close, fade it (PUT after a failed gap-up, CALL after a failed gap-down). This is the opposite of OPN.'},
- {'id':'ORB','name':'Opening Range Breakout','origin':'New midday','author':'Intraday session','session':'10:05-11:30','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'First break of the 09:30-10:00 range with time-adjusted RVOL; ATM same-day option so the break can show in P&L.','plain':'After 10:00 the 30-minute range is locked. First genuine break with volume, not a name that was already outside at 10:05.'},
+ {'id':'ORB','name':'Opening Range Breakout','origin':'New midday','author':'Intraday session','session':'10:05-11:30','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Held break of the 09:30-10:00 range (3 consecutive 1-minute closes still outside and ≥15bps through the box) with time-adjusted RVOL; ATM same-day option so the break can show in P&L.','plain':'After 10:00 the 30-minute range is locked. Three 1-minute closes outside, still outside, and at least 15bps through the box — not a one-bar poke or a 7bp leak, and not a name that was already outside at 10:05.'},
  {'id':'VRC','name':'VWAP Reclaim','origin':'New midday','author':'Trend continuation','session':'10:30-13:00','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Ride a reclaim of session VWAP rather than fading a stretch. ATM 0DTE.','plain':'Opposite of MVR. If price spent time on one side of VWAP and then reclaims it with volume, go with the reclaim (CALL reclaim from below, PUT lose VWAP from above).'},
  {'id':'MVR','name':'Midday VWAP Reversion','origin':'New midday','author':'Intraday session','session':'11:00-14:30','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Fade a 5-min RSI extreme stretched from session VWAP; ATM same-day option so a VWAP snapback can show in P&L.','plain':'Mean-reversion sleeve. Only when stretched ≥1.25 ATR from VWAP and 5-min RSI is extreme. Today’s 2¢ 0DTEs did not express this; ATM is the point of the style.'},
 ]
@@ -127,6 +132,32 @@ def _clip01(x):
     except Exception:
         return 0.0
 
+def opening_range_excursion(c, or_high, or_low):
+    """Signed fraction beyond the opening range. >0 above the high, <0 below the low, 0 inside."""
+    try:
+        px,hi,lo=float(c),float(or_high),float(or_low)
+    except Exception:
+        return 0.0
+    if hi<=0 or lo<=0: return 0.0
+    if px>hi: return (px-hi)/hi
+    if px<lo: return (px-lo)/lo
+    return 0.0
+
+def option_pnl(entry_fill, exit_fill, qty=1):
+    """Closed-option P&L in dollars, rounded to cents so float binary does not leak into the book."""
+    try:
+        return round((float(exit_fill)-float(entry_fill or 0))*100*int(qty or 1), 2)
+    except Exception:
+        return None
+
+def _sql_in(values):
+    return ','.join('?'*len(values))
+
+def _transient_broker_msg(msg):
+    m=(msg or '').lower()
+    return any(x in m for x in ('broken pipe','errno 32','connection reset','connection aborted',
+                                'timeout','temporarily unavailable','brokenpipe'))
+
 def setup_proximity(s, hm=None):
     """AND-gate progress toward a live fire. Bottleneck is the weakest gate on the best CALL/PUT path."""
     hm=hm or now_ny().strftime('%H:%M')
@@ -162,18 +193,23 @@ def setup_proximity(s, hm=None):
     if '10:05'<=hm<='11:30':
         orh,orl=s.get('or_high'),s.get('or_low')
         g_rvol=_clip01(rv/1.0); g_or=0.0; side=None
+        held=bool(s.get('or_held_break'))
+        need=float(thresh().get('orb_break_pct',0.0015) or 0.0015)
+        exc=abs(opening_range_excursion(c,orh,orl)) if (orh and orl and c) else 0.0
+        deep=exc>=need
         if orh and orl and c and orh>orl:
             mid=(orh+orl)/2
-            if c>=orh: g_or=1.0; side='CALL'
-            elif c<=orl: g_or=1.0; side='PUT'
+            if c>=orh: g_or=1.0 if (held and deep) else 0.55; side='CALL'
+            elif c<=orl: g_or=1.0 if (held and deep) else 0.55; side='PUT'
             else:
                 g_or=_clip01(abs(c-mid)/((orh-orl)/2))
                 side='CALL' if c>=mid else 'PUT'
-        gates={'rvol':round(g_rvol,3),'range':round(g_or,3)}
+        gates={'rvol':round(g_rvol,3),'range':round(g_or,3),'held':1.0 if held else 0.0,'depth':round(_clip01(exc/need),3) if need else 0.0}
         score=min(gates.values()) if gates else 0
+        fired=bool(rv>=1.0 and held and deep and orh and orl and c and (c>orh or c<orl))
         cands.append({'window':'ORB','score':round(score,3),'side':side,
-                      'bottleneck':'FIRED' if score>=0.999 else min(gates,key=gates.get),
-                      'gates':gates,'fired':score>=0.999})
+                      'bottleneck':'FIRED' if fired else min(gates,key=gates.get),
+                      'gates':gates,'fired':fired})
     if '10:30'<=hm<='13:00':
         rec=s.get('reclaim'); dist=s.get('vwap_dist_atr')
         g_rvol=_clip01(rv/0.9)
@@ -266,8 +302,8 @@ def explain_now(live=None, rm=None, ws=None):
         if why:
             paras.append('Closest names: ' + ' '.join(why[:2]))
     vix=ws.get('vix')
-    if vix is not None:
-        paras.append(f"VIX {float(vix):.1f} — CEG wants ≥15, so capitulation is {'allowed' if float(vix)>=15 else 'blocked'} on that gate.")
+    if vix is not None and float(vix)<15:
+        paras.append(f"VIX {float(vix):.1f} — CEG wants ≥15, so capitulation is blocked on that gate.")
     if ws.get('macro_clear') is False:
         paras.append('Macro calendar is blocking overnight entries (tomorrow is a mapped event).')
     dnt=ws.get('dnt') or live.get('dnt') or {}
@@ -282,7 +318,7 @@ def explain_now(live=None, rm=None, ws=None):
     books=[
         {'id':'OPN','when':'09:35–09:55','what':'Opening swing: held gap-and-go. ATM 0DTE to the close.'},
         {'id':'OSF','when':'09:50–10:25','what':'Failed opening swing: fade a gap that already crossed yesterday’s close.'},
-        {'id':'ORB','when':'10:05–11:30','what':'First break of the locked 09:30–10:00 range.'},
+        {'id':'ORB','when':'10:05–11:30','what':'Held break (3 closes, ≥15bps) of the locked 09:30–10:00 range.'},
         {'id':'VRC','when':'10:30–13:00','what':'VWAP reclaim (trend). Opposite of the MVR fade.'},
         {'id':'MVR','when':'11:00–14:30','what':'VWAP stretch fade with extreme 5-min RSI. ATM, not a 2¢ lottery.'},
         {'id':'EOD','when':'15:45','what':'Ten overnight models on SPY/QQQ/IWM. Next-week 1% OTM. Exit after 09:35 tomorrow.'},
@@ -296,6 +332,9 @@ def normalize_reason(reason):
     if 'not extreme' in low: return 'RSI not extreme with stretch'
     if 'inside opening range' in low: return 'inside opening range'
     if 'opening range incomplete' in low: return 'opening range incomplete'
+    if 'break not held' in low: return 'break not held'
+    if 'break too shallow' in low: return 'break too shallow'
+    if 'need 5m atr' in low: return 'need 5m ATR'
     if 'need vwap' in low: return 'need VWAP + 5m ATR/RSI'
     if 'too early' in low: return 'too early in the open'
     if 'need prior close' in low: return 'need prior close for gap'
@@ -340,6 +379,7 @@ def thresh(book=None):
         'mvr_rsi_lo':float(d.get('mvr_rsi_lo',32)),
         'mvr_rsi_hi':float(d.get('mvr_rsi_hi',68)),
         'orb_rvol':float(d.get('orb_rvol',1.0)),
+        'orb_break_pct':float(d.get('orb_break_pct',0.0015)),
         'max_daily_fires':int(c.get('max_daily_fires',3)),
         'max_cluster':int(c.get('max_cluster',3)),
         'time_stop_min':int(c.get('time_stop_min',90)),
@@ -619,10 +659,126 @@ def init_db():
     con.execute('''CREATE TABLE IF NOT EXISTS account_snapshots(
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, equity REAL, cash REAL, portfolio_value REAL,
       last_equity REAL, buying_power REAL, options_buying_power REAL, daytrade_count INTEGER, payload TEXT)''')
+    con.execute('''CREATE TABLE IF NOT EXISTS desk_comments(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, kind TEXT, target_type TEXT, target_id TEXT,
+      trade_date TEXT, strategy_id TEXT, ticker TEXT, window TEXT, body TEXT)''')
     con.execute('CREATE INDEX IF NOT EXISTS idx_account_snapshots_ts ON account_snapshots(ts)')
     con.execute('CREATE INDEX IF NOT EXISTS idx_trades_dates ON trades(trade_date, status, exit_filled_at)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_desk_comments_target ON desk_comments(target_type, target_id)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_desk_comments_date ON desk_comments(trade_date)')
+    _seed_trade_comments(con)
     con.commit(); con.close()
     _log_split_development_ledger()
+
+COMMENT_KINDS=frozenset(('INTENT','EXIT','MISS','DEBRIEF'))
+COMMENT_TARGETS=frozenset(('trade','signal','session'))
+
+def _seed_trade_comments(con):
+    try:
+        rows=con.execute("SELECT id,comment,trade_date,strategy_id,ticker,window FROM trades WHERE IFNULL(comment,'')!=''").fetchall()
+    except Exception:
+        return
+    for r in rows:
+        exists=con.execute("SELECT 1 FROM desk_comments WHERE target_type='trade' AND target_id=?",(str(r['id']),)).fetchone()
+        if exists:
+            continue
+        con.execute(
+            '''INSERT INTO desk_comments(ts,kind,target_type,target_id,trade_date,strategy_id,ticker,window,body)
+               VALUES(?,?,?,?,?,?,?,?,?)''',
+            (now_ny().isoformat(),'INTENT','trade',str(r['id']),r['trade_date'],r['strategy_id'],r['ticker'],r['window'],str(r['comment'])[:800])
+        )
+
+def _comment_row(r):
+    return dict(r)
+
+def _insert_comment(kind,target_type,target_id,body,meta=None):
+    kind=(kind or '').upper()
+    target_type=(target_type or '').lower()
+    body=str(body or '').strip()
+    if kind not in COMMENT_KINDS:
+        raise ValueError('kind must be INTENT, EXIT, MISS, or DEBRIEF')
+    if target_type not in COMMENT_TARGETS:
+        raise ValueError('target_type must be trade, signal, or session')
+    if not body:
+        raise ValueError('body required')
+    if not target_id:
+        raise ValueError('target_id required')
+    meta=meta or {}
+    trade_date=meta.get('trade_date')
+    strategy_id=meta.get('strategy_id')
+    ticker=meta.get('ticker')
+    window=meta.get('window')
+    con=db()
+    if target_type=='trade':
+        tr=con.execute('SELECT id,trade_date,strategy_id,ticker,window FROM trades WHERE id=?',(int(target_id),)).fetchone()
+        if not tr:
+            con.close(); raise ValueError('trade not found')
+        trade_date=tr['trade_date']; strategy_id=tr['strategy_id']; ticker=tr['ticker']; window=tr['window']
+    elif target_type=='signal':
+        sig=con.execute('SELECT id,trade_date,strategy_id,ticker,window FROM signals WHERE id=?',(int(target_id),)).fetchone()
+        if not sig:
+            con.close(); raise ValueError('signal not found')
+        trade_date=sig['trade_date']; strategy_id=sig['strategy_id']; ticker=sig['ticker']; window=sig['window']
+    elif target_type=='session':
+        trade_date=str(target_id)
+    ts=now_ny().isoformat()
+    con.execute(
+        '''INSERT INTO desk_comments(ts,kind,target_type,target_id,trade_date,strategy_id,ticker,window,body)
+           VALUES(?,?,?,?,?,?,?,?,?)''',
+        (ts,kind,target_type,str(target_id),trade_date,strategy_id,ticker,window,body[:800])
+    )
+    cid=con.execute('SELECT last_insert_rowid() x').fetchone()['x']
+    row=con.execute('SELECT * FROM desk_comments WHERE id=?',(cid,)).fetchone()
+    con.commit(); con.close()
+    return _comment_row(row)
+
+def _comments_for(*, trade_id=None, signal_id=None, date=None, related=False, days=30):
+    con=db()
+    if trade_id:
+        trade=con.execute('SELECT * FROM trades WHERE id=?',(int(trade_id),)).fetchone()
+        rows=con.execute("SELECT * FROM desk_comments WHERE target_type='trade' AND target_id=? ORDER BY id",(str(trade_id),)).fetchall()
+        extra=[]
+        if related and trade:
+            sig=con.execute(
+                '''SELECT id FROM signals WHERE trade_date=? AND strategy_id=? AND ticker=? ORDER BY id DESC LIMIT 1''',
+                (trade['trade_date'],trade['strategy_id'],trade['ticker'])
+            ).fetchone()
+            if sig:
+                extra+=con.execute("SELECT * FROM desk_comments WHERE target_type='signal' AND target_id=? ORDER BY id",(str(sig['id']),)).fetchall()
+            extra+=con.execute("SELECT * FROM desk_comments WHERE target_type='session' AND target_id=? ORDER BY id",(trade['trade_date'],)).fetchall()
+        con.close()
+        seen=set(); out=[]
+        for r in list(rows)+list(extra):
+            if r['id'] in seen: continue
+            seen.add(r['id']); out.append(_comment_row(r))
+        out.sort(key=lambda x:x['id'])
+        return out
+    if signal_id:
+        sig=con.execute('SELECT * FROM signals WHERE id=?',(int(signal_id),)).fetchone()
+        rows=list(con.execute("SELECT * FROM desk_comments WHERE target_type='signal' AND target_id=? ORDER BY id",(str(signal_id),)).fetchall())
+        if related and sig:
+            tr=con.execute(
+                '''SELECT id FROM trades WHERE trade_date=? AND strategy_id=? AND ticker=? ORDER BY id DESC LIMIT 1''',
+                (sig['trade_date'],sig['strategy_id'],sig['ticker'])
+            ).fetchone()
+            if tr:
+                rows+=list(con.execute("SELECT * FROM desk_comments WHERE target_type='trade' AND target_id=? ORDER BY id",(str(tr['id']),)).fetchall())
+            rows+=list(con.execute("SELECT * FROM desk_comments WHERE target_type='session' AND target_id=? ORDER BY id",(sig['trade_date'],)).fetchall())
+        con.close()
+        seen=set(); out=[]
+        for r in rows:
+            if r['id'] in seen: continue
+            seen.add(r['id']); out.append(_comment_row(r))
+        out.sort(key=lambda x:x['id'])
+        return out
+    if date:
+        rows=con.execute('SELECT * FROM desk_comments WHERE trade_date=? ORDER BY id',(date,)).fetchall()
+        con.close()
+        return [_comment_row(r) for r in rows]
+    cutoff=desk_cutoff(max(1,min(int(days or 30),365)))
+    rows=con.execute('SELECT * FROM desk_comments WHERE IFNULL(trade_date,"")>=? ORDER BY id DESC LIMIT 400',(cutoff,)).fetchall()
+    con.close()
+    return [_comment_row(r) for r in reversed(list(rows))]
 
 def event(msg,level='INFO'):
     try:
@@ -916,6 +1072,29 @@ def opening_range(bars):
     if not or_bars:return None,None,0
     return max(float(b['h']) for b in or_bars), min(float(b['l']) for b in or_bars), sum(float(b.get('v') or 0) for b in or_bars)
 
+def opening_range_held(mins, or_high, or_low, need=None):
+    """Last consecutive RTH closes after 10:00 on the same side of the opening range."""
+    need=int(need if need is not None else ORB_HELD_CLOSES)
+    if not mins or or_high is None or or_low is None or need<=0:
+        return None, 0
+    up=dn=0
+    hi,lo=float(or_high),float(or_low)
+    for b in mins:
+        try: hm=datetime.fromisoformat(str(b['t']).replace('Z','+00:00')).astimezone(NY).strftime('%H:%M')
+        except Exception: continue
+        if hm<'10:00': continue
+        try: px=float(b['c'])
+        except Exception: continue
+        if px>hi:
+            up+=1; dn=0
+        elif px<lo:
+            dn+=1; up=0
+        else:
+            up=dn=0
+    if up>=need: return 'CALL', up
+    if dn>=need: return 'PUT', dn
+    return None, max(up,dn)
+
 def daily_cache_missing(symbols=None,min_sessions=90):
     symbols=symbols or ALL_TICKERS
     date=now_ny().date().isoformat()
@@ -1098,6 +1277,12 @@ def local_intraday_state(sym,date=None):
     bars5=resample_5m(mins); closes5=[float(x['c']) for x in bars5]
     rsi5=rsi_simple(closes5,14) if len(closes5)>=15 else None
     at=atr(bars5,14) if len(bars5)>=15 else None
+    atr_src='5m'
+    if at is None and len(mins)>=20:
+        at1=atr(mins,14)
+        if at1:
+            at=at1*(5**0.5)
+            atr_src='1m√5'
     vwap_dist_atr=((c-vwap)/at) if (vwap and at) else None
     con=db()
     drows=con.execute('''SELECT t,o,h,l,c,v FROM live_bars WHERE ticker=? AND timeframe='1Day' AND trade_date<? ORDER BY t''',
@@ -1123,7 +1308,7 @@ def local_intraday_state(sym,date=None):
     if q: last_q=dict(q)
     state={'sym':sym,'date':date,'o':o,'h':h,'l':l,'c':c,'vol':vol,'vwap':vwap,'or_high':or_high,'or_low':or_low,
            'or_width_pct':((or_high-or_low)/((or_high+or_low)/2)*100) if or_high and or_low and or_high>or_low else None,
-           'rvol':rvol,'rsi5':rsi5,'atr5':at,'vwap_dist_atr':vwap_dist_atr,'ret':ret,'prev_close':prev_close,
+           'rvol':rvol,'rsi5':rsi5,'atr5':at,'atr_src':atr_src,'vwap_dist_atr':vwap_dist_atr,'ret':ret,'prev_close':prev_close,
            'gap_pct':gap_pct,'reclaim':reclaim,
            'cp':(c-l)/(h-l) if h>l else .5,'bars':len(mins),'last_bar':mins[-1]['t'],'quote':last_q,
            'clock':last_dt.strftime('%H:%M'),'feed':'iex-local','bars5':bars5[-36:]}
@@ -1137,6 +1322,9 @@ def local_intraday_state(sym,date=None):
             if hm<='10:05' and out: outside_open=True
             if out and first_out is None: first_out=hm
     state['or_first_break']=first_out; state['or_outside_at_open']=outside_open
+    held_side,held_n=opening_range_held(mins, or_high, or_low)
+    state['or_held_side']=held_side; state['or_held_bars']=held_n
+    state['or_held_break']=held_side is not None
     state['or_locked']=last_dt.strftime('%H:%M')>='10:00'
     state['vwap_hi']=(vwap+at) if (vwap and at) else None
     state['vwap_lo']=(vwap-at) if (vwap and at) else None
@@ -1162,6 +1350,7 @@ def build_local_live_overview(date=None,quotes=None):
         row['setup']=setup_proximity(st)
         row['regime']=st.get('regime')
         row['or_first_break']=st.get('or_first_break'); row['or_outside_at_open']=st.get('or_outside_at_open')
+        row['or_held_break']=st.get('or_held_break'); row['or_held_bars']=st.get('or_held_bars'); row['or_held_side']=st.get('or_held_side')
         row['or_locked']=st.get('or_locked'); row['vwap_hi']=st.get('vwap_hi'); row['vwap_lo']=st.get('vwap_lo')
         b5=st.get('bars5') or []
         row['bars5']=[{'t':x.get('t'),'o':x.get('o'),'h':x.get('h'),'l':x.get('l'),'c':x.get('c')} for x in b5[-36:]]
@@ -1194,10 +1383,41 @@ def build_local_live_overview(date=None,quotes=None):
                                        'read':x.get('read')} for x in watch]}
 
 def already_signaled(date,strategy_id,ticker):
-    con=db(); r=con.execute("""SELECT id FROM signals WHERE trade_date=? AND strategy_id=? AND ticker=?
-                               AND IFNULL(execution_status,'PENDING') NOT IN ('ERROR') LIMIT 1""",
-                            (date,strategy_id,ticker)).fetchone(); con.close()
-    return bool(r)
+    """True when a non-retryable send already exists. Fresh PENDING locks; stale PENDING can retry."""
+    con=db(); rows=con.execute("""SELECT execution_status,ts FROM signals WHERE trade_date=? AND strategy_id=? AND ticker=?""",
+                               (date,strategy_id,ticker)).fetchall(); con.close()
+    now=now_ny()
+    for r in rows:
+        st=r['execution_status'] or 'PENDING'
+        if st in RETRYABLE_SIGNAL_STATUSES:
+            continue
+        if st=='PENDING':
+            dt=parse_ny(r['ts'])
+            if dt and (now-dt).total_seconds()<PENDING_SIGNAL_STALE_SEC:
+                return True
+            continue
+        return True
+    return False
+
+def _upsert_pending_signal(date, sig):
+    """Reuse the latest retryable/stale row so SKIP_DNT retries do not flood the tape."""
+    sid,ticker=sig['strategy_id'],sig['ticker']
+    details=json.dumps(sig.get('details') or {},default=str)
+    ts=now_ny().isoformat()
+    marks=RETRYABLE_SIGNAL_STATUSES+('PENDING',)
+    con=db()
+    row=con.execute(f"""SELECT id FROM signals WHERE trade_date=? AND strategy_id=? AND ticker=?
+                        AND IFNULL(execution_status,'PENDING') IN ({_sql_in(marks)})
+                        ORDER BY id DESC LIMIT 1""",(date,sid,ticker,*marks)).fetchone()
+    if row:
+        con.execute("""UPDATE signals SET ts=?,direction=?,score=?,details=?,execution_status='PENDING',window=?,horizon=?
+                       WHERE id=?""",
+                    (ts,sig.get('direction'),sig.get('score'),details,sig.get('window'),sig.get('horizon','EOD'),row['id']))
+    else:
+        con.execute("""INSERT INTO signals(ts,trade_date,strategy_id,ticker,direction,score,details,execution_status,window,horizon)
+                       VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (ts,date,sid,ticker,sig.get('direction'),sig.get('score'),details,'PENDING',sig.get('window'),sig.get('horizon','EOD')))
+    con.commit(); con.close()
 
 def already_traded(date,strategy_id,ticker):
     con=db(); r=con.execute("""SELECT id FROM trades WHERE trade_date=? AND strategy_id=? AND ticker=?
@@ -1609,20 +1829,25 @@ def midday_signals(states, which='ALL', ignore_clock=False):
             elif width is not None and width<0.12: miss('ORB',sym,'range too tight',metrics)
             elif width is not None and width>1.9: miss('ORB',sym,'range too wide / chaos day',metrics)
             elif rv<th['orb_rvol']: miss('ORB',sym,f'rvol {rv:.2f} < {th["orb_rvol"]}',metrics)
-            elif c>orh:
+            elif c is not None and orh is not None and orl is not None and (c>orh or c<orl):
                 if s.get('or_outside_at_open') and (s.get('or_first_break') or '10:05')<='10:05':
                     miss('ORB',sym,'still outside range (not first break)',metrics)
+                elif not s.get('or_held_break'):
+                    miss('ORB',sym,f'break not held (need {ORB_HELD_CLOSES} closes outside)',metrics)
                 else:
-                    add('ORB',sym,'CALL',(c/orh-1)*100,{'or_high':orh,'or_low':orl,'rvol':rv,'width_pct':width,'read':s.get('read'),'first_break':s.get('or_first_break')},book=book)
-            elif c<orl:
-                if s.get('or_outside_at_open') and (s.get('or_first_break') or '10:05')<='10:05':
-                    miss('ORB',sym,'still outside range (not first break)',metrics)
-                else:
-                    add('ORB',sym,'PUT',(orl/c-1)*100,{'or_high':orh,'or_low':orl,'rvol':rv,'width_pct':width,'read':s.get('read'),'first_break':s.get('or_first_break')},book=book)
+                    need=th.get('orb_break_pct',0.0015)
+                    exc=opening_range_excursion(c,orh,orl)
+                    if abs(exc)<need:
+                        miss('ORB',sym,f'break too shallow ({exc*100:.2f}% < {need*100:.2f}%)',metrics)
+                    elif c>orh:
+                        add('ORB',sym,'CALL',(c/orh-1)*100,{'or_high':orh,'or_low':orl,'rvol':rv,'width_pct':width,'exc_pct':exc,'read':s.get('read'),'first_break':s.get('or_first_break'),'held_bars':s.get('or_held_bars')},book=book)
+                    else:
+                        add('ORB',sym,'PUT',(orl/c-1)*100,{'or_high':orh,'or_low':orl,'rvol':rv,'width_pct':width,'exc_pct':exc,'read':s.get('read'),'first_break':s.get('or_first_break'),'held_bars':s.get('or_held_bars')},book=book)
             else: miss('ORB',sym,'inside opening range',metrics)
         if run_vrc:
             rec=s.get('reclaim'); dist=s.get('vwap_dist_atr'); vwap=s.get('vwap')
-            if vwap is None or dist is None: miss('VRC',sym,'need VWAP',metrics)
+            if vwap is None: miss('VRC',sym,'need VWAP',metrics)
+            elif dist is None: miss('VRC',sym,'need 5m ATR',metrics)
             elif rec not in ('UP','DOWN'): miss('VRC',sym,'no VWAP reclaim yet',metrics)
             elif rv<th.get('vrc_rvol',0.9): miss('VRC',sym,f'rvol {rv:.2f} < {th.get("vrc_rvol",0.9)}',metrics)
             elif abs(dist)<th.get('vrc_atr',0.2): miss('VRC',sym,f'reclaim only {dist:.2f} ATR through VWAP',metrics)
@@ -1697,26 +1922,25 @@ def pretrade_checklist(sig, states, coverage, quote, quality):
     spr=quote.get('spread'); mid=None
     if quote.get('bid') and quote.get('ask'): mid=(float(quote['bid'])+float(quote['ask']))/2
     add(not (mid and spr and spr/mid>0.35), 'option spread usable')
-    add(not do_not_trade_reasons(st, st.get('quote')), 'not on do-not-trade list')
+    add(not do_not_trade_reasons(st, st.get('quote'), sleeve=sid), 'not on do-not-trade list')
     add(st.get('c') is not None, 'spot available')
     age=quote.get('age_sec')
     add(age is None or age<=thresh()['quote_max_age_sec'], 'option quote fresh', None if age is None else f'{age:.0f}s')
     return {'pass':all(x['ok'] for x in items),'items':items}
 
-def do_not_trade_reasons(s, quote=None):
+def do_not_trade_reasons(s, quote=None, sleeve=None):
+    """Hard blocks only. IEX last/NBBO is not SIP — quote is ignored on purpose."""
+    _=quote
     reasons=[]
     if (s.get('session_pct') or 1)<0.9: reasons.append('incomplete tape')
-    q=quote or s.get('quote') or {}
-    bid,ask,last=q.get('bid'),q.get('ask'),q.get('last') or s.get('c')
-    try:
-        if bid and ask and last and (float(ask)-float(bid))/float(last)>0.004: reasons.append('wide underlying spread')
-    except Exception: pass
-    if s.get('bars') is not None and (s.get('bars') or 0)<30: reasons.append('thin session')
+    opening=False
+    if isinstance(sleeve,(list,tuple,set)):
+        opening=bool(OPENING_DNT_SLEEVES.intersection(sleeve))
+    elif sleeve in OPENING_DNT_SLEEVES:
+        opening=True
+    if not opening and s.get('bars') is not None and (s.get('bars') or 0)<30:
+        reasons.append('thin session')
     if s.get('halt'): reasons.append('halt / no prints')
-    try:
-        if last and s.get('c') and abs(float(last)-float(s['c']))/float(s['c'])>0.002:
-            reasons.append('quote/tape divergence')
-    except Exception: pass
     earn=earnings_block(s.get('sym'))
     if earn: reasons.append(earn)
     return reasons
@@ -1733,13 +1957,16 @@ def classify_error(msg):
 
 def daily_fire_count(sid, date=None):
     date=date or now_ny().date().isoformat()
-    con=db(); n=con.execute("""SELECT COUNT(*) n FROM trades WHERE strategy_id=? AND trade_date=?
-                               AND IFNULL(status,'') NOT IN ('ERROR')""",(sid,date)).fetchone()['n']; con.close()
+    marks=OPEN_TRADE_STATUSES
+    con=db(); n=con.execute(f"""SELECT COUNT(*) n FROM trades WHERE strategy_id=? AND trade_date=?
+                               AND status IN ({_sql_in(marks)})""",(sid,date,*marks)).fetchone()['n']; con.close()
     return n or 0
 
 def cluster_count(date=None, window_min=20):
     date=date or now_ny().date().isoformat()
-    con=db(); rows=con.execute("SELECT signal_ts FROM trades WHERE trade_date=? AND IFNULL(status,'') NOT IN ('ERROR')",(date,)).fetchall(); con.close()
+    marks=OPEN_TRADE_STATUSES
+    con=db(); rows=con.execute(f"""SELECT signal_ts FROM trades WHERE trade_date=?
+                                   AND status IN ({_sql_in(marks)})""",(date,*marks)).fetchall(); con.close()
     n=now_ny(); cut=n-timedelta(minutes=window_min); k=0
     for r in rows:
         dt=parse_ny(r['signal_ts'])
@@ -1783,10 +2010,16 @@ def earnings_block(ticker, date=None):
             return f'earnings {dx.isoformat()}'
     return None
 
-def loser_cooldown(sid, date=None):
+def loser_cooldown(sid, date=None, ticker=None):
     date=date or now_ny().date().isoformat()
-    con=db(); r=con.execute("""SELECT pnl FROM trades WHERE strategy_id=? AND trade_date=? AND status='CLOSED'
-                               ORDER BY id DESC LIMIT 1""",(sid,date)).fetchone(); con.close()
+    con=db()
+    if ticker:
+        r=con.execute("""SELECT pnl FROM trades WHERE strategy_id=? AND ticker=? AND trade_date=? AND status='CLOSED'
+                         ORDER BY id DESC LIMIT 1""",(sid,ticker,date)).fetchone()
+    else:
+        r=con.execute("""SELECT pnl FROM trades WHERE strategy_id=? AND trade_date=? AND status='CLOSED'
+                         ORDER BY id DESC LIMIT 1""",(sid,date)).fetchone()
+    con.close()
     if r and r['pnl'] is not None and float(r['pnl'])<0:
         return True
     return False
@@ -2061,12 +2294,7 @@ def refresh_excursions_and_stops():
                     event(f"Scale-out {tr['strategy_id']} {tr['ticker']} x{half}")
                 except Exception as e:
                     event(f'Scale-out {tr["id"]}: {e}','WARN')
-            else:
-                try:
-                    submit_exit(tr, 'SCALE')
-                    continue
-                except Exception as e:
-                    event(f'Scale-out {tr["id"]}: {e}','WARN')
+            # 1-lot: do not flatten on first MFE tick; SIGNAL / TIME / EOD still apply.
         entry=parse_ny(tr.get('entry_filled_at') or tr.get('signal_ts'))
         held=None if not entry else (now_ny()-entry).total_seconds()/60.0
         sid=tr.get('strategy_id'); horizon=tr.get('horizon') or 'OVERNIGHT'
@@ -2167,13 +2395,13 @@ def submit_entry(sig,states):
         log_shadow(sig,'SKIP_OPPOSITE',extra); return 'SKIP_OPPOSITE',extra
     fires=daily_fire_count(sid,date)
     if fires>=th['max_daily_fires']:
-        extra={'skip_reason':f'daily cap {fires}/{th["max_daily_fires"]}','ab_book':book}; event(f'{sid} skip daily cap {ticker}','WARN')
+        extra={'skip_reason':f'daily cap {fires}/{th["max_daily_fires"]} open','ab_book':book}; event(f'{sid} skip daily cap {ticker}','WARN')
         log_shadow(sig,'SKIP_DAILY_CAP',extra); return 'SKIP_DAILY_CAP',extra
     clus=cluster_count(date,20)
     if clus>=th['max_cluster']:
         extra={'skip_reason':f'cluster {clus} fires in 20m','ab_book':book}; event(f'{sid} skip cluster {ticker}','WARN')
         log_shadow(sig,'SKIP_CLUSTER',extra); return 'SKIP_CLUSTER',extra
-    if loser_cooldown(sid,date):
+    if loser_cooldown(sid,date,ticker):
         extra={'skip_reason':'loser cooldown until next session','ab_book':book}
         log_shadow(sig,'SKIP_LOSER',extra); return 'SKIP_LOSER',extra
     pdt=pdt_block(horizon)
@@ -2183,7 +2411,7 @@ def submit_entry(sig,states):
     spot=states[ticker]['c']
     coverage=session_coverage(ALL_TICKERS,date)
     st=states[ticker]
-    dnt=do_not_trade_reasons(st, st.get('quote'))
+    dnt=do_not_trade_reasons(st, st.get('quote'), sleeve=sid)
     try:
         option,expiry,strike,reason,style=option_contract(ticker,direction,spot,allow_0dte=(horizon=='EOD'),style=style)
     except RuntimeError as e:
@@ -2292,7 +2520,7 @@ def reconcile():
                 con.execute("UPDATE trades SET entry_fill=?,entry_filled_at=?,status='OPEN' WHERE id=?",(fp,ft,tr['id']))
                 msg=f"FILLED entry {tr['strategy_id']} {tr['ticker']} {tr['option_symbol']} @ {fp}"
             else:
-                pnl=(fp-float(tr['entry_fill'] or 0))*100*int(tr['qty']); con.execute("UPDATE trades SET exit_fill=?,exit_filled_at=?,status='CLOSED',pnl=? WHERE id=?",(fp,ft,pnl,tr['id']))
+                pnl=option_pnl(tr['entry_fill'],fp,tr['qty']); con.execute("UPDATE trades SET exit_fill=?,exit_filled_at=?,status='CLOSED',pnl=? WHERE id=?",(fp,ft,pnl,tr['id']))
                 try:
                     mae,mfe=mae_mfe_from_tape({**dict(tr),'exit_filled_at':ft,'status':'CLOSED'})
                     if mae is not None: con.execute('UPDATE trades SET mae=?,mfe=? WHERE id=?',(mae,mfe,tr['id']))
@@ -2328,7 +2556,8 @@ def _option_is_worthless(tr, n=None):
     horizon=tr.get('horizon') or 'OVERNIGHT'
     after_close=n.weekday()>=5 or hm>='16:00'
     if exp and exp<today: return True
-    if horizon=='EOD' and after_close: return True
+    if exp==today and after_close: return True
+    if not exp and horizon=='EOD' and after_close: return True
     return False
 
 def _expire_trade(tr, note='expired / no quote after close'):
@@ -2405,12 +2634,12 @@ def broker_ledger_repair_plan(orders):
         if not sell:continue
         oid=str(sell.get('id') or ''); used_exits.add(oid)
         exit_fill=float(sell.get('filled_avg_price') or 0)
-        pnl=(exit_fill-float(tr.get('entry_fill') or 0))*100*int(tr.get('qty') or 1)
+        pnl=option_pnl(tr.get('entry_fill'),exit_fill,tr.get('qty'))
         plan.append({
             'action':'update','trade_id':int(tr['id']),'strategy_id':tr.get('strategy_id'),'ticker':tr.get('ticker'),
             'entry_order_id':tr.get('entry_order_id'),'exit_order_id':oid,
             'exit_client_id':sell.get('client_order_id'),'exit_fill':exit_fill,'exit_filled_at':sell.get('filled_at'),
-            'pnl':round(pnl,8),'old_pnl':tr.get('pnl'),
+            'pnl':pnl,'old_pnl':tr.get('pnl'),
         })
 
     # Recover completed app-managed round trips that disappeared with a local DB
@@ -2451,7 +2680,7 @@ def broker_ledger_repair_plan(orders):
             'expiry':expiry,'entry_order_id':oid,'entry_client_id':cid,'entry_fill':entry_fill,
             'entry_filled_at':buy.get('filled_at'),'exit_due_date':exit_due,'exit_order_id':exit_oid,
             'exit_client_id':sell.get('client_order_id'),'exit_fill':exit_fill,'exit_filled_at':sell.get('filled_at'),
-            'status':'CLOSED','pnl':round((exit_fill-entry_fill)*100*qty,8),'horizon':horizon,
+            'status':'CLOSED','pnl':option_pnl(entry_fill,exit_fill,qty),'horizon':horizon,
             'window':sid if horizon=='EOD' else '15:45',
         })
     return plan
@@ -2497,7 +2726,7 @@ def apply_broker_ledger_repair(plan):
 def _close_trade_from_broker_exit(tr, order):
     fp=float(order.get('filled_avg_price') or 0)
     ft=order.get('filled_at')
-    pnl=(fp-float(tr.get('entry_fill') or 0))*100*int(tr.get('qty') or 1)
+    pnl=option_pnl(tr.get('entry_fill'),fp,tr.get('qty'))
     con=db(); con.execute("""UPDATE trades SET exit_order_id=?,exit_client_id=?,exit_fill=?,exit_filled_at=?,
                              status='CLOSED',pnl=?,exit_kind=COALESCE(NULLIF(exit_kind,''),'BROKER'),
                              broker_note=? WHERE id=?""",
@@ -2562,7 +2791,6 @@ def startup_reconcile():
                                'recovered by startup reconciliation',horizon,sid if horizon=='EOD' else '15:45'))
         con.commit(); con.close(); recovered+=1
         event(f'Recovered broker order {cid} into the local trade ledger','WARN')
-    expire_dead_options()
     today=now_ny().date().isoformat()
     con=db(); local_open=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()]; con.close()
     missing=[]
@@ -2579,6 +2807,7 @@ def startup_reconcile():
             _expire_trade(tr, 'broker flat after Activity still OPEN')
             continue
         missing.append(str(tr['id']))
+    expire_dead_options(held)
     if missing:
         event('Startup reconciliation: local OPEN trades absent from Alpaca positions: '+','.join(missing),'ERROR')
         raise RuntimeError('startup reconciliation found missing broker positions for local trades: '+','.join(missing))
@@ -2588,10 +2817,13 @@ def startup_reconcile():
     event(f'Startup reconciliation complete: {len(orders)} orders checked, {recovered} recovered, {skipped_flat} filled buys ignored (broker already flat)')
     return True
 
-def expire_dead_options():
+def expire_dead_options(held=None):
     """0DTE still OPEN after the close is worthless — do not keep sending market sells."""
+    held=set(held or ())
     con=db(); rows=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()]; con.close()
     for tr in rows:
+        if tr.get('option_symbol') in held:
+            continue
         if _option_is_worthless(tr):
             _expire_trade(tr)
 
@@ -2615,7 +2847,8 @@ def submit_due_exits():
         except Exception as e:
             msg=str(e)
             meta_set(f"exit_skip_{tr['id']}_{n.date().isoformat()}",'1')
-            con=db(); con.execute('UPDATE trades SET broker_note=? WHERE id=?',(msg[:240],tr['id'])); con.commit(); con.close()
+            if not _transient_broker_msg(msg):
+                con=db(); con.execute('UPDATE trades SET broker_note=? WHERE id=?',(msg[:240],tr['id'])); con.commit(); con.close()
             if meta_get(f"exit_err_{tr['id']}")!='1':
                 event(f"Exit error trade {tr['id']}: {e}",'ERROR')
                 meta_set(f"exit_err_{tr['id']}",'1')
@@ -2662,8 +2895,7 @@ def evaluate_midday(which='BOTH', force_preview=False):
     fired=[]
     for s in rank_signals(signals):
         if already_signaled(date,s['strategy_id'],s['ticker']): continue
-        con=db(); con.execute('INSERT INTO signals(ts,trade_date,strategy_id,ticker,direction,score,details,execution_status,window,horizon) VALUES(?,?,?,?,?,?,?,?,?,?)',
-                              (now_ny().isoformat(),date,s['strategy_id'],s['ticker'],s['direction'],s['score'],json.dumps(s.get('details') or {},default=str),'PENDING',s.get('window'),s.get('horizon','EOD'))); con.commit(); con.close()
+        _upsert_pending_signal(date,s)
         try:
             status,extra=submit_entry(s,states); con=db(); con.execute('''UPDATE signals SET execution_status=?,note=? WHERE id=(SELECT id FROM signals WHERE trade_date=? AND strategy_id=? AND ticker=? ORDER BY id DESC LIMIT 1)''',(status,json.dumps(extra or {},default=str),date,s['strategy_id'],s['ticker'])); con.commit(); con.close()
             event(f"{s['strategy_id']} {s['ticker']} {s['direction']} {s.get('window')} -> {status}")
@@ -2804,6 +3036,7 @@ def intro_save():
 def _guest_lan():
     if request.method in ('GET','HEAD','OPTIONS'): return
     if not request.path.startswith('/api/'): return
+    if request.path.startswith('/api/comments'): return
     if orders_allowed(): return
     return jsonify({'error':'guest LAN is read-only; paper orders stay on this device','guest':True}),403
 @app.get('/manifest.webmanifest')
@@ -3566,8 +3799,9 @@ def live_tape():
     overview['midday']=[dict(x) for x in con.execute("SELECT * FROM midday_evals WHERE trade_date=? ORDER BY strategy_id,ticker",(date,)).fetchall()]
     con.close()
     dnt={}
+    cur=(overview.get('clock') or {}).get('current') or []
     for sym,st in (overview.get('tickers') or {}).items():
-        r=do_not_trade_reasons(st, st.get('quote'))
+        r=do_not_trade_reasons(st, st.get('quote'), sleeve=cur)
         if r: dnt[sym]=r
     overview['dnt']=dnt
     overview['explain']=explain_now(live=overview, rm=mem_get('ui:rm:'+date,90) or {}, ws=mem_get('ui:workspace',30) or {})
@@ -3741,7 +3975,7 @@ def workspace():
 def set_thresholds():
     d=request.get_json(force=True) or {}; c=cfg()
     th=c.get('thresholds') or {}
-    for k in ('mvr_rvol','mvr_stretch','mvr_rsi_lo','mvr_rsi_hi','orb_rvol'):
+    for k in ('mvr_rvol','mvr_stretch','mvr_rsi_lo','mvr_rsi_hi','orb_rvol','orb_break_pct'):
         if k in d: th[k]=float(d[k])
     c['thresholds']=th
     if 'max_daily_fires' in d: c['max_daily_fires']=int(d['max_daily_fires'])
@@ -3856,7 +4090,51 @@ def save_debrief():
         con=db(); con.execute('INSERT INTO lab_snapshots(ts,trade_date,label,payload) VALUES(?,?,?,?)',
                               (now_ny().isoformat(),date,'eod-debrief',json.dumps(payload,default=str))); con.commit(); con.close()
     except Exception as e: event(f'debrief snapshot: {e}','WARN')
+    prompts=(
+        ('q1','What actually happened vs the setup?'),
+        ('q2','What would you not repeat?'),
+        ('q3','What will you measure tomorrow?'),
+    )
+    for key,label in prompts:
+        text=str(d.get(key) or '').strip()
+        if text:
+            try:
+                _insert_comment('DEBRIEF','session',date,f'{label} {text}',{'trade_date':date})
+            except Exception as e:
+                event(f'debrief comment: {e}','WARN')
     return jsonify({'ok':True})
+
+@app.get('/api/comments')
+def get_comments():
+    related=str(request.args.get('related') or '').lower() in ('1','true','yes')
+    try:
+        days=int(request.args.get('days') or 30)
+    except (TypeError,ValueError):
+        days=30
+    try:
+        if request.args.get('trade_id'):
+            rows=_comments_for(trade_id=request.args.get('trade_id'), related=related)
+        elif request.args.get('signal_id'):
+            rows=_comments_for(signal_id=request.args.get('signal_id'), related=related)
+        elif request.args.get('date'):
+            rows=_comments_for(date=request.args.get('date'))
+        else:
+            rows=_comments_for(days=days)
+    except ValueError as e:
+        return jsonify({'error':str(e)}),400
+    return jsonify({'comments':rows})
+
+@app.post('/api/comments')
+def post_comment():
+    d=request.get_json(force=True) or {}
+    try:
+        row=_insert_comment(
+            d.get('kind'), d.get('target_type'), d.get('target_id'), d.get('body'),
+            {'trade_date':d.get('trade_date'),'strategy_id':d.get('strategy_id'),'ticker':d.get('ticker'),'window':d.get('window')}
+        )
+    except ValueError as e:
+        return jsonify({'error':str(e)}),400
+    return jsonify({'ok':True,'comment':row})
 
 @app.get('/api/shadow')
 def shadow_book():
