@@ -673,7 +673,7 @@ function signalExec(x){
   return skip?st+' · '+skip:st;
 }
 const pct=x=>x==null?'—':(Number(x)*100).toFixed(1)+'%';
-function td(label,html,cls){return `<td data-label="${label}"${cls?` class="${cls}"`:''}>${html}</td>`}
+function td(label,html,cls){return `<td data-label="${escapeHtml(label)}"${cls?` class="${cls}"`:''}>${html}</td>`}
 let STATE={},layout=4,lens='CEG';
 let replay={bars:[],i:0,timer:null,playing:false,signals:[],inspect:null};
 let surfaceRot={x:-.38,y:.68,drag:false,lx:0,ly:0},surfacePoints=[];
@@ -2199,7 +2199,7 @@ function signedBars(el,rows,key,label,summaryId){
     let c=el.querySelector('canvas');if(c)chartEmpty(c);
     return;
   }
-  let max=Math.max(1,...rows.map(r=>Math.abs(Number(r[key]))));el.innerHTML=rows.map(r=>{let v=Number(r[key]),mag=Math.max(.015,Math.abs(v)/max),direction=v>0?'pos':v<0?'neg':'zero',tone=v>0?'up':v<0?'down':'muted';return `<div class="signedBar"><span class="signedBarLabel">${r[label]}</span><span class="signedBarTrack" aria-hidden="true"><i class="signedBarFill ${direction}" style="--mag:${mag}"></i></span><span class="signedBarValue ${tone}">${signedMoney(v)}</span></div>`}).join('');
+  let max=Math.max(1,...rows.map(r=>Math.abs(Number(r[key]))));el.innerHTML=rows.map(r=>{let v=Number(r[key]),mag=Math.max(.015,Math.abs(v)/max),direction=v>0?'pos':v<0?'neg':'zero',tone=v>0?'up':v<0?'down':'muted';return `<div class="signedBar"><span class="signedBarLabel">${escapeHtml(r[label])}</span><span class="signedBarTrack" aria-hidden="true"><i class="signedBarFill ${direction}" style="--mag:${mag}"></i></span><span class="signedBarValue ${tone}">${signedMoney(v)}</span></div>`}).join('');
   let best=rows.slice().sort((a,b)=>Number(b[key])-Number(a[key]))[0],worst=rows.slice().sort((a,b)=>Number(a[key])-Number(b[key]))[0];chartText(summaryId,`Best ${best[label]} ${signedMoney(best[key])}; lowest ${worst[label]} ${signedMoney(worst[key])}.`)
 }
 let refreshAbort=null,detailAbort=null,refreshSerial=0;
@@ -2289,11 +2289,11 @@ function toggleHomeDetail(id){let el=$(id);if(!el)return;el.open=!el.open;if(el.
 function covClass(p){p=Number(p||0);return p>=.98?'':p>=.9?' mid':' low'}
 function covBar(p){p=Number(p||0);return `<div class="covBar${covClass(p)}"><i style="width:${Math.max(0,Math.min(100,p*100)).toFixed(1)}%"></i></div>`}
 function covGridHTML(coverage){
-  return Object.entries(coverage||{}).map(([t,x])=>`<div class=covCell><b>${t}</b>${covBar(x.pct)}<div class=liveMeta>${x.have||0}/${x.expected||0} · ${pct(x.pct)}${x.first_missing?' · gap '+x.first_missing:''}</div></div>`).join('')||'<div class=sub>No session minutes yet.</div>'
+  return Object.entries(coverage||{}).map(([t,x])=>`<div class=covCell><b>${escapeHtml(t)}</b>${covBar(x.pct)}<div class=liveMeta>${Number(x.have)||0}/${Number(x.expected)||0} · ${pct(x.pct)}${x.first_missing?' · gap '+escapeHtml(x.first_missing):''}</div></div>`).join('')||'<div class=sub>No session minutes yet.</div>'
 }
 function reasonBars(rows){
   let max=Math.max(1,...(rows||[]).map(x=>x[1]));
-  return (rows||[]).length?rows.map(([k,v])=>`<div class=reasonBar><span style="min-width:46%">${k}</span><div class=track><b style="width:${(100*v/max).toFixed(0)}%"></b></div><b>${v}</b></div>`).join(''):'<div class=sub>No miss journal yet.</div>'
+  return (rows||[]).length?rows.map(([k,v])=>`<div class=reasonBar><span style="min-width:46%">${escapeHtml(k)}</span><div class=track><b style="width:${(100*v/max).toFixed(0)}%"></b></div><b>${Number(v)||0}</b></div>`).join(''):'<div class=sub>No miss journal yet.</div>'
 }
 function setupBar(s){let p=Number((s&&s.score)||0),cls=s&&s.fired?'hot':p>=.85?'armed':'';return `<div class="setupBar ${cls}"><i style="width:${Math.max(0,Math.min(100,p*100)).toFixed(0)}%"></i></div>`}
 function setupJoin(parts){return (parts||[]).map(x=>x==null?'':String(x).trim()).filter(Boolean).join(' · ')}
@@ -2326,14 +2326,14 @@ function clockLabel(clk){
 function renderExplain(){
   let ex=(STATE.live&&STATE.live.explain)||(STATE.ws&&STATE.ws.explain)||{};
   if($('explainHead'))$('explainHead').textContent=ex.headline||'What’s going on';
-  if($('explainBody'))$('explainBody').innerHTML=(ex.paragraphs&&ex.paragraphs.length)?ex.paragraphs.map(p=>`<p>${p}</p>`).join(''):'<p>The runner is up. Home paints the session clock first, then this box fills in from the live tape.</p>';
-  if($('explainWhy'))$('explainWhy').innerHTML=(ex.why_not||[]).map(x=>`<div>${x}</div>`).join('');
+  if($('explainBody'))$('explainBody').innerHTML=(ex.paragraphs&&ex.paragraphs.length)?ex.paragraphs.map(p=>`<p>${escapeHtml(p)}</p>`).join(''):'<p>The runner is up. Home paints the session clock first, then this box fills in from the live tape.</p>';
+  if($('explainWhy'))$('explainWhy').innerHTML=(ex.why_not||[]).map(x=>`<div>${escapeHtml(x)}</div>`).join('');
   let clk=(STATE.live&&STATE.live.clock)||(STATE.status&&STATE.status.clock)||{};
   let live=new Set(clk.current||[]);
   let books=ex.books||[];
   let pills=live.size?books.filter(b=>live.has(b.id)):books.slice(0,0);
-  if($('explainBooks'))$('explainBooks').innerHTML=pills.map(b=>`<div class=sessionBook aria-label="${b.id} ${b.when||''}: ${b.what||''}"><b>${b.id}</b><span>${b.when||''}</span></div>`).join('');
-  if($('explainBookDetails'))$('explainBookDetails').innerHTML=books.map(b=>`<div class=explainBook><b>${b.id}</b><span>${b.when||''}</span><p>${b.what||''}</p></div>`).join('')||'<div class=sub>No active model book in this window.</div>';
+  if($('explainBooks'))$('explainBooks').innerHTML=pills.map(b=>`<div class=sessionBook aria-label="${escapeHtml(`${b.id} ${b.when||''}: ${b.what||''}`)}"><b>${escapeHtml(b.id)}</b><span>${escapeHtml(b.when||'')}</span></div>`).join('');
+  if($('explainBookDetails'))$('explainBookDetails').innerHTML=books.map(b=>`<div class=explainBook><b>${escapeHtml(b.id)}</b><span>${escapeHtml(b.when||'')}</span><p>${escapeHtml(b.what||'')}</p></div>`).join('')||'<div class=sub>No active model book in this window.</div>';
 }
 function brandStamp(clk){
   if(!clk)return 'V10';
@@ -2380,14 +2380,14 @@ function renderHomeOpenTrades(){
   let packs=((STATE.tradeBoard&&STATE.tradeBoard.trades)||[]).filter(p=>OPEN_ST.has(p.trade?.status));
   let rows=packs.length?packs.map(p=>({trade:p.trade||{},pnl:p.livePnl})):(STATE.d?.openTrades||[]).map(t=>({trade:t,pnl:tradeRowPnl(t)}));
   el.classList.toggle('emptyCompact',!rows.length);
-  el.innerHTML=rows.length?rows.slice(0,4).map(({trade:t,pnl})=>`<div class=metric><span>${t.strategy_id||'—'} · ${t.ticker||'—'} · ${t.direction||'—'}</span><b class="${Number(pnl||0)>=0?'up':'down'}">${t.status||'OPEN'} · ${pnl==null?'—':signedMoney(pnl)}</b></div>`).join(''):'No open paper trades. The action stack stays quiet until a fill exists.'
+  el.innerHTML=rows.length?rows.slice(0,4).map(({trade:t,pnl})=>`<div class=metric><span>${escapeHtml(t.strategy_id||'—')} · ${escapeHtml(t.ticker||'—')} · ${escapeHtml(t.direction||'—')}</span><b class="${Number(pnl||0)>=0?'up':'down'}">${escapeHtml(t.status||'OPEN')} · ${pnl==null?'—':signedMoney(pnl)}</b></div>`).join(''):'No open paper trades. The action stack stays quiet until a fill exists.'
 }
 function renderHomeSummaries(){
   let d=STATE.d||{},live=STATE.live||{},rm=STATE.rm||{},status=STATE.status||{},updated=STATE.updated||{};
   let tape=Object.values(live.tickers||{}).filter(x=>x&&x.sym).sort((a,b)=>Math.abs(Number(b.ret)||0)-Math.abs(Number(a.ret)||0)).slice(0,3);
-  if($('marketSummary'))$('marketSummary').innerHTML=tape.length?tape.map(x=>`<b>${x.sym} ${(Number(x.ret)||0)>=0?'+':''}${((Number(x.ret)||0)*100).toFixed(2)}%</b>`).join(' · '):'No local tape yet. Charts will populate as minute bars arrive.';
+  if($('marketSummary'))$('marketSummary').innerHTML=tape.length?tape.map(x=>`<b>${escapeHtml(x.sym)} ${(Number(x.ret)||0)>=0?'+':''}${((Number(x.ret)||0)*100).toFixed(2)}%</b>`).join(' · '):'No local tape yet. Charts will populate as minute bars arrive.';
   let models=(d.strategies||[]).slice().sort((a,b)=>(b.fireRate||0)-(a.fireRate||0)).slice(0,2),today=rm.today||{},midday=live.midday||[],fires=today.fires??midday.filter(x=>x.eligible).length;
-  if($('modelSummary'))$('modelSummary').innerHTML=models.length?`<b>${fires} fires</b> today · ${models.map(x=>`${x.id} ${pct(x.fireRate)}`).join(' · ')}`:'Forward evidence is still collecting.';
+  if($('modelSummary'))$('modelSummary').innerHTML=models.length?`<b>${Number(fires)||0} fires</b> today · ${models.map(x=>`${escapeHtml(x.id)} ${pct(x.fireRate)}`).join(' · ')}`:'Forward evidence is still collecting.';
   let stale=!!(status.watchdog_stale||status.data_stale),open=d.totals?.open||0;
   if($('deskSummary'))$('deskSummary').innerHTML=`<b>${stale?'STALE':'RUNNER OK'}</b> · ${open} open trade${open===1?'':'s'} · ${status.broker_orders_enabled?'paper orders enabled':'signal only'}`;
   ['market','model','desk'].forEach(k=>{let el=$(k+'Freshness');if(el)el.textContent=freshnessLabel(updated[k]||updated.home)})
@@ -2395,7 +2395,7 @@ function renderHomeSummaries(){
 function renderChartOverview(){
   let d=STATE.d||{};
   renderLiveTape();
-  if($('marketGrid'))$('marketGrid').innerHTML=Object.entries(d.tickerStats||{}).map(([t,x])=>`<div class=market role=button tabindex=0 onclick="openTicker('${t}')" onkeydown="activateClick(event)" aria-label="Open ${t} chart"><b>${t}</b><small>${x.closed} tests · ${pct(x.winRate)} win</small><div class="${x.pnl>=0?'up':'down'} num" style="margin-top:7px;font-weight:900">${signedMoney(x.pnl)}</div></div>`).join('')||'<div class=sub>No closed paper tests yet.</div>'
+  if($('marketGrid'))$('marketGrid').innerHTML=Object.entries(d.tickerStats||{}).map(([t,x])=>`<div class=market role=button tabindex=0 data-ticker="${escapeHtml(t)}" onclick="openTicker(this.dataset.ticker)" onkeydown="activateClick(event)" aria-label="Open ${escapeHtml(t)} chart"><b>${escapeHtml(t)}</b><small>${Number(x.closed)||0} tests · ${pct(x.winRate)} win</small><div class="${x.pnl>=0?'up':'down'} num" style="margin-top:7px;font-weight:900">${signedMoney(x.pnl)}</div></div>`).join('')||'<div class=sub>No closed paper tests yet.</div>'
 }
 function renderHome(){
   let d=STATE.d||{totals:{},curve:[]},a=STATE.a||{},live=STATE.live||{},status=STATE.status||{},t=(STATE.rm&&STATE.rm.today)||{};
@@ -2411,7 +2411,7 @@ function renderHome(){
   if($('sessionClock'))$('sessionClock').textContent=clockLabel(clk);
   if($('brandStamp'))$('brandStamp').textContent=brandStamp(clk);
   renderExplain();
-  $('labStrip').innerHTML=[['Fires',fires],['Misses',t.misses??Math.max(0,opportunities-fires)],['Top miss',t.top_miss||'expand to load'],['Next',clk?.next?clk.next.id+' '+clk.next.start:(clk?.phase||'—')]].map(([label,value])=>`<div class=kpi><span>${label}</span><b>${value}</b></div>`).join('');
+  $('labStrip').innerHTML=[['Fires',fires],['Misses',t.misses??Math.max(0,opportunities-fires)],['Top miss',t.top_miss||'expand to load'],['Next',clk?.next?clk.next.id+' '+clk.next.start:(clk?.phase||'—')]].map(([label,value])=>`<div class=kpi><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`).join('');
   $('todayReasons').innerHTML=reasonBars(t.reasons||[]);
   renderWatchlist();renderHomeOpenTrades();renderOps();renderHomeSummaries()
 }
@@ -2420,10 +2420,10 @@ function renderWatchlist(){
   let rows=(STATE.live&&STATE.live.watchlist)||[];
   el.innerHTML=rows.length?rows.slice(0,4).map(x=>{
     let s=x.setup||{};
-    return `<div class=liveRow role=button tabindex=0 onclick="openTicker('${x.sym}')" onkeydown="activateClick(event)" aria-label="Open ${x.sym} chart"><div class=strategyTop><b>${x.sym}</b><span>${setupChip(s)}</span></div>
+    return `<div class=liveRow role=button tabindex=0 data-ticker="${escapeHtml(x.sym)}" onclick="openTicker(this.dataset.ticker)" onkeydown="activateClick(event)" aria-label="Open ${escapeHtml(x.sym)} chart"><div class=strategyTop><b>${escapeHtml(x.sym)}</b><span>${escapeHtml(setupChip(s))}</span></div>
       ${setupBar(s)}
-      <div class=liveMeta>${setupWatchMeta(s,x)}</div>
-      ${s.book_label?`<div class=liveMeta>${s.book_label}</div>`:''}</div>`
+      <div class=liveMeta>${escapeHtml(setupWatchMeta(s,x))}</div>
+      ${s.book_label?`<div class=liveMeta>${escapeHtml(s.book_label)}</div>`:''}</div>`
   }).join(''):'<div class=sub>No live setups in the current window.</div>'
 }
 function renderLiveTape(){
@@ -2437,14 +2437,14 @@ function renderLiveTape(){
     let q=x.quote&&x.quote.last?Number(x.quote.last):x.c;
     let s=x.setup||{};
     let dnt=((live.dnt||{})[x.sym]||((STATE.ws&&STATE.ws.dnt)||{})[x.sym]); dnt=dnt&&dnt.length?dnt.join(','):'';
-    return `<div class=liveRow role=button tabindex=0 onclick="openTicker('${x.sym}')" onkeydown="activateClick(event)" aria-label="Open ${x.sym} chart"><div class=strategyTop><b>${x.sym}</b><span class="${(x.ret||0)>=0?'up':'down'}">${ch}</span></div>
-      <div class="livePrice num">${q==null?'—':Number(q).toFixed(2)} <span class=origin>${x.regime||''}</span></div>
+    return `<div class=liveRow role=button tabindex=0 data-ticker="${escapeHtml(x.sym)}" onclick="openTicker(this.dataset.ticker)" onkeydown="activateClick(event)" aria-label="Open ${escapeHtml(x.sym)} chart"><div class=strategyTop><b>${escapeHtml(x.sym)}</b><span class="${(x.ret||0)>=0?'up':'down'}">${ch}</span></div>
+      <div class="livePrice num">${q==null?'—':Number(q).toFixed(2)} <span class=origin>${escapeHtml(x.regime||'')}</span></div>
       ${setupBar(s)}
-      <div class=liveMeta>${setupJoin([setupChip(s), s.fired?setupWhy(s,x):(pct(s.score)+' · '+(s.bottleneck_en||s.bottleneck||'—')), s.book_label])}${dnt?' · DNT '+dnt:''}</div>
-      <div class="spark"><canvas id="sp${x.sym}" aria-hidden="true"></canvas></div>
+      <div class=liveMeta>${escapeHtml(setupJoin([setupChip(s), s.fired?setupWhy(s,x):(pct(s.score)+' · '+(s.bottleneck_en||s.bottleneck||'—')), s.book_label]))}${dnt?' · DNT '+escapeHtml(dnt):''}</div>
+      <div class="spark"><canvas id="sp${escapeHtml(x.sym)}" aria-hidden="true"></canvas></div>
       ${covBar(x.session_pct)}
       <div class=liveMeta>tape ${x.bars_have||x.bars||0}/${x.bars_expected||'—'} · VWAP ${x.vwap?Number(x.vwap).toFixed(2):'—'} · RVOL ${x.rvol==null?'—':Number(x.rvol).toFixed(2)} · RSI5 ${x.rsi5==null?'—':Number(x.rsi5).toFixed(1)}</div>
-      <div class=liveMeta>${read}</div></div>`
+      <div class=liveMeta>${escapeHtml(read)}</div></div>`
   }).join('');
   paintLiveSparks()
 }
@@ -2461,7 +2461,7 @@ function paintLiveSparks(){
     })
   })
 }
-function strategyCard(x){let opt=x.opt?`${x.opt.dte||''} ${x.opt.moneyness||''}`.trim():'';let sample=x.sample||'COLLECTING';let wr=x.winLo!=null?`${pct(x.winLo)}–${pct(x.winHi)}`:(x.closed?pct(x.wins/x.closed):'—');let note=(STATE.ws&&STATE.ws.notes&&STATE.ws.notes[x.id])||{};let plain=x.plain||note.plain||x.desc||'';return `<div class=strategy><div class=strategyTop><b>${x.id}</b><span class=origin>${x.session||x.origin}</span></div><h3>${x.name}</h3><p>${plain}</p><p>${x.horizon||'—'} · ${opt||x.author} · fire ${x.fires||0}/${x.opportunities||0} · ${x.nDays||0}d</p><div class=metric><span>Fire rate</span><b>${x.opportunities?pct(x.fireRate):'—'}</b></div><div class=metric><span>Win 95% CI</span><b>${wr}</b></div><div class=metric><span>Expectancy</span><b class="${Number(x.expectancy||0)>=0?'up':'down'}">${x.expectancy==null?'—':signedMoney(x.expectancy)}</b></div><div class=metric><span>Sample</span><b class="${sampleCls(sample)}">${sample}${x.nDays?` · ${x.nDays}d`:''}</b></div></div>`}
+function strategyCard(x){let opt=x.opt?`${x.opt.dte||''} ${x.opt.moneyness||''}`.trim():'';let sample=x.sample||'COLLECTING';let wr=x.winLo!=null?`${pct(x.winLo)}–${pct(x.winHi)}`:(x.closed?pct(x.wins/x.closed):'—');let note=(STATE.ws&&STATE.ws.notes&&STATE.ws.notes[x.id])||{};let plain=x.plain||note.plain||x.desc||'';return `<div class=strategy><div class=strategyTop><b>${escapeHtml(x.id)}</b><span class=origin>${escapeHtml(x.session||x.origin)}</span></div><h3>${escapeHtml(x.name)}</h3><p>${escapeHtml(plain)}</p><p>${escapeHtml(x.horizon||'—')} · ${escapeHtml(opt||x.author)} · fire ${Number(x.fires)||0}/${Number(x.opportunities)||0} · ${Number(x.nDays)||0}d</p><div class=metric><span>Fire rate</span><b>${x.opportunities?pct(x.fireRate):'—'}</b></div><div class=metric><span>Win 95% CI</span><b>${wr}</b></div><div class=metric><span>Expectancy</span><b class="${Number(x.expectancy||0)>=0?'up':'down'}">${x.expectancy==null?'—':signedMoney(x.expectancy)}</b></div><div class=metric><span>Sample</span><b class="${sampleCls(sample)}">${escapeHtml(sample)}${x.nDays?` · ${Number(x.nDays)}d`:''}</b></div></div>`}
 function escapeHtml(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
 function lastCommentFor(targetType,targetId){
   let rows=(STATE.comments||[]).filter(p=>p.target_type===targetType&&String(p.target_id)===String(targetId));
@@ -2482,7 +2482,7 @@ function threadHTML(posts,target,kinds){
   kinds=kinds||['INTENT','EXIT'];
   let list=(posts||[]).map(p=>`<div class=threadPost><div class=threadKind>${escapeHtml(p.kind)} · ${p.ts?new Date(p.ts).toLocaleString():''}</div><p class=threadBody>${escapeHtml(p.body)}</p></div>`).join('')||'<div class=sub>No notes yet.</div>';
   let chips=kinds.map((k,i)=>`<button type=button class="tab${i===0?' active':''}" data-kind="${k}" onclick="pickCommentKind(this)">${k}</button>`).join('');
-  return `<div class=thread data-type="${target.type}" data-id="${target.id}">${list}<div class=threadComposer><div class=tabrow>${chips}</div><textarea class=threadInput maxlength="800" aria-label="Comment"></textarea><button type=button class="btn" onclick="submitComment(this)">POST</button></div></div>`
+  return `<div class=thread data-type="${escapeHtml(target.type)}" data-id="${escapeHtml(target.id)}">${list}<div class=threadComposer><div class=tabrow>${chips}</div><textarea class=threadInput maxlength="800" aria-label="Comment"></textarea><button type=button class="btn" onclick="submitComment(this)">POST</button></div></div>`
 }
 function pickCommentKind(el){el.parentElement.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active',x===el))}
 async function submitComment(btn){
@@ -2518,7 +2518,7 @@ function commentSnippet(t){
 }
 function tradeTableRow(x){
   let pnl=tradeRowPnl(x);
-  return `<tr>${td('ID',x.id,'num')}${td('Strategy',x.strategy_id)}${td('Ticker',x.ticker)}${td('Side',x.direction)}${td('Contract',x.option_symbol||'—')}${td('Status',x.status)}${td('Entry',x.entry_fill==null?'—':money(x.entry_fill),'num')}${td('Mark',x.mark==null?'—':money(x.mark),'num')}${td('P&L',pnl==null?'—':signedMoney(pnl),`num ${Number(pnl||0)>=0?'up':'down'}`)}${td('Note',commentSnippet(x))}</tr>`
+  return `<tr>${td('ID',escapeHtml(x.id),'num')}${td('Strategy',escapeHtml(x.strategy_id))}${td('Ticker',escapeHtml(x.ticker))}${td('Side',escapeHtml(x.direction))}${td('Contract',escapeHtml(x.option_symbol||'—'))}${td('Status',escapeHtml(x.status))}${td('Entry',x.entry_fill==null?'—':money(x.entry_fill),'num')}${td('Mark',x.mark==null?'—':money(x.mark),'num')}${td('P&L',pnl==null?'—':signedMoney(pnl),`num ${Number(pnl||0)>=0?'up':'down'}`)}${td('Note',escapeHtml(commentSnippet(x)))}</tr>`
 }
 function renderActivity(){
   let{tr,si,ev}=STATE; tr=tr||{trades:[]}; si=si||{signals:[]}; ev=ev||{events:[]};
@@ -2527,8 +2527,8 @@ function renderActivity(){
   let closed=trades.filter(x=>!OPEN_ST.has(x.status));
   if($('openTradeRows'))$('openTradeRows').innerHTML=open.map(tradeTableRow).join('')||'';
   if($('tradeRows'))$('tradeRows').innerHTML=closed.map(tradeTableRow).join('')||'';
-  if($('signalRows'))$('signalRows').innerHTML=(si.signals||[]).map(x=>`<tr>${td('Time',new Date(x.ts).toLocaleString())}${td('Strategy',x.strategy_id)}${td('Ticker',x.ticker)}${td('Direction',x.direction)}${td('Window',x.window||x.horizon||'15:45')}${td('Execution',signalExec(x))}${td('Details',x.details)}</tr>`).join('');
-  if($('events'))$('events').innerHTML=(ev.events||[]).map(x=>`<div class=metric><span>${new Date(x.ts).toLocaleString()} · ${x.level}</span><b>${x.message}</b></div>`).join('');
+  if($('signalRows'))$('signalRows').innerHTML=(si.signals||[]).map(x=>`<tr>${td('Time',escapeHtml(new Date(x.ts).toLocaleString()))}${td('Strategy',escapeHtml(x.strategy_id))}${td('Ticker',escapeHtml(x.ticker))}${td('Direction',escapeHtml(x.direction))}${td('Window',escapeHtml(x.window||x.horizon||'15:45'))}${td('Execution',escapeHtml(signalExec(x)))}${td('Details',escapeHtml(x.details))}</tr>`).join('');
+  if($('events'))$('events').innerHTML=(ev.events||[]).map(x=>`<div class=metric><span>${escapeHtml(new Date(x.ts).toLocaleString())} · ${escapeHtml(x.level)}</span><b>${escapeHtml(x.message)}</b></div>`).join('');
   let date=(trades[0]&&trades[0].trade_date)||'';
   let sessionPosts=(STATE.comments||[]).filter(p=>p.target_type==='session'&&(!date||p.target_id===date||p.trade_date===date));
   let intentN=(STATE.comments||[]).filter(p=>p.kind==='INTENT'||p.kind==='EXIT').length;
@@ -2538,13 +2538,14 @@ function renderActivity(){
 }
 function tradeCardHTML(pack,target){
   let t=pack.trade||{}, pnl=pack.livePnl, open=t.status==='OPEN'||t.status==='ENTRY_SUBMITTED'||t.status==='EXIT_SUBMITTED';
+  let tid=Number(t.id)||0, safeTarget=String(target).replace(/[^a-zA-Z0-9_-]/g,'');
   let exitHint=t.horizon==='EOD'?'EXIT 3:50 PM':'EXIT NEXT OPEN';
   let move=pack.directionalMove==null?'—':((pack.directionalMove>=0?'+':'')+(pack.directionalMove*100).toFixed(2)+'%');
   return `<div class="tradeCard panel" style="margin:0">
-    <div class=strategyTop><b>${t.strategy_id} ${t.ticker} ${t.direction}</b><span class=origin>${t.status}</span></div>
-    <div class="sub" style="margin:4px 0 0">${t.option_symbol||'—'} · ${t.window||t.horizon||''} · ${open?exitHint:'CLOSED'}</div>
-    <div id="tr${t.id}-${target}" class="chartReadout">${t.ticker||'Trade'} tape · ${pack.lastUnderlying==null?'awaiting price':axisPrice(pack.lastUnderlying)}</div>
-    <div class=miniChart><canvas id="tc${t.id}-${target}" class="chartCanvasInteractive" tabindex="0" aria-label="${t.ticker||'Trade'} tape with VWAP, opening range, entry, and exit" aria-describedby="tr${t.id}-${target}"></canvas></div>
+    <div class=strategyTop><b>${escapeHtml(t.strategy_id)} ${escapeHtml(t.ticker)} ${escapeHtml(t.direction)}</b><span class=origin>${escapeHtml(t.status)}</span></div>
+    <div class="sub" style="margin:4px 0 0">${escapeHtml(t.option_symbol||'—')} · ${escapeHtml(t.window||t.horizon||'')} · ${open?exitHint:'CLOSED'}</div>
+    <div id="tr${tid}-${safeTarget}" class="chartReadout">${escapeHtml(t.ticker||'Trade')} tape · ${pack.lastUnderlying==null?'awaiting price':axisPrice(pack.lastUnderlying)}</div>
+    <div class=miniChart><canvas id="tc${tid}-${safeTarget}" class="chartCanvasInteractive" tabindex="0" aria-label="${escapeHtml(t.ticker||'Trade')} tape with VWAP, opening range, entry, and exit" aria-describedby="tr${tid}-${safeTarget}"></canvas></div>
     <div class=tradeMeta>
       <div class=metric><span>Option entry</span><b>${t.entry_fill==null?'—':money(t.entry_fill)}</b></div>
       <div class=metric><span>${open?'Live mark':'Exit'}</span><b>${pack.mark==null?'—':money(pack.mark)}</b></div>
@@ -2553,12 +2554,12 @@ function tradeCardHTML(pack,target){
       <div class=metric><span>ATM overlay</span><b class="${Number(pack.hypAtmPnl||0)>=0?'up':'down'}">${pack.hypAtmPnl==null?'—':signedMoney(pack.hypAtmPnl)}</b></div>
       <div class=metric><span>MAE / MFE</span><b>${pack.mae==null?'—':pct(pack.mae)} / ${pack.mfe==null?'—':pct(pack.mfe)}</b></div>
       <div class=metric><span>IV / delta</span><b>${pack.iv==null?'—':(Number(pack.iv)*100).toFixed(0)+'%'} · ${pack.delta==null?'—':Number(pack.delta).toFixed(2)}</b></div>
-      <div class=metric><span>Exit kind</span><b>${pack.exitKind||'—'}</b></div>
+      <div class=metric><span>Exit kind</span><b>${escapeHtml(pack.exitKind||'—')}</b></div>
       <div class=metric><span>Would fill @ ask</span><b>${pack.fill&&pack.fill.would_fill_at_ask===true?'YES':pack.fill&&pack.fill.would_fill_at_ask===false?'NO':'—'}</b></div>
       <div class=metric><span>Contract / spread</span><b>${pack.contractScore==null?'—':pack.contractScore}${pack.entrySpread==null?'':' · '+Number(pack.entrySpread).toFixed(2)}</b></div>
       <div class=metric><span>Fill latency</span><b>${pack.latencySec==null?'—':Math.round(pack.latencySec)+'s'}</b></div>
     </div>
-    <div class=sub>${(pack.checklist&&pack.checklist.items||[]).map(i=>(i.ok?'✓ ':'✗ ')+i.label).join(' · ')}</div>
+    <div class=sub>${(pack.checklist&&pack.checklist.items||[]).map(i=>escapeHtml((i.ok?'✓ ':'✗ ')+i.label)).join(' · ')}</div>
     ${threadHTML(commentsForTrade(t.id),{type:'trade',id:t.id},open?['INTENT']:['INTENT','EXIT'])}
   </div>`
 }
@@ -2587,7 +2588,7 @@ async function renderTradeBoard(target,openOnly=false){
     let rows=(j.trades||[]).filter(p=>openOnly?['OPEN','ENTRY_SUBMITTED','EXIT_SUBMITTED'].includes(p.trade?.status):true);
     el.innerHTML=rows.length?rows.map(p=>tradeCardHTML(p,target)).join(''):`<div class=sub>${openOnly?'No open paper trades. Midday fills will appear here.':'No paper trades yet.'}</div>`;
     requestAnimationFrame(()=>rows.forEach(p=>{let c=$(`tc${p.trade.id}-${target}`);if(c)renderTradeChartCard(c,p,target)}))
-  }catch(e){el.innerHTML=`<div class=sub>Trade charts unavailable: ${e.message}</div>`}
+  }catch(e){el.innerHTML=`<div class=sub>Trade charts unavailable: ${escapeHtml(e.message)}</div>`}
 }
 function renderModels(){
   if(!STATE.d)return;
@@ -2596,10 +2597,10 @@ function renderModels(){
   signedBars($('strategyBars'),s.filter(x=>(x.closed||0)>0),'pnl','id','strategyBarsSummary');
   let ids=STATE.ov.ids,m=STATE.ov.matrix,max=1;
   ids.forEach(a=>ids.forEach(b=>max=Math.max(max,m[a][b])));
-  let html=`<div class=matrix style="grid-template-columns:52px repeat(${ids.length},1fr)"><div></div>${ids.map(x=>`<div class=sub>${x}</div>`).join('')}`;
-  ids.forEach(a=>{html+=`<div class=sub>${a}</div>`;ids.forEach(b=>{let v=m[a][b],q=v/max;html+=`<div class=mx title="${a}+${b}: ${v}" style="background:rgba(238,238,232,${.025+.68*q})">${v}</div>`})});
+  let html=`<div class=matrix style="grid-template-columns:52px repeat(${ids.length},1fr)"><div></div>${ids.map(x=>`<div class=sub>${escapeHtml(x)}</div>`).join('')}`;
+  ids.forEach(a=>{html+=`<div class=sub>${escapeHtml(a)}</div>`;ids.forEach(b=>{let v=Number(m[a][b])||0,q=v/max;html+=`<div class=mx title="${escapeHtml(a)}+${escapeHtml(b)}: ${v}" style="background:rgba(238,238,232,${.025+.68*q})">${v}</div>`})});
   html+='</div>';$('overlapMatrix').innerHTML=html;
-  $('driftRows').innerHTML=STATE.dr.rows.map(x=>{let st=(STATE.d.strategies||[]).find(z=>z.id===x.id)||{};let ci=st.winLo!=null?`${pct(st.winLo)}–${pct(st.winHi)}`:pct(x.live_win_rate);let exp=st.expectancy==null?x.live_avg_pnl:st.expectancy;return `<tr>${td('Strategy',x.id)}${td('Fire rate',pct(st.fireRate),'num')}${td('Forward N',x.n,'num')}${td('Win 95% CI',ci,'num')}${td('Expectancy',signedMoney(exp),`num ${Number(exp||0)>=0?'up':'down'}`)}${td('Historical ref',x.hist_win_rate==null?'collecting':pct(x.hist_win_rate),'num')}${td('Sample',st.sample||(x.n<10?'COLLECTING':x.n<30?'UNDERPOWERED':'STABLE'),sampleCls(st.sample))}</tr>`}).join('')
+  $('driftRows').innerHTML=STATE.dr.rows.map(x=>{let st=(STATE.d.strategies||[]).find(z=>z.id===x.id)||{};let ci=st.winLo!=null?`${pct(st.winLo)}–${pct(st.winHi)}`:pct(x.live_win_rate);let exp=st.expectancy==null?x.live_avg_pnl:st.expectancy;return `<tr>${td('Strategy',escapeHtml(x.id))}${td('Fire rate',pct(st.fireRate),'num')}${td('Forward N',Number(x.n)||0,'num')}${td('Win 95% CI',ci,'num')}${td('Expectancy',signedMoney(exp),`num ${Number(exp||0)>=0?'up':'down'}`)}${td('Historical ref',x.hist_win_rate==null?'collecting':pct(x.hist_win_rate),'num')}${td('Sample',escapeHtml(st.sample||(x.n<10?'COLLECTING':x.n<30?'UNDERPOWERED':'STABLE')),sampleCls(st.sample))}</tr>`}).join('')
 }
 let chartData={},chartDataAt={};
 function setLayout(n,el){layout=n;xhair=null;document.querySelectorAll('#chartLayoutTabs .tab').forEach(x=>x.classList.remove('active'));if(el)el.classList.add('active');renderMulti()}
@@ -2629,7 +2630,7 @@ function renderReplay(){
     let cls='unknown',word='OUTCOME ?';
     if(visible&&x.directionWorked===true){cls='worked';word='WORKED'}
     else if(visible&&x.directionWorked===false){cls='failed';word='MISSED'}
-    return `<span class="signalTag ${visible?cls:''}" title="${x.direction} @ ${money(x.entryUnderlying)} → next open ${money(x.nextOpenUnderlying)}">${x.strategy_id} ${x.direction} · ${visible?word:'3:45'}</span>`
+    return `<span class="signalTag ${visible?cls:''}" title="${escapeHtml(x.direction)} @ ${money(x.entryUnderlying)} → next open ${money(x.nextOpenUnderlying)}">${escapeHtml(x.strategy_id)} ${escapeHtml(x.direction)} · ${visible?word:'3:45'}</span>`
   }).join('');
   let known=(replay.signals||[]).filter(x=>x.directionWorked!==null&&x.directionWorked!==undefined),wins=known.filter(x=>x.directionWorked).length;
   $('replaySummary').innerHTML=[['Signals',replay.signals?.length||0],['Worked',visible?wins:'—'],['Missed',visible?(known.length-wins):'—'],['Directional hit rate',visible&&known.length?pct(wins/known.length):'—']].map(([a,b])=>`<div class=kpi><span>${a}</span><b>${b}</b></div>`).join('')
@@ -2639,7 +2640,7 @@ function stepReplay(delta=1){if(!replay.bars.length)return;replay.inspect=null;r
 async function renderResearch(signal){
   let rm=STATE.rm||await api('/api/research_metrics',{signal}); STATE.rm=rm;
   if($('labHint'))$('labHint').textContent=rm.note||'';
-  if($('labRows'))$('labRows').innerHTML=(rm.strategies||[]).map(x=>`<tr>${td('Strategy',x.id)}${td('Session',x.session||'—')}${td('Opps',x.opportunities,'num')}${td('Fires',x.fires,'num')}${td('Fire rate',pct(x.fireRate),'num')}${td('Days',x.nDays||0,'num')}${td('Win 95% CI',x.winLo==null?'—':pct(x.winLo)+'–'+pct(x.winHi),'num')}${td('Expectancy',x.expectancy==null?'—':signedMoney(x.expectancy),`num ${Number(x.expectancy||0)>=0?'up':'down'}`)}${td('Sample',x.sample,sampleCls(x.sample))}</tr>`).join('');
+  if($('labRows'))$('labRows').innerHTML=(rm.strategies||[]).map(x=>`<tr>${td('Strategy',escapeHtml(x.id))}${td('Session',escapeHtml(x.session||'—'))}${td('Opps',Number(x.opportunities)||0,'num')}${td('Fires',Number(x.fires)||0,'num')}${td('Fire rate',pct(x.fireRate),'num')}${td('Days',Number(x.nDays)||0,'num')}${td('Win 95% CI',x.winLo==null?'—':pct(x.winLo)+'–'+pct(x.winHi),'num')}${td('Expectancy',x.expectancy==null?'—':signedMoney(x.expectancy),`num ${Number(x.expectancy||0)>=0?'up':'down'}`)}${td('Sample',escapeHtml(x.sample),sampleCls(x.sample))}</tr>`).join('');
   if($('labCovGrid'))$('labCovGrid').innerHTML=covGridHTML(rm.coverage||(STATE.live||{}).coverage);
   if($('reasonPareto'))$('reasonPareto').innerHTML=reasonBars(rm.reasons||[]);
   if($('stretchChart'))histChart($('stretchChart'),rm.stretch_bins||[]);
@@ -2648,7 +2649,7 @@ async function renderResearch(signal){
   if(STATE.d)signedBars($('tickerBars'),Object.entries(STATE.d.tickerStats).filter(([,x])=>(x.closed||0)>0).map(([ticker,x])=>({ticker,pnl:x.pnl})),'pnl','ticker','tickerBarsSummary');
   let[nm,sf]=await Promise.all([api('/api/near_misses',{signal}),api('/api/research_surface',{signal})]);
   if(activePageId()!=='research')return;
-  $('nearMisses').innerHTML=nm.rows.length?nm.rows.slice(0,45).map(x=>`<div class=metric><span>${x.trade_date} · ${x.strategy_id} · ${x.ticker}</span><b>${x.reason}</b></div>`).join(''):'No journaled near misses yet. Opening swing, ORB, VWAP, and the 3:45 freeze all write reasons here.';
+  $('nearMisses').innerHTML=nm.rows.length?nm.rows.slice(0,45).map(x=>`<div class=metric><span>${escapeHtml(x.trade_date)} · ${escapeHtml(x.strategy_id)} · ${escapeHtml(x.ticker)}</span><b>${escapeHtml(x.reason)}</b></div>`).join(''):'No journaled near misses yet. Opening swing, ORB, VWAP, and the 3:45 freeze all write reasons here.';
   drawSurface(sf.points)
 }
 function drawSurface(points=surfacePoints){
@@ -2764,7 +2765,7 @@ function openTicker(sym){chartFocus=sym;if(activePageId()==='charts')renderMulti
 function renderHealth(s){
   let c=s.cache||{},clk=s.clock||(STATE.live&&STATE.live.clock),cov=s.session_complete_pct!=null?s.session_complete_pct:STATE.live?.session_complete_pct;
   let rows=[['Runner heartbeat',s.heartbeat?new Date(s.heartbeat).toLocaleTimeString():'—'],['Clock',clockLabel(clk)],['Last live ingest',s.last_ingest?new Date(s.last_ingest).toLocaleTimeString():'—'],['Ingest mode',s.last_ingest_source||'—'],['Session complete',pct(cov)],['Local bars',c.local_bars??'—'],['API cache hits / misses',(c.hits??0)+' / '+(c.misses??0)],['Alpaca/FRED HTTP calls',c.http_calls??'—'],['Last midday scan',s.last_midday_scan?new Date(s.last_midday_scan).toLocaleTimeString():'—'],['Last 3:45 eval',s.last_eval||'—'],['Paper orders',s.broker_orders_enabled?'ENABLED':'SIGNAL ONLY']];
-  let html=rows.map(([label,value])=>`<div class=metric><span>${label}</span><b>${value}</b></div>`).join('');
+  let html=rows.map(([label,value])=>`<div class=metric><span>${escapeHtml(label)}</span><b>${escapeHtml(value)}</b></div>`).join('');
   if($('health'))$('health').innerHTML=html;if($('settingsInfo'))$('settingsInfo').innerHTML=html
 }
 function applyStatus(s){
@@ -2784,8 +2785,8 @@ function renderOps(){
   if($('vixChip'))$('vixChip').textContent=ws.vix==null?'VIX':'VIX '+Number(ws.vix).toFixed(1);
   if($('gateStrip'))$('gateStrip').innerHTML=[['VIX',ws.vix==null?'—':Number(ws.vix).toFixed(1)],['Macro next',ws.macro_clear===false?'BLOCKED':'clear'],['Cluster',(ws.cluster_n||0)+' / '+(ws.cluster_cap||3)],['If 0DTE→0',money(ws.risk_if_zero)],['PDT',(ws.bp&&ws.bp.pdt_warn)?'WARN':((ws.bp&&ws.bp.daytrade_count)||0)+' DT'],['MC p50',ws.monte_carlo?money(ws.monte_carlo.p50):'—']].map(([a,b])=>`<div class=kpi><span>${a}</span><b>${b}</b></div>`).join('');
   if($('riskChip'))$('riskChip').textContent=ws.risk_if_zero!=null?('MAX '+money(ws.risk_if_zero)):'RISK';
-  if($('playbook'))$('playbook').innerHTML=(ws.playbook||[]).length?(ws.playbook||[]).map(p=>`<div class=metric><span>${p.strategy_id} ${p.ticker} ×${p.qty}</span><b>${p.ready?'SELL NOW':'exit '+p.exit_at}</b></div>`).join(''):'<div class=sub>No open exits queued.</div>';
-  if($('errorTax'))$('errorTax').innerHTML=Object.entries(ws.errors||{}).map(([k,v])=>`<div class=metric><span>${k}</span><b>${v}</b></div>`).join('')||'';
+  if($('playbook'))$('playbook').innerHTML=(ws.playbook||[]).length?(ws.playbook||[]).map(p=>`<div class=metric><span>${escapeHtml(p.strategy_id)} ${escapeHtml(p.ticker)} ×${Number(p.qty)||0}</span><b>${p.ready?'SELL NOW':'exit '+escapeHtml(p.exit_at)}</b></div>`).join(''):'<div class=sub>No open exits queued.</div>';
+  if($('errorTax'))$('errorTax').innerHTML=Object.entries(ws.errors||{}).map(([k,v])=>`<div class=metric><span>${escapeHtml(k)}</span><b>${Number(v)||0}</b></div>`).join('')||'';
 }
 function renderLabExtras(signal){
   let ws=STATE.ws||{}, th=ws.thresholds||{};
@@ -2793,13 +2794,13 @@ function renderLabExtras(signal){
   if($('walkForward'))$('walkForward').innerHTML=(ws.walk_forward||[]).slice(-8).map(x=>`<div class=metric><span>n=${x.n} train exp</span><b>${x.train_exp} → next ${x.next}</b></div>`).join('')||'<div class=sub>Need ≥6 closed trades.</div>';
   if($('bootstrapBox'))$('bootstrapBox').innerHTML=Object.entries(ws.bootstrap||{}).filter(([,v])=>v).map(([k,v])=>`<div class=metric><span>${k}</span><b>p50 ${v.p50} · 5–95 ${v.p05}–${v.p95} · P(μ>0) ${pct(v.frac_positive)}</b></div>`).join('')||'<div class=sub>Need ≥3 closed trades.</div>';
   if($('corrMatrix')&&ws.corr){let ids=ws.corr_ids||[]; let html=`<div class=matrix style="grid-template-columns:40px repeat(${ids.length},1fr)"><div></div>${ids.map(x=>`<div class=sub>${x}</div>`).join('')}`;ids.forEach(a=>{html+=`<div class=sub>${a}</div>`;ids.forEach(b=>{let v=ws.corr[a]&&ws.corr[a][b],q=v==null?0:Math.min(1,Math.abs(Number(v))),tone=Number(v)>=0?'78,230,147':'255,98,108';html+=`<div class=mx title="${a}+${b}" style="background:rgba(${tone},${v==null?0:.08+.62*q})">${v==null?'':v}</div>`})});html+='</div>';$('corrMatrix').innerHTML=html}
-  api('/api/lab_snapshots',{signal}).then(j=>{if(activePageId()==='research')$('snapList').innerHTML=(j.rows||[]).map(x=>`<div class=metric><span>${x.ts} · ${x.label}</span><b>#${x.id}</b></div>`).join('')||'<div class=sub>No snapshots yet.</div>'}).catch(()=>{})
+  api('/api/lab_snapshots',{signal}).then(j=>{if(activePageId()==='research')$('snapList').innerHTML=(j.rows||[]).map(x=>`<div class=metric><span>${escapeHtml(x.ts)} · ${escapeHtml(x.label)}</span><b>#${Number(x.id)||0}</b></div>`).join('')||'<div class=sub>No snapshots yet.</div>'}).catch(()=>{})
   let rm=STATE.rm||{};
   if($('mdeBox'))$('mdeBox').innerHTML=`<div class=metric><span>n days</span><b>${rm.mde_n||0}</b></div><div class=metric><span>Min detectable edge vs 50%</span><b>${rm.mde==null?'need sample':pct(rm.mde)}</b></div><div class=sub>Wilson CIs still swamp this until nDays≥30.</div>`;
   if($('powerBox'))$('powerBox').innerHTML=(rm.power_curve||[]).map(x=>`<div class=metric><span>n=${x.n}</span><b>CI ${pct(x.ci_width)} · MDE ${pct(x.mde)}</b></div>`).join('')||'<div class=sub>—</div>';
-  if($('fdrBox'))$('fdrBox').innerHTML=(rm.fdr||[]).map(x=>`<div class=metric><span>${x.id} p=${x.p} n=${x.n}</span><b class="${x.reject?'up':'muted'}">${x.reject?'REJECT H0':'keep H0'}</b></div>`).join('')||'<div class=sub>Need closed trades.</div>';
-  if($('looBox'))$('looBox').innerHTML=(rm.loo||[]).map(x=>`<div class=metric><span>leave out ${x.left_out}</span><b>${pct(x.fireRate)} (${x.fires}/${x.n})</b></div>`).join('')||'<div class=sub>—</div>';
-  if($('shadowBox')){let sh=rm.shadow||{}; $('shadowBox').innerHTML=(sh.by_status||[]).map(([k,v])=>`<div class=metric><span>${k}</span><b>${v}</b></div>`).join('')||'<div class=sub>No skips logged yet.</div>'}
+  if($('fdrBox'))$('fdrBox').innerHTML=(rm.fdr||[]).map(x=>`<div class=metric><span>${escapeHtml(x.id)} p=${Number(x.p)||0} n=${Number(x.n)||0}</span><b class="${x.reject?'up':'muted'}">${x.reject?'REJECT H0':'keep H0'}</b></div>`).join('')||'<div class=sub>Need closed trades.</div>';
+  if($('looBox'))$('looBox').innerHTML=(rm.loo||[]).map(x=>`<div class=metric><span>leave out ${escapeHtml(x.left_out)}</span><b>${pct(x.fireRate)} (${Number(x.fires)||0}/${Number(x.n)||0})</b></div>`).join('')||'<div class=sub>—</div>';
+  if($('shadowBox')){let sh=rm.shadow||{}; $('shadowBox').innerHTML=(sh.by_status||[]).map(([k,v])=>`<div class=metric><span>${escapeHtml(k)}</span><b>${Number(v)||0}</b></div>`).join('')||'<div class=sub>No skips logged yet.</div>'}
   if($('heatBox')&&rm.seasonality){
     let cells=rm.seasonality, hours=[...new Set(cells.map(x=>x.hour))].sort((a,b)=>a-b), days=['Mon','Tue','Wed','Thu','Fri'];
     let html=`<div class=heat><div></div>${hours.map(h=>`<div class=sub>${h}</div>`).join('')}`;
@@ -2808,7 +2809,7 @@ function renderLabExtras(signal){
   }
   if($('labNotes')&&!$('labNotes').dataset.loaded){api('/api/notes',{signal}).then(j=>{if(activePageId()==='research'){$('labNotes').value=j.text||'';$('labNotes').dataset.loaded='1'}}).catch(()=>{})}
   if($('lanOrders')&&STATE.ws)$('lanOrders').textContent=STATE.ws.guest?'read-only guest':'this device can order';
-  api('/api/backups',{signal}).then(j=>{if(activePageId()==='research')$('backupList').innerHTML=(j.files||[]).slice(0,8).map(f=>`<div class=metric><span>${f.name}</span><button class=chip onclick="restoreBackup('${f.name}')">RESTORE</button></div>`).join('')||'<div class=sub>No backups yet.</div>'}).catch(()=>{})
+  api('/api/backups',{signal}).then(j=>{if(activePageId()==='research')$('backupList').innerHTML=(j.files||[]).slice(0,8).map(f=>`<div class=metric><span>${escapeHtml(f.name)}</span><button class=chip data-file="${escapeHtml(f.name)}" onclick="restoreBackup(this.dataset.file)">RESTORE</button></div>`).join('')||'<div class=sub>No backups yet.</div>'}).catch(()=>{})
 }
 async function saveThresholds(){
   let body={}; ['mvr_rvol','mvr_stretch','mvr_rsi_lo','mvr_rsi_hi','orb_rvol','max_daily_fires','max_cluster'].forEach(k=>{let el=$('th_'+k); if(el&&el.value!=='')body[k]=+el.value});
@@ -2839,7 +2840,7 @@ async function renderMulti(){
   grid.innerHTML=tickers.map((t,i)=>`<div class=panel style="margin:0"><div class=panelHead><h2>${t} · 90 trading days</h2><span class=chip>${['SPY','QQQ','IWM'].includes(t)?'INDEX':'EQUITY'}</span></div><div id="mcr${i}" class=chartReadout></div><div class=miniChart><canvas id="mc${i}" class=chartCanvasInteractive tabindex="0" aria-label="${t} daily candlestick chart" aria-describedby="mcr${i} mcs${i}"></canvas></div><div id="mcs${i}" class=chartSummary></div></div>`).join('');
   tickers.forEach((t,i)=>{let c=$('mc'+i);if(c)startWait(c,{busy:true})});
   try{await Promise.all(tickers.map(async t=>{if(!chartData[t]||Date.now()-(chartDataAt[t]||0)>60000){chartData[t]=await api('/api/market_chart/'+t+'?days=90',{signal});chartDataAt[t]=Date.now()}}))}
-  catch(e){if(aborted(e))return;grid.innerHTML=`<div class=sub>Daily charts unavailable: ${e.message}</div>`;return}
+  catch(e){if(aborted(e))return;grid.innerHTML=`<div class=sub>Daily charts unavailable: ${escapeHtml(e.message)}</div>`;return}
   if(signal.aborted||serial!==chartSerial||activePageId()!=='charts')return;
   let selectedForDate=bars=>{if(xhair==null)return Math.max(0,bars.length-1);let exact=bars.findIndex(b=>String(b.t)===String(xhair));if(exact>=0)return exact;let prior=-1;bars.forEach((b,i)=>{if(String(b.t)<=String(xhair))prior=i});return prior>=0?prior:0};
   let drawAll=()=>tickers.forEach((t,i)=>{let bars=chartData[t].bars||[],selected=selectedForDate(bars),c=$('mc'+i);c._chartIndex=selected;candles(c,bars,bars.length,{intraday:false,selectedIndex:selected,readoutId:'mcr'+i,summaryId:'mcs'+i,label:t})});
@@ -2857,7 +2858,7 @@ async function renderMulti(){
       let sub=$('mtfSub'+i);if(sub)sub.textContent=`${mtfLabel[k]} · ${focus}${m.or_locked?' · OR locked':''}`;
       let bars=(m[k]||[]).map(b=>({...b,h:+b.h,l:+b.l,o:+b.o,c:+b.c})),c=$('mtf'+i),draw=index=>{c._chartIndex=index;candles(c,bars,bars.length,{intraday:k!=='d1',selectedIndex:index,readoutId:'mtfr'+i,summaryId:'mtfs'+i,label:focus})};draw(Math.max(0,bars.length-1));let p=chartPads(c.getBoundingClientRect().width);bindChartInspect(c,{count:bars.length,left:p.l,right:p.r,onSelect:draw})
     })
-  }catch(e){if(!aborted(e)&&$('mtfCharts'))$('mtfCharts').innerHTML=`<div class=sub>${e.message}</div>`}
+  }catch(e){if(!aborted(e)&&$('mtfCharts'))$('mtfCharts').innerHTML=`<div class=sub>${escapeHtml(e.message)}</div>`}
 }
 async function saveNotes(){await api('/api/notes',{method:'POST',body:JSON.stringify({text:$('labNotes').value})})}
 async function saveDebrief(){await api('/api/debrief',{method:'POST',body:JSON.stringify({q1:$('dq1').value,q2:$('dq2').value,q3:$('dq3').value})});$('debriefMsg').textContent='Saved with a lab snapshot.';}

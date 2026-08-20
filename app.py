@@ -3,11 +3,16 @@ from pathlib import Path
 from datetime import datetime, timedelta, date as date_cls
 from zoneinfo import ZoneInfo
 import requests, sqlite3, json, os, time, math, statistics, threading, traceback, subprocess, shutil, zipfile, io, random, hashlib, hmac, re
+from html import escape as html_escape
 
 ROOT=Path(__file__).resolve().parent
 ENVIRONMENT=(os.environ.get('CEG_ENV') or 'development').strip().lower()
 if ENVIRONMENT not in ('development','production','test'):
     raise RuntimeError('CEG_ENV must be development, production, or test')
+PROCESS_ROLE=(os.environ.get('CEG_PROCESS_ROLE') or ('runner' if ENVIRONMENT!='production' else 'web')).strip().lower()
+if PROCESS_ROLE not in ('web','runner','test'):
+    raise RuntimeError('CEG_PROCESS_ROLE must be web, runner, or test')
+WEB_READ_ONLY=ENVIRONMENT=='production' and PROCESS_ROLE=='web'
 STATIC=ROOT/'static'
 DATA=Path(os.environ.get('CEG_DATA_DIR') or (ROOT/'data'/ENVIRONMENT)).expanduser()
 DB=Path(os.environ.get('CEG_DB_PATH') or (DATA/'arena.db')).expanduser()
@@ -354,7 +359,8 @@ def cfg():
 
 def broker_runtime_armed():
     """Second, process-level interlock. A config/UI change alone cannot arm orders."""
-    return (os.environ.get('CEG_ALLOW_BROKER_ORDERS') or '').strip().lower() in ('1','true','yes')
+    return (PROCESS_ROLE in ('runner','test') and
+            (os.environ.get('CEG_ALLOW_BROKER_ORDERS') or '').strip().lower() in ('1','true','yes'))
 
 def broker_orders_enabled():
     """Fail closed unless both the config and runtime interlocks are explicitly armed."""
@@ -477,6 +483,8 @@ def years_to_expiry(expiry):
         return 1/365.0
 
 def ah():
+    if ENVIRONMENT=='production' and PROCESS_ROLE!='runner':
+        raise RuntimeError('broker credentials are unavailable to the web process')
     c=cfg(); return {'APCA-API-KEY-ID':c.get('alpaca_key',''),'APCA-API-SECRET-KEY':c.get('alpaca_secret','')}
 
 _MEM_CACHE={}
@@ -541,6 +549,8 @@ def broker_order_by_client_id(client_id):
 
 def place_broker_order(payload):
     """Submit an Alpaca paper order once, recovering the same client id after a crash."""
+    if PROCESS_ROLE not in ('runner','test'):
+        raise RuntimeError('broker orders are runner-only')
     if not broker_orders_enabled():
         raise RuntimeError('broker orders are disabled')
     client_id=(payload or {}).get('client_order_id')
@@ -567,11 +577,16 @@ def mem_set(key,payload):
     _MEM_CACHE[key]=(time.time(),payload)
 
 def db():
-    con=sqlite3.connect(DB,timeout=30,check_same_thread=False)
+    read_only=WEB_READ_ONLY
+    con=(sqlite3.connect(f'file:{DB}?mode=ro',uri=True,timeout=30,check_same_thread=False)
+         if read_only else sqlite3.connect(DB,timeout=30,check_same_thread=False))
     con.row_factory=sqlite3.Row
-    con.execute('PRAGMA journal_mode=WAL')
+    if read_only:
+        con.execute('PRAGMA query_only=ON')
+    else:
+        con.execute('PRAGMA journal_mode=WAL')
     con.execute('PRAGMA busy_timeout=8000')
-    con.execute('PRAGMA synchronous=NORMAL')
+    if not read_only: con.execute('PRAGMA synchronous=NORMAL')
     return con
 
 def init_db():
@@ -1634,12 +1649,30 @@ def maybe_snapshot_account(acct=None, min_age=60):
         return None
 
 def live_or_stored_account():
+    if WEB_READ_ONLY:
+        return stored_account()
     try:
         a=broker_account()
         maybe_snapshot_account(a)
         out=dict(a); out['source']='live'; out['snapshot_at']=now_ny().isoformat(); return out
     except Exception:
         return stored_account()
+
+def snapshot_positions(rows=None):
+    rows=broker_positions() if rows is None else rows
+    safe=[]
+    for x in rows or []:
+        safe.append({k:x.get(k) for k in ('symbol','qty','side','market_value','cost_basis',
+                    'unrealized_pl','unrealized_plpc','current_price','avg_entry_price','change_today')})
+    meta_set('positions_snapshot',json.dumps({'rows':safe,'snapshot_at':now_ny().isoformat()},default=str))
+    return safe
+
+def stored_positions():
+    try:
+        value=json.loads(meta_get('positions_snapshot') or '{}')
+        return value.get('rows') or []
+    except Exception:
+        return []
 
 def balance_curve(days=None):
     cutoff=desk_cutoff(days)
@@ -2929,6 +2962,8 @@ def runner_loop(heartbeat_callback=None):
                 time.sleep(30); continue
             try: maybe_snapshot_account()
             except Exception as e: event(f'Account snapshot: {e}','WARN')
+            try: snapshot_positions()
+            except Exception as e: event(f'Position snapshot: {e}','WARN')
             reconcile(); submit_due_exits()
             try: refresh_excursions_and_stops()
             except Exception as e: event(f'Manage open: {e}','WARN')
@@ -3036,7 +3071,7 @@ def intro_save():
 def _guest_lan():
     if request.method in ('GET','HEAD','OPTIONS'): return
     if not request.path.startswith('/api/'): return
-    if request.path.startswith('/api/comments'): return
+    if request.path.startswith('/api/comments') and not (ENVIRONMENT=='production' and PROCESS_ROLE=='web'): return
     if orders_allowed(): return
     return jsonify({'error':'guest LAN is read-only; paper orders stay on this device','guest':True}),403
 @app.get('/manifest.webmanifest')
@@ -3067,6 +3102,7 @@ def status_payload():
         'broker_config_enabled':c.get('broker_orders_enabled') is True,
         'broker_runtime_armed':broker_runtime_armed(),
         'environment':ENVIRONMENT,
+        'process_role':PROCESS_ROLE,
         'release':ROOT.name,
         'runner_release':meta_get('runner_release'),
         'heartbeat':meta_get('heartbeat'),'last_eval':meta_get('last_eval'),
@@ -3103,6 +3139,8 @@ def health():
     return jsonify(payload),(200 if payload['ok'] else 503)
 @app.post('/api/config')
 def setconfig():
+    if ENVIRONMENT=='production' and PROCESS_ROLE!='runner':
+        return jsonify({'error':'production configuration is runner-only'}),403
     d=request.get_json(force=True) or {}; c=cfg()
     for k in ('alpaca_key','alpaca_secret','fred_key','fomc_dates','ntfy_url','earnings_dates'):
         if k in d:c[k]=d[k]
@@ -3113,6 +3151,8 @@ def setconfig():
     save_cfg(c); return jsonify({'ok':True})
 @app.post('/api/test')
 def test():
+    if ENVIRONMENT=='production' and PROCESS_ROLE!='runner':
+        return jsonify({'error':'broker tests are runner-only'}),403
     out={'alpaca':False,'fred':False,'paper_account':False,'errors':[]}
     try:out['alpaca']=bool(getj(f'{MD}/v2/stocks/SPY/snapshot',ah(),{'feed':'iex'}))
     except Exception as e:out['errors'].append('Alpaca data: '+str(e))
@@ -3142,6 +3182,8 @@ def account():
 @app.get('/api/positions')
 def positions():
     try:
+        if ENVIRONMENT=='production' and PROCESS_ROLE=='web':
+            return jsonify({'positions':stored_positions(),'source':'runner_snapshot'})
         rows=[]
         for x in broker_positions():
             rows.append({k:x.get(k) for k in ("symbol","qty","side","market_value","cost_basis",
@@ -3156,10 +3198,10 @@ def market_chart(sym):
     sym=sym.upper()
     if sym not in ALL_TICKERS:return jsonify({"error":"unsupported ticker"}),400
     days=max(20,min(365,int(request.args.get("days","90"))))
-    ensure_daily_cache([sym],days)
+    if not WEB_READ_ONLY: ensure_daily_cache([sym],days)
     try:
         bars=load_local_bars_since(sym,'1Day',(now_ny().date()-timedelta(days=days*2)).isoformat())
-        if len(bars)<days:
+        if len(bars)<days and not WEB_READ_ONLY:
             end=now_ny(); start=end-timedelta(days=days*2)
             fetched=fetch_bars(sym,start.isoformat(),end.isoformat(),"1Day","iex")
             upsert_live_bars(sym,'1Day',fetched)
@@ -3619,7 +3661,6 @@ def backup():
     stamp=now_ny().strftime("%Y%m%d_%H%M%S")
     bdir=DATA/"backups";bdir.mkdir(exist_ok=True)
     dbdst=bdir/f"arena_{stamp}.db";shutil.copy2(DB,dbdst)
-    if CFG.exists():shutil.copy2(CFG,bdir/f"config_{stamp}.json")
     event(f"Backup created {dbdst.name}")
     return jsonify({"ok":True,"file":str(dbdst)})
 
@@ -3628,7 +3669,7 @@ def export_bundle():
     mem=io.BytesIO()
     with zipfile.ZipFile(mem,"w",zipfile.ZIP_DEFLATED) as z:
         if DB.exists():z.write(DB,"arena.db")
-        if CFG.exists():z.write(CFG,"config.json")
+        # Broker credentials never belong in a browser download.
         con=db()
         for name,query in {
           "signals.csv":"SELECT * FROM signals ORDER BY id",
@@ -4055,7 +4096,7 @@ def mtf(sym):
     m1=rth_bars(load_local_bars(sym,date,'1Min'))
     st=local_intraday_state(sym,date) or {}
     m5=st.get('bars5') or []
-    ensure_daily_cache([sym],90)
+    if not WEB_READ_ONLY: ensure_daily_cache([sym],90)
     d1=load_local_bars_since(sym,'1Day',(now_ny().date()-timedelta(days=180)).isoformat())[-90:]
     def slim(arr):
         out=[]
@@ -4069,6 +4110,7 @@ def mtf(sym):
 @app.get('/api/notes')
 def get_notes():
     if not NOTES.exists():
+        if WEB_READ_ONLY: return jsonify({'text':''})
         NOTES.write_text('# Lab notes\n\nSession observations live here.\n')
     return jsonify({'text':NOTES.read_text()})
 
@@ -4143,7 +4185,9 @@ def shadow_book():
 
 @app.get('/api/backups')
 def list_backups():
-    BACKUP_DIR.mkdir(exist_ok=True)
+    if not BACKUP_DIR.exists():
+        if WEB_READ_ONLY: return jsonify({'files':[]})
+        BACKUP_DIR.mkdir(exist_ok=True)
     files=sorted(BACKUP_DIR.glob('arena_*.db'), key=lambda p:p.stat().st_mtime, reverse=True)
     return jsonify({'files':[{'name':p.name,'mtime':datetime.fromtimestamp(p.stat().st_mtime, NY).isoformat(),'bytes':p.stat().st_size} for p in files[:40]]})
 
@@ -4167,22 +4211,27 @@ def journal_day():
     shadows=[dict(x) for x in con.execute('SELECT * FROM shadow_trades WHERE trade_date=? ORDER BY id',(date,)).fetchall()]
     debrief=con.execute('SELECT * FROM debriefs WHERE trade_date=? ORDER BY id DESC LIMIT 1',(date,)).fetchone()
     con.close()
+    esc=lambda value: html_escape(str(value if value is not None else ''),quote=True)
     def row(t):
-        return f"<tr><td>{t.get('id')}</td><td>{t.get('strategy_id')}</td><td>{t.get('ticker')}</td><td>{t.get('direction')}</td><td>{t.get('status')}</td><td>{t.get('entry_fill')}</td><td>{t.get('pnl')}</td><td>{t.get('mae')}</td><td>{t.get('mfe')}</td><td>{t.get('exit_kind') or ''}</td></tr>"
-    html=f"""<!doctype html><html><head><meta charset=utf-8><title>ASH journal {date}</title>
+        return '<tr>'+''.join(f'<td>{esc(t.get(k))}</td>' for k in (
+            'id','strategy_id','ticker','direction','status','entry_fill','pnl','mae','mfe','exit_kind'))+'</tr>'
+    safe_date=esc(date)
+    safe_debrief=esc(json.dumps(dict(debrief), indent=2) if debrief else 'Not submitted')
+    report_html=f"""<!doctype html><html><head><meta charset=utf-8><title>ASH journal {safe_date}</title>
     <style>body{{font-family:Georgia,serif;max-width:820px;margin:32px auto;color:#111}}h1{{font-size:22px}}table{{width:100%;border-collapse:collapse;font-size:12px}}td,th{{border-bottom:1px solid #ddd;padding:6px;text-align:left}}@media print{{button{{display:none}}}}</style></head>
     <body><button onclick="print()">Print / Save PDF</button>
-    <h1>ASH paper journal · {date}</h1>
+    <h1>ASH paper journal · {safe_date}</h1>
     <p>One-pager. Print this page to PDF from the browser.</p>
     <h2>Fills</h2><table><thead><tr><th>ID</th><th>Sid</th><th>Tkr</th><th>Side</th><th>Status</th><th>Entry</th><th>P&L</th><th>MAE</th><th>MFE</th><th>Exit</th></tr></thead>
     <tbody>{''.join(row(t) for t in trades) or '<tr><td colspan=10>No fills</td></tr>'}</tbody></table>
     <h2>Shadow skips</h2><table><thead><tr><th>Sid</th><th>Tkr</th><th>Status</th><th>Reason</th></tr></thead>
-    <tbody>{''.join(f"<tr><td>{s.get('strategy_id')}</td><td>{s.get('ticker')}</td><td>{s.get('status')}</td><td>{s.get('skip_reason') or ''}</td></tr>" for s in shadows) or '<tr><td colspan=4>No skips</td></tr>'}</tbody></table>
-    <h2>Debrief</h2><pre>{json.dumps(dict(debrief), indent=2) if debrief else 'Not submitted'}</pre>
+    <tbody>{''.join('<tr>'+''.join(f'<td>{esc(s.get(k))}</td>' for k in ('strategy_id','ticker','status','skip_reason'))+'</tr>' for s in shadows) or '<tr><td colspan=4>No skips</td></tr>'}</tbody></table>
+    <h2>Debrief</h2><pre>{safe_debrief}</pre>
     </body></html>"""
-    return Response(html, mimetype='text/html')
+    return Response(report_html, mimetype='text/html')
 
-init_db()
+if not (ENVIRONMENT=='production' and PROCESS_ROLE=='web'):
+    init_db()
 if __name__=='__main__':
     bind=(os.environ.get('CEG_BIND') or '0.0.0.0').strip() or '0.0.0.0'
     event(f'ASH Terminal web: http://{bind}:8765')
