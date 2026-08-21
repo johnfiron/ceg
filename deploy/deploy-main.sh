@@ -117,6 +117,7 @@ if $isolation_migration; then
   usermod -g ash-runner -a -G ash-readers ash-runner
   usermod -g ash-readers ash-web
   install -d -o ash-runner -g ash-readers -m 2750 /var/lib/ash
+  install -d -o ash-runner -g ash-runner -m 0700 /var/lib/ash/offsite
   install -d -o root -g root -m 0755 /etc/ash
   chown root:ash-runner /etc/ash/config.production.json
   chmod 0640 /etc/ash/config.production.json
@@ -138,6 +139,7 @@ install -m 0644 "$release/deploy/systemd/ash-runner-upgrade.service" /etc/system
 install -m 0644 "$release/deploy/systemd/ash-runner-upgrade.timer" /etc/systemd/system/ash-runner-upgrade.timer
 rm -f /etc/systemd/system/ash-web.service.d/paper-orders.conf
 install -m 0755 "$release/deploy/restart-pending-runner.sh" /usr/local/sbin/ash-restart-pending-runner
+install -m 0755 "$release/deploy/backup-offsite.sh" /usr/local/sbin/ash-backup-offsite
 systemctl daemon-reload
 systemctl enable --now ash-backup.timer ash-runner-upgrade.timer
 
