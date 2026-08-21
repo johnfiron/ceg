@@ -348,9 +348,10 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
   </div>
 
   <div id="setup" class="panel setup hidden">
-    <div class="eyebrow">LOCAL PAPER CONNECTION</div>
-    <h2>Initialize ASH Terminal</h2>
-    <p class="sub">Alpaca paper + FRED. Keys stay in local config.json — never commit them.</p>
+    <div class="eyebrow" id="setupEyebrow">LOCAL PAPER CONNECTION</div>
+    <h2 id="setupTitle">Initialize ASH Terminal</h2>
+    <p class="sub" id="setupLead">Alpaca paper + FRED. Keys stay in local config.json — never commit them.</p>
+    <div id="setupLocalFields">
     <label for="ak">Alpaca key</label><input id="ak">
     <label for="as">Alpaca secret</label><input id="as" type="password">
     <label for="fk">FRED key</label><input id="fk">
@@ -362,6 +363,7 @@ details.panel>summary:focus-visible{outline:2px solid var(--violet);outline-offs
       </div>
     </div>
     <button class="btn primary" style="width:100%;margin-top:10px" onclick="saveSetup()">Connect</button>
+    </div>
     <pre id="setupMsg" class="sub"></pre>
   </div>
 
@@ -680,7 +682,14 @@ let surfaceRot={x:-.38,y:.68,drag:false,lx:0,ly:0},surfacePoints=[];
 const ASH_BASE=location.pathname==='/ash'||location.pathname.startsWith('/ash/')?'/ash':'';
 const ashUrl=p=>ASH_BASE+p;
 if(ASH_BASE)$('familyVaultLink').classList.remove('hidden');
-async function api(p,o={}){let r=await fetch(ashUrl(p),{headers:{'Content-Type':'application/json'},...o});let j=await r.json();if(!r.ok)throw Error(j.error||JSON.stringify(j));return j}
+async function api(p,o={}){
+  let r=await fetch(ashUrl(p),{headers:{'Content-Type':'application/json'},...o});
+  let raw=await r.text();
+  let j=null;
+  if(raw){try{j=JSON.parse(raw)}catch(e){j={error:raw.slice(0,300)}}}
+  if(!r.ok)throw Error((j&&j.error)||raw||('http_'+r.status));
+  return j
+}
 
 // ---------- title engine: path-A, plate light, flakes / candles ----------
 function introPick(key,allowed,fallback){let v=localStorage.getItem(key);return allowed.includes(v)?v:fallback}
@@ -690,12 +699,14 @@ let INTRO_BAR=introPick('ashIntroBar',['sl','success','tp','all'],'all');
 let INTRO_GATE=introPick('ashIntroGate',['finger','auto'],'finger');
 let ASH_IDLE=introPick('ashIdle',['on','pause'],'on');
 const INTRO_Q=new URLSearchParams(location.search);
+const FROM_VAULT=INTRO_Q.get('from')==='vault';
+const SKIP_INTRO=FROM_VAULT||!!ASH_BASE;
 const PHONE=Math.min(screen.width||innerWidth,innerWidth)<=520;
-const RECORD=INTRO_Q.has('record')&&!PHONE;
+const RECORD=INTRO_Q.has('record')&&!PHONE&&!SKIP_INTRO;
 const REDUCE_MOTION=matchMedia('(prefers-reduced-motion: reduce)').matches;
 const INTRO_GROUND_KEY='ashIntroSeenGround';
 let INTRO_FIRST_OPEN=RECORD;
-try{INTRO_FIRST_OPEN=RECORD||localStorage.getItem(INTRO_GROUND_KEY)!=='1'}catch(e){INTRO_FIRST_OPEN=true}
+try{INTRO_FIRST_OPEN=SKIP_INTRO?false:(RECORD||localStorage.getItem(INTRO_GROUND_KEY)!=='1')}catch(e){INTRO_FIRST_OPEN=!SKIP_INTRO}
 const INTRO_FALL_MS=7200,INTRO_DRAFT_MS=6800,INTRO_CAMERA_MS=4600;
 const INTRO_FILL_MS=15000,INTRO_TITLE_MS=1600,INTRO_LOOP_MS=5000;
 const INTRO_MS=(INTRO_FIRST_OPEN?INTRO_FALL_MS:0)+INTRO_DRAFT_MS+INTRO_CAMERA_MS+INTRO_FILL_MS+INTRO_TITLE_MS;
@@ -1526,7 +1537,26 @@ function startIntroVideo(){
   };
   v.play().catch(()=>{v.style.display='none';intro.style.display='block';startIntroLive()})
 }
+function finishIntroImmediate(){
+  if(introDone)return;introDone=true;
+  introIdleOn=false;
+  if(introIdleRaf){cancelAnimationFrame(introIdleRaf);introIdleRaf=0}
+  hideIntroPrint();
+  try{$('introVideo').pause()}catch(e){}
+  intro.style.display='none';
+  $('introVideo').style.display='none';
+  $('bootOverlay').style.display='none';
+  let app=document.querySelector('.app');if(app)app.style.opacity='1';
+  if(!ash.length)spawnAsh();
+  startAmbient();
+  let locked=document.body.classList.contains('needs-keys');
+  if($('nav')&&!locked)$('nav').style.opacity='1';
+  if($('home')&&!locked)$('home').style.opacity='1';
+  if($('setup'))$('setup').style.opacity='';
+  paintDeskFromCache()
+}
 function finishIntro(){
+  if(SKIP_INTRO){finishIntroImmediate();return}
   if(introDone)return;introDone=true;
   introIdleOn=false;
   if(introIdleRaf){cancelAnimationFrame(introIdleRaf);introIdleRaf=0}
@@ -1575,7 +1605,9 @@ async function startIntro(){
     await startIntroLive()
   }catch(e){startIntroLive()}
 }
-bakeFlakeSprites();mountOrbA();startIntro().catch(()=>startIntroLive());
+bakeFlakeSprites();mountOrbA();
+if(SKIP_INTRO)finishIntroImmediate();
+else startIntro().catch(()=>startIntroLive());
 
 // ---------- exact-origin pressure-and-settle page cut ----------
 const fx=$('fxCanvas'), fg=fx.getContext('2d');
@@ -2052,11 +2084,27 @@ function activateClick(e){
   e.preventDefault();e.currentTarget.click()
 }
 function showSetup(){keysGate(false)}
+function applyMonitorLock(s){
+  let prod=(s&&s.environment==='production')||!!ASH_BASE||FROM_VAULT;
+  let fields=$('setupLocalFields');
+  if(fields)fields.classList.toggle('hidden',!!prod);
+  if(!prod)return;
+  let eye=$('setupEyebrow'),title=$('setupTitle'),lead=$('setupLead'),msg=$('setupMsg');
+  if(eye)eye.textContent='FAMILYVAULT MONITOR';
+  if(title)title.textContent='Read-only paper desk';
+  if(lead)lead.textContent='This tab cannot store or test Alpaca and FRED keys. Those stay on the ASH runner. If the desk is locked, the runner has not marked keys_ok.';
+  if(msg&&!msg.textContent)msg.textContent='Connect is disabled on the production monitor.';
+}
+if(ASH_BASE||FROM_VAULT)applyMonitorLock({environment:'production'});
 async function saveSetup(){
   let d={alpaca_key:$('ak').value,alpaca_secret:$('as').value,fred_key:$('fk').value,contracts_per_trade:+$('qty').value,broker_orders_enabled:$('bo').checked};
-  $('setupMsg').textContent='Testing...';await api('/api/config',{method:'POST',body:JSON.stringify(d)});
-  let t=await api('/api/test',{method:'POST',body:'{}'});$('setupMsg').textContent=JSON.stringify(t,null,2);
-  if(t.alpaca&&t.paper_account&&t.fred){keysGate(true);refreshAll()}
+  $('setupMsg').textContent='Testing...';
+  try{
+    await api('/api/config',{method:'POST',body:JSON.stringify(d)});
+    let t=await api('/api/test',{method:'POST',body:'{}'});
+    $('setupMsg').textContent=JSON.stringify(t,null,2);
+    if(t.alpaca&&t.paper_account&&t.fred){keysGate(true);refreshAll()}
+  }catch(e){$('setupMsg').textContent=e.message||String(e)}
 }
 function resize(c,fillBlack=true){if(!c._waitPaint)stopWait(c);let d=devicePixelRatio||1,r=c.getBoundingClientRect();c.width=Math.max(1,r.width*d);c.height=Math.max(1,r.height*d);let g=c.getContext('2d');g.setTransform(d,0,0,d,0,0);g.clearRect(0,0,r.width,r.height);if(fillBlack){g.fillStyle='#030303';g.fillRect(0,0,r.width,r.height)}return{g,w:r.width,h:r.height}}
 function chartColor(name,fallback){let v=getComputedStyle(document.documentElement).getPropertyValue(name).trim();return v||fallback}
@@ -2703,6 +2751,7 @@ function syncIntroUI(){
 async function boot(){
   let s=await api('/api/status');
   applyStatus(s);
+  applyMonitorLock(s);
   if(!s.configured){keysGate(false);return}
   keysGate(true);
   let cached=readDeskCache();
