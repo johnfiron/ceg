@@ -370,6 +370,12 @@ def keys_ok():
     c=cfg()
     return bool(c.get('alpaca_key') and c.get('alpaca_secret') and c.get('fred_key') and c.get('keys_ok'))
 
+def desk_configured():
+    """Production web has no broker secrets; still open the read-only snapshot desk."""
+    if ENVIRONMENT=='production' and PROCESS_ROLE=='web':
+        return True
+    return keys_ok()
+
 def save_cfg(c):
     CFG.write_text(json.dumps(c,indent=2))
     try: os.chmod(CFG,0o600)
@@ -2614,15 +2620,47 @@ def _expire_trade(tr, note='expired / no quote after close'):
 def _broker_order_time(order):
     return parse_ny(order.get('filled_at') or order.get('submitted_at') or order.get('created_at'))
 
-def _matching_exit_fill(tr, orders, used_order_ids=None, allow_generic=False):
-    """Find one broker sell for a local ticket without reusing another ticket's exit.
+def _order_qty(order):
+    try: return max(0,int(float((order or {}).get('filled_qty') or (order or {}).get('qty') or 0)))
+    except (TypeError,ValueError): return 0
+
+def _ticket_qty(tr):
+    try: return max(1,int(float((tr or {}).get('qty') or 1)))
+    except (TypeError,ValueError): return 1
+
+def _exit_remaining(orders, trades=None):
+    """Lots still available on each filled sell after tickets already attached to it."""
+    rem={}
+    for order in orders or []:
+        if not isinstance(order,dict) or order.get('side')!='sell' or str(order.get('status') or '')!='filled':
+            continue
+        oid=str(order.get('id') or '')
+        if not oid: continue
+        rem[oid]=rem.get(oid,0)+(_order_qty(order) or 1)
+    for trade in trades or []:
+        oid=str(trade.get('exit_order_id') or '')
+        if oid: rem[oid]=rem.get(oid,0)-_ticket_qty(trade)
+    return rem
+
+def _recent_broker_orders(days=14):
+    after=(now_ny()-timedelta(days=days)).astimezone(ZoneInfo('UTC')).isoformat()
+    orders=getj(paper_api_url('/orders'),ah(),{'status':'all','after':after,'direction':'desc','limit':500},timeout=15)
+    return orders if isinstance(orders,list) else []
+
+def _matching_exit_fill(tr, orders, used_order_ids=None, allow_generic=False, remaining_qty=None, allow_symbol=False):
+    """Find one broker sell for a local ticket without over-allocating that sell.
 
     Current exits use ``x53-<local id>``. Pre-hardening releases used
-    ``x53-<strategy>-<ticker>-<timestamp>``; those fills are still authoritative
-    when strategy, ticker, symbol, and chronology agree. Generic x53 matching is
-    reserved for repairing a broker round trip whose local row was lost.
+    ``x53-<strategy>-<ticker>-<timestamp>``. Same-symbol UUID liquidations are
+    used only when ``allow_symbol`` is set (repair / expire), not for buy replay.
+    Generic x53 matching is reserved for repairing a broker round trip whose
+    local row was lost.
     """
-    used=set(used_order_ids or ())
+    if remaining_qty is None:
+        remaining_qty=_exit_remaining(orders)
+        for oid in used_order_ids or ():
+            remaining_qty[str(oid)]=0
+    need=_ticket_qty(tr)
     want=str(tr.get('exit_client_id') or '')
     fallback=f"x53-{int(tr['id'])}" if tr.get('id') is not None else ''
     symbol=str(tr.get('option_symbol') or '')
@@ -2633,7 +2671,9 @@ def _matching_exit_fill(tr, orders, used_order_ids=None, allow_generic=False):
         if not isinstance(order,dict) or order.get('side')!='sell' or str(order.get('status') or '')!='filled':
             continue
         oid=str(order.get('id') or '')
-        if not oid or oid in used or order.get('filled_avg_price') is None:
+        if not oid or order.get('filled_avg_price') is None:
+            continue
+        if remaining_qty.get(oid,0)<need:
             continue
         if symbol and str(order.get('symbol') or '')!=symbol:
             continue
@@ -2645,25 +2685,37 @@ def _matching_exit_fill(tr, orders, used_order_ids=None, allow_generic=False):
     def earliest(rows):
         return min(rows,key=lambda o:(_broker_order_time(o) or datetime.max.replace(tzinfo=NY),str(o.get('id') or ''))) if rows else None
 
+    def take(rows):
+        hit=earliest(rows)
+        if not hit: return None
+        oid=str(hit.get('id') or '')
+        remaining_qty[oid]=remaining_qty.get(oid,0)-need
+        return hit
+
     exact=[o for o in candidates if str(o.get('client_order_id') or '') in (want,fallback) and str(o.get('client_order_id') or '')]
-    if exact:return earliest(exact)
+    if exact: return take(exact)
 
     sid=str(tr.get('strategy_id') or '').lower()
     ticker=str(tr.get('ticker') or '').lower()
     legacy_prefix=f'x53-{sid}-{ticker}-' if sid and ticker else ''
     legacy=[o for o in candidates if legacy_prefix and str(o.get('client_order_id') or '').lower().startswith(legacy_prefix)]
-    if legacy:return earliest(legacy)
+    if legacy: return take(legacy)
+
+    if allow_symbol:
+        liquidations=[o for o in candidates if not str(o.get('client_order_id') or '').lower().startswith('x53-')]
+        hit=take(liquidations)
+        if hit: return hit
 
     if allow_generic:
         generic=[o for o in candidates if str(o.get('client_order_id') or '').lower().startswith('x53-')]
-        return earliest(generic)
+        return take(generic)
     return None
 
 def broker_ledger_repair_plan(orders):
     """Build a deterministic, broker-sourced repair plan without changing SQLite."""
     broker_orders=[o for o in (orders or []) if isinstance(o,dict)]
     con=db(); trades=[dict(r) for r in con.execute('SELECT * FROM trades ORDER BY id').fetchall()]; con.close()
-    used_exits={str(t.get('exit_order_id')) for t in trades if t.get('exit_order_id')}
+    remaining=_exit_remaining(broker_orders,trades)
     plan=[]
 
     # Replace guessed full-premium expirations when Alpaca has the actual sell.
@@ -2672,9 +2724,9 @@ def broker_ledger_repair_plan(orders):
         key=lambda t:(parse_ny(t.get('entry_filled_at') or t.get('signal_ts')) or datetime.min.replace(tzinfo=NY),int(t.get('id') or 0)),
     )
     for tr in guessed:
-        sell=_matching_exit_fill(tr,broker_orders,used_exits)
+        sell=_matching_exit_fill(tr,broker_orders,remaining_qty=remaining,allow_symbol=True)
         if not sell:continue
-        oid=str(sell.get('id') or ''); used_exits.add(oid)
+        oid=str(sell.get('id') or '')
         exit_fill=float(sell.get('filled_avg_price') or 0)
         pnl=option_pnl(tr.get('entry_fill'),exit_fill,tr.get('qty'))
         plan.append({
@@ -2707,9 +2759,9 @@ def broker_ledger_repair_plan(orders):
             'strategy_id':sid,'ticker':ticker,'option_symbol':buy.get('symbol'),
             'entry_filled_at':buy.get('filled_at'),'signal_ts':submitted.isoformat(),
         }
-        sell=_matching_exit_fill(probe,broker_orders,used_exits,allow_generic=True)
+        sell=_matching_exit_fill(probe,broker_orders,remaining_qty=remaining,allow_generic=True)
         if not sell:continue
-        exit_oid=str(sell.get('id') or ''); used_exits.add(exit_oid)
+        exit_oid=str(sell.get('id') or '')
         qty=int(float(buy.get('filled_qty') or buy.get('qty') or 0))
         if qty<=0:continue
         entry_fill=float(buy.get('filled_avg_price') or 0)
@@ -2834,12 +2886,14 @@ def startup_reconcile():
         con.commit(); con.close(); recovered+=1
         event(f'Recovered broker order {cid} into the local trade ledger','WARN')
     today=now_ny().date().isoformat()
-    con=db(); local_open=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()]; con.close()
+    con=db(); booked=[dict(x) for x in con.execute('SELECT * FROM trades').fetchall()]; con.close()
+    local_open=[t for t in booked if t.get('status')=='OPEN']
+    remaining=_exit_remaining(orders, booked)
     missing=[]
     for tr in local_open:
         if tr.get('option_symbol') in held:
             continue
-        sell=_matching_exit_fill(tr, orders)
+        sell=_matching_exit_fill(tr, orders, remaining_qty=remaining, allow_symbol=True)
         if sell:
             _close_trade_from_broker_exit(tr, sell)
             continue
@@ -2849,7 +2903,7 @@ def startup_reconcile():
             _expire_trade(tr, 'broker flat after Activity still OPEN')
             continue
         missing.append(str(tr['id']))
-    expire_dead_options(held)
+    expire_dead_options(held, orders=orders, remaining_qty=remaining)
     if missing:
         event('Startup reconciliation: local OPEN trades absent from Alpaca positions: '+','.join(missing),'ERROR')
         raise RuntimeError('startup reconciliation found missing broker positions for local trades: '+','.join(missing))
@@ -2859,15 +2913,37 @@ def startup_reconcile():
     event(f'Startup reconciliation complete: {len(orders)} orders checked, {recovered} recovered, {skipped_flat} filled buys ignored (broker already flat)')
     return True
 
-def expire_dead_options(held=None):
-    """0DTE still OPEN after the close is worthless — do not keep sending market sells."""
+def expire_dead_options(held=None, orders=None, remaining_qty=None):
+    """0DTE still OPEN after the close is worthless — do not keep sending market sells.
+
+    A broker liquidation (including UUID client ids) closes the ticket at the
+    fill. Full-debit EXPIRED is only used when no sell remains.
+    """
     held=set(held or ())
     con=db(); rows=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='OPEN'").fetchall()]; con.close()
+    need=[]
     for tr in rows:
         if tr.get('option_symbol') in held:
             continue
         if _option_is_worthless(tr):
-            _expire_trade(tr)
+            need.append(tr)
+    if not need: return
+    if orders is None:
+        try:
+            c=cfg()
+            orders=_recent_broker_orders() if (c.get('alpaca_key') and c.get('alpaca_secret')) else []
+        except Exception as e:
+            event(f'expire_dead_options orders: {e}','WARN')
+            orders=[]
+    if remaining_qty is None:
+        con=db(); booked=[dict(x) for x in con.execute('SELECT id,qty,exit_order_id FROM trades').fetchall()]; con.close()
+        remaining_qty=_exit_remaining(orders, booked)
+    for tr in need:
+        sell=_matching_exit_fill(tr, orders, remaining_qty=remaining_qty, allow_symbol=True)
+        if sell:
+            _close_trade_from_broker_exit(tr, sell)
+            continue
+        _expire_trade(tr)
 
 def submit_due_exits():
     expire_dead_options()
@@ -3130,7 +3206,7 @@ def status_payload():
         except Exception: stale=None
     snap=stored_account()
     return {
-        'configured':keys_ok(),
+        'configured':desk_configured(),
         'paper_only':True,'broker_orders_enabled':broker_orders_enabled(),
         'broker_config_enabled':c.get('broker_orders_enabled') is True,
         'broker_runtime_armed':broker_runtime_armed(),
