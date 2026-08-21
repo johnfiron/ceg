@@ -330,6 +330,49 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(response.status_code,403)
         self.assertTrue((response.get_json() or {}).get('guest'))
 
+    def test_production_web_is_read_only_even_behind_loopback_proxy(self):
+        client=app.app.test_client()
+        attempts=(
+            ('post','/api/backup',{}),
+            ('post','/api/ingest',{}),
+            ('post','/api/reconcile',{}),
+            ('post','/api/thresholds',{}),
+            ('patch','/api/trades/1',{'comment':'proxy must not grant writes'}),
+            ('post','/api/notes',{'text':'blocked'}),
+            ('post','/api/comments',{'kind':'INTENT','target_type':'session','target_id':'2026-08-20','body':'blocked'}),
+            ('post','/api/restore',{'name':'arena_fake.db'}),
+        )
+        with mock.patch.object(app,'ENVIRONMENT','production'), mock.patch.object(app,'PROCESS_ROLE','web'):
+            for method,path,payload in attempts:
+                response=getattr(client,method)(
+                    path,json=payload,environ_base={'REMOTE_ADDR':'127.0.0.1'})
+                self.assertEqual(response.status_code,403,(method,path,response.get_data(as_text=True)))
+                self.assertEqual((response.get_json() or {}).get('error'),'production monitor is read-only')
+
+    def test_production_web_blocks_full_database_export(self):
+        with mock.patch.object(app,'ENVIRONMENT','production'), mock.patch.object(app,'PROCESS_ROLE','web'):
+            response=app.app.test_client().get(
+                '/api/export',environ_base={'REMOTE_ADDR':'127.0.0.1'})
+        self.assertEqual(response.status_code,403)
+        self.assertIn('unavailable',(response.get_json() or {}).get('error',''))
+
+    def test_api_responses_receive_baseline_security_headers(self):
+        response=app.app.test_client().get('/api/status')
+        self.assertEqual(response.headers.get('Cache-Control'),'no-store, max-age=0')
+        self.assertEqual(response.headers.get('X-Content-Type-Options'),'nosniff')
+        self.assertEqual(response.headers.get('X-Frame-Options'),'DENY')
+        self.assertEqual(response.headers.get('Referrer-Policy'),'strict-origin-when-cross-origin')
+        self.assertIn('geolocation=()',response.headers.get('Permissions-Policy',''))
+        self.assertIn("script-src 'self'",response.headers.get('Content-Security-Policy-Report-Only',''))
+
+    def test_authenticated_desk_is_not_cached_persistently(self):
+        response=app.app.test_client().get('/')
+        self.assertEqual(response.headers.get('Cache-Control'),'no-store, max-age=0')
+        html=response.get_data(as_text=True)
+        self.assertIn("sessionStorage.setItem(DESK_CACHE_KEY",html)
+        self.assertIn("localStorage.removeItem('ashDeskCache')",html)
+        self.assertNotIn("localStorage.setItem('ashDeskCache'",html)
+
     def test_journal_escapes_stored_debrief_html(self):
         con=app.db()
         con.execute("INSERT INTO debriefs(ts,trade_date,q1,q2,q3) VALUES(?,?,?,?,?)",

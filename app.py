@@ -3077,12 +3077,36 @@ def intro_save():
     return jsonify({'ok':True,'file':name,'bytes':n})
 
 @app.before_request
-def _guest_lan():
+def _enforce_web_boundary():
+    if not request.path.startswith('/api/'):
+        return
+    if ENVIRONMENT=='production' and PROCESS_ROLE=='web':
+        if request.path=='/api/export':
+            return jsonify({'error':'export is unavailable from the production monitor'}),403
+        if request.method not in ('GET','HEAD','OPTIONS'):
+            return jsonify({'error':'production monitor is read-only'}),403
     if request.method in ('GET','HEAD','OPTIONS'): return
-    if not request.path.startswith('/api/'): return
     if request.path.startswith('/api/comments') and not (ENVIRONMENT=='production' and PROCESS_ROLE=='web'): return
     if orders_allowed(): return
     return jsonify({'error':'guest LAN is read-only; paper orders stay on this device','guest':True}),403
+
+@app.after_request
+def _security_headers(response):
+    response.headers.setdefault('X-Content-Type-Options','nosniff')
+    response.headers.setdefault('X-Frame-Options','DENY')
+    response.headers.setdefault('Referrer-Policy','strict-origin-when-cross-origin')
+    response.headers.setdefault('Permissions-Policy','geolocation=(), microphone=(), camera=()')
+    response.headers.setdefault(
+        'Content-Security-Policy-Report-Only',
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        "connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; "
+        "frame-ancestors 'none'"
+    )
+    if request.path=='/' or request.path.startswith('/api/'):
+        response.headers['Cache-Control']='no-store, max-age=0'
+        response.headers['Pragma']='no-cache'
+    return response
+
 @app.get('/manifest.webmanifest')
 def manifest():return send_from_directory(STATIC,'manifest.webmanifest')
 @app.get('/sw.js')

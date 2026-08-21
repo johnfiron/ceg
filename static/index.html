@@ -2701,25 +2701,32 @@ function syncIntroUI(){
   document.querySelectorAll('#ashIdleTabs .tab').forEach(x=>x.classList.toggle('active',x.dataset.idle===introPick('ashIdle',['on','pause'],'on')))
 }
 async function boot(){
-  let cached=readDeskCache();
-  if(cached)applyBootstrap(cached,true);
-  let s=(cached&&cached.status)||await api('/api/status');
+  let s=await api('/api/status');
   applyStatus(s);
   if(!s.configured){keysGate(false);return}
   keysGate(true);
+  let cached=readDeskCache();
+  if(cached)applyBootstrap(cached,true);
   try{await primeDesk()}catch(e){await refreshAll()}
   if(introDone)await renderPage(activePageId())
 }
+const DESK_CACHE_KEY='ash:desk:v2',DESK_CACHE_VERSION=2,DESK_CACHE_TTL_MS=5*60*1000;
 function readDeskCache(){
   try{
-    let d=JSON.parse(localStorage.getItem('ashDeskCache')||'');
-    if(!d||!d.as_of)return null;
-    return d
+    localStorage.removeItem('ashDeskCache');
+    let envelope=JSON.parse(sessionStorage.getItem(DESK_CACHE_KEY)||'');
+    if(!envelope||envelope.v!==DESK_CACHE_VERSION||!envelope.stored_at
+      ||Date.now()-envelope.stored_at>DESK_CACHE_TTL_MS||!envelope.payload?.as_of){
+      sessionStorage.removeItem(DESK_CACHE_KEY);return null
+    }
+    return envelope.payload
   }catch(e){return null}
 }
 function writeDeskCache(payload){
   if(!payload||!payload.as_of)return;
-  try{localStorage.setItem('ashDeskCache',JSON.stringify(payload))}catch(e){}
+  try{sessionStorage.setItem(DESK_CACHE_KEY,JSON.stringify({
+    v:DESK_CACHE_VERSION,stored_at:Date.now(),payload
+  }))}catch(e){}
 }
 function applyBootstrap(b,fromCache){
   if(!b)return;

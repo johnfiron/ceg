@@ -16,6 +16,7 @@ id ash-web >/dev/null 2>&1 || useradd --system --gid ash-readers --home /nonexis
 usermod -g ash-runner -a -G ash-readers ash-runner
 usermod -g ash-readers ash-web
 install -d -o ash-runner -g ash-readers -m 2750 /var/lib/ash
+install -d -o ash-runner -g ash-runner -m 0700 /var/lib/ash/offsite
 install -d -o root -g root -m 0755 /etc/ash /opt/ash/releases
 install -d /var/log/journal
 if [ ! -f /etc/ash/config.production.json ]; then
@@ -23,6 +24,9 @@ if [ ! -f /etc/ash/config.production.json ]; then
 fi
 chown root:ash-runner /etc/ash/config.production.json
 chmod 0640 /etc/ash/config.production.json
+if [ ! -f /etc/ash/backup.env ]; then
+  install -o root -g ash-runner -m 0640 /opt/ash/repo/deploy/ash-backup.env.example /etc/ash/backup.env
+fi
 install -o root -g ash-readers -m 0640 /opt/ash/repo/config.production.example.json /etc/ash/config.web.json
 if command -v jq >/dev/null; then
   tmp_web=$(mktemp /etc/ash/config.web.json.XXXXXX)
@@ -49,6 +53,7 @@ install -m 0644 /opt/ash/repo/deploy/systemd/ash-runner-upgrade.service /etc/sys
 install -m 0644 /opt/ash/repo/deploy/systemd/ash-runner-upgrade.timer /etc/systemd/system/ash-runner-upgrade.timer
 install -m 0755 /opt/ash/repo/deploy/deploy-main.sh /usr/local/sbin/ash-deploy-main
 install -m 0755 /opt/ash/repo/deploy/restart-pending-runner.sh /usr/local/sbin/ash-restart-pending-runner
+install -m 0755 /opt/ash/repo/deploy/backup-offsite.sh /usr/local/sbin/ash-backup-offsite
 install -d /etc/systemd/journald.conf.d
 install -m 0644 /opt/ash/repo/deploy/journald/ash-retention.conf /etc/systemd/journald.conf.d/ash-retention.conf
 systemctl daemon-reload
