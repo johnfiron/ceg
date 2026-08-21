@@ -3096,8 +3096,15 @@ def _security_headers(response):
     response.headers.setdefault('X-Frame-Options','DENY')
     response.headers.setdefault('Referrer-Policy','strict-origin-when-cross-origin')
     response.headers.setdefault('Permissions-Policy','geolocation=(), microphone=(), camera=()')
-    if request.path.startswith('/api/'):
-        response.headers.setdefault('Cache-Control','no-store')
+    response.headers.setdefault(
+        'Content-Security-Policy-Report-Only',
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+        "connect-src 'self'; font-src 'self'; object-src 'none'; base-uri 'self'; "
+        "frame-ancestors 'none'"
+    )
+    if request.path=='/' or request.path.startswith('/api/'):
+        response.headers['Cache-Control']='no-store, max-age=0'
+        response.headers['Pragma']='no-cache'
     return response
 
 @app.get('/manifest.webmanifest')
