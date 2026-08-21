@@ -13,13 +13,21 @@ Environment=CEG_PROCESS_ROLE=runner
 Environment=CEG_DATA_DIR=/var/lib/ash
 Environment=CEG_CONFIG_FILE=/etc/ash/config.production.json
 Environment=CEG_ALLOW_BROKER_ORDERS=false
-ExecStart=/opt/ash/venv/bin/python backup_db.py --retain 14
+Environment=RCLONE_CONFIG=/var/lib/ash/offsite/rclone.conf
+EnvironmentFile=-/etc/ash/backup.env
+ExecStart=/usr/local/sbin/ash-backup-offsite
 UMask=0077
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/var/lib/ash
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictRealtime=true
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=ash-backup
