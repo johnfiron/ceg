@@ -14,19 +14,19 @@ dependency into ordinary session authorization.
 | Browser identity uses an opaque, hashed, expiring, revocable session | `backend/tests/authLoginRoundtrip.test.ts`, `sessionSecurity.test.ts` | Pass |
 | Session load rejects revoked, idle-expired, absolute-expired, and stale-version rows | `sessionSecurity.test.ts` SQL-boundary assertion | Pass |
 | Mutations require same origin, same-site Fetch Metadata, JSON content type, and session CSRF proof | `sessionSecurity.test.ts`; `requestSecurity.ts` global hook | Pass |
-| Authentication does not grant admin authority | `requireAdmin`; route-level family/trading checks | Code review gate |
+| Authentication does not grant admin authority | `sessionSecurity.test.ts` requireAdmin cases; `authorizationBoundaries.test.ts` family/trading wiring | Pass |
 | Production ASH web rejects all mutation methods and export, including loopback proxy traffic | `tests/test_safety.py` production boundary tests | Pass |
 | ASH web cannot read runner credentials or arm broker orders | `test_production_web_role_cannot_arm_or_read_broker_credentials` | Pass |
 | Autonomous orders remain paper-only and require independent config/runtime interlocks | broker endpoint/interlock tests in `test_safety.py` | Pass |
-| Logout revokes the current BFF session and child ASH sessions | transactional updates in `backend/src/auth/routes.ts` | Code review gate |
+| Logout revokes the current BFF session and child ASH sessions | `authorizationBoundaries.test.ts` logout SQL assertion | Pass |
 | Password/recovery/member-removal operations require current step-up | `sessionSecurity.test.ts` expiry tests and protected route prehandlers | Pass |
 
 ## Cryptographic authorization, lock, replay, and race checks
 
 | Invariant | Evidence | Result |
 |---|---|---|
-| Operational P-256 private key is imported non-extractable | `frontend/src/crypto/operationSigning.ts` | Build/code review gate |
-| Application has no generic arbitrary-byte signing method | operation-specific methods in `frontend/src/stores/auth.ts` | Code review gate |
+| Operational P-256 private key is imported non-extractable | `frontend/src/crypto/__tests__/operationSigning.test.ts` | Pass |
+| Application has no generic arbitrary-byte signing method | `frontend/src/stores/__tests__/auth.test.ts` public-API assertion | Pass |
 | Signature binds version, operation, subject, resource, exact parameters, nonce, audience, issue time, and expiry | backend/client canonical challenge implementation | Pass |
 | Modified parameters or wrong audience fail verification | `backend/tests/operationAuthorization.test.ts` | Pass |
 | Wrong session, user, family, operation, or resource cannot consume a challenge | bound atomic SQL assertion in `operationAuthorization.test.ts` | Pass |
@@ -45,8 +45,8 @@ dependency into ordinary session authorization.
 | FamilyVault scripts are self-only and Trusted Types is enforced | `backend/tests/serverHeaders.test.ts`; Caddy/Helmet policies | Pass locally |
 | Inline style permission is limited to style attributes, not stylesheet/script execution | header test | Pass locally |
 | API/session/key responses are `no-store` | global backend header test; ASH header test | Pass |
-| Service worker excludes APIs and ASH authenticated navigation | `frontend/src/sw/sw.ts` denylist | Code review gate |
-| FamilyVault logout clears vault state and ASH tab cache | `AppShell.tsx` | Build/code review gate |
+| Service worker excludes APIs and ASH authenticated navigation | `frontend/src/sw/__tests__/navigationDenylist.test.ts` | Pass |
+| FamilyVault logout clears vault state and ASH tab cache | `sensitiveCache.test.ts`; AppShell wiring assertion | Pass |
 | ASH validates authorization before restoring cache, uses tab-only storage, and expires it after five minutes | `test_authenticated_desk_is_not_cached_persistently` | Pass |
 | Stored journal markup is escaped | `test_journal_escapes_stored_debrief_html` | Pass |
 | ASH enforced CSP can remove inline script/event permission | Report-only policy is shipped first; production violation collection and extraction remain a pre-deploy gate | Not yet enforceable |
