@@ -51,6 +51,14 @@ class SafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'runner-only'):
                 app.place_broker_order({'client_order_id':'web-must-fail'})
 
+    def test_production_web_opens_the_desk_without_local_keys(self):
+        app.CFG.write_text(json.dumps({'keys_ok':False,'broker_orders_enabled':False}))
+        with mock.patch.object(app,'ENVIRONMENT','production'), mock.patch.object(app,'PROCESS_ROLE','web'):
+            self.assertFalse(app.keys_ok())
+            self.assertTrue(app.desk_configured())
+            response=app.app.test_client().get('/api/status')
+        self.assertTrue((response.get_json() or {}).get('configured'))
+
     def test_order_retry_recovers_deterministic_client_id(self):
         app.CFG.write_text(json.dumps({'broker_orders_enabled':True}))
         os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
@@ -82,6 +90,13 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("const ASH_BASE=location.pathname==='/ash'",html)
         self.assertIn('fetch(ashUrl(p)',html)
         self.assertIn("serviceWorker.register(ashUrl('/sw.js')",html)
+        self.assertIn('let raw=await r.text()',html)
+        self.assertIn("catch(e){$('setupMsg').textContent=e.message||String(e)}",html)
+        self.assertIn('function applyMonitorLock(s)',html)
+        self.assertIn("const FROM_VAULT=INTRO_Q.get('from')==='vault'",html)
+        self.assertIn('function finishIntroImmediate()',html)
+        self.assertIn('if(SKIP_INTRO)finishIntroImmediate()',html)
+        self.assertIn('if(ASH_BASE||FROM_VAULT)applyMonitorLock',html)
         self.assertIn('href="manifest.webmanifest"',html)
         self.assertIn("xhair=bars[index]?.t??null",html)
         self.assertNotIn("[{date:null,cumPnl:0}]",html)
@@ -172,6 +187,71 @@ class SafetyTests(unittest.TestCase):
         con=app.db(); rows=con.execute('SELECT id,exit_order_id,pnl,exit_kind FROM trades ORDER BY id').fetchall(); con.close()
         self.assertEqual([(r['id'],r['exit_order_id'],r['pnl'],r['exit_kind']) for r in rows],
                          [(1,'sell1',-97.0,'BROKER_REPAIR'),(2,'sell2',-64.0,'BROKER_REPAIR')])
+
+    def test_ledger_repair_pairs_uuid_liquidation(self):
+        self._wipe_trades()
+        con=app.db()
+        con.execute("""INSERT INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,
+                       expiry,entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,status,pnl,exit_kind)
+                       VALUES(25,'OPN','IWM','PUT','IWM260820P00300000',1,'2026-08-20T13:51:15Z','2026-08-20','2026-08-20',
+                       'buy25','a53-20260820-opn-iwm',0.83,'2026-08-20T13:51:15Z','2026-08-20','CLOSED',-83,'EXPIRED')""")
+        con.commit(); con.close()
+        sell={'id':'liq25','client_order_id':'21b17cf4-8dbf-4dac-867b-d36d27ffa9c8','side':'sell','status':'filled',
+              'symbol':'IWM260820P00300000','qty':'1','filled_qty':'1','filled_avg_price':'2.36',
+              'filled_at':'2026-08-20T19:45:06Z'}
+        plan=app.broker_ledger_repair_plan([sell])
+        self.assertEqual([(x['trade_id'],x['exit_order_id'],x['pnl']) for x in plan],[(25,'liq25',153.0)])
+        self.assertEqual(app.apply_broker_ledger_repair(plan),{'updated':1,'inserted':0})
+
+    def test_ledger_repair_splits_qty2_uuid_sell_across_two_tickets(self):
+        self._wipe_trades()
+        con=app.db()
+        for tid,fill,entered in ((37,0.82,'2026-08-21T14:17:16Z'),(38,1.03,'2026-08-21T14:30:22Z')):
+            con.execute("""INSERT INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,
+                           expiry,entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,status,pnl,exit_kind)
+                           VALUES(?,'ORB','NVDA','PUT','NVDA260821P00215000',1,?,'2026-08-21','2026-08-21',
+                           ?,?, ?,?,'2026-08-21','CLOSED',?,'EXPIRED')""",
+                        (tid,entered,f'buy{tid}',f'a53-20260821-orb-nvda-{tid}',fill,entered,-fill*100))
+        con.commit(); con.close()
+        sell={'id':'liq37','client_order_id':'3ff746d8-0098-4b69-8792-99efdd1e6749','side':'sell','status':'filled',
+              'symbol':'NVDA260821P00215000','qty':'2','filled_qty':'2','filled_avg_price':'0.31',
+              'filled_at':'2026-08-21T19:30:47Z'}
+        plan=app.broker_ledger_repair_plan([sell])
+        self.assertEqual([(x['trade_id'],x['exit_order_id'],x['pnl']) for x in plan],
+                         [(37,'liq37',-51.0),(38,'liq37',-72.0)])
+        self.assertEqual(app.apply_broker_ledger_repair(plan),{'updated':2,'inserted':0})
+        one_lot=dict(sell); one_lot['qty']='1'; one_lot['filled_qty']='1'; one_lot['id']='liq-one'
+        self._wipe_trades()
+        con=app.db()
+        for tid,fill,entered in ((37,0.82,'2026-08-21T14:17:16Z'),(38,1.03,'2026-08-21T14:30:22Z')):
+            con.execute("""INSERT INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,
+                           expiry,entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,status,pnl,exit_kind)
+                           VALUES(?,'ORB','NVDA','PUT','NVDA260821P00215000',1,?,'2026-08-21','2026-08-21',
+                           ?,?, ?,?,'2026-08-21','CLOSED',?,'EXPIRED')""",
+                        (tid,entered,f'buy{tid}',f'a53-20260821-orb-nvda-{tid}',fill,entered,-fill*100))
+        con.commit(); con.close()
+        plan=app.broker_ledger_repair_plan([one_lot])
+        self.assertEqual([x['trade_id'] for x in plan],[37])
+
+    def test_expire_dead_options_closes_from_uuid_sell_not_full_debit(self):
+        self._wipe_trades()
+        frozen=app.datetime(2026,8,21,16,30,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,
+                       entry_fill,entry_filled_at,exit_due_date,status,horizon)
+                       VALUES(35,'OSF','NVDA','PUT','NVDA260821P00217500',1,?,?,?,1.46,?,'2026-08-21','OPEN','EOD')""",
+                    ('2026-08-21T09:51:00-04:00','2026-08-21','2026-08-21','2026-08-21T09:51:08Z'))
+        con.commit(); con.close()
+        sell={'id':'liq35','client_order_id':'a62df2ac-846d-420f-8c6a-912c299d8a03','side':'sell','status':'filled',
+              'symbol':'NVDA260821P00217500','qty':'1','filled_qty':'1','filled_avg_price':'2.54',
+              'filled_at':'2026-08-21T19:30:48Z'}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            app.expire_dead_options(held=set(), orders=[sell])
+        con=app.db(); row=con.execute('SELECT status,pnl,exit_fill,exit_kind FROM trades WHERE id=35').fetchone(); con.close()
+        self.assertEqual(row['status'],'CLOSED')
+        self.assertEqual(row['exit_fill'],2.54)
+        self.assertAlmostEqual(row['pnl'],108.0)
+        self.assertNotEqual(row['exit_kind'],'EXPIRED')
 
     def test_ledger_repair_recovers_missing_closed_round_trip(self):
         self._wipe_trades()
