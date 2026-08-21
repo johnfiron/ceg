@@ -358,11 +358,20 @@ class SafetyTests(unittest.TestCase):
 
     def test_api_responses_receive_baseline_security_headers(self):
         response=app.app.test_client().get('/api/status')
-        self.assertEqual(response.headers.get('Cache-Control'),'no-store')
+        self.assertEqual(response.headers.get('Cache-Control'),'no-store, max-age=0')
         self.assertEqual(response.headers.get('X-Content-Type-Options'),'nosniff')
         self.assertEqual(response.headers.get('X-Frame-Options'),'DENY')
         self.assertEqual(response.headers.get('Referrer-Policy'),'strict-origin-when-cross-origin')
         self.assertIn('geolocation=()',response.headers.get('Permissions-Policy',''))
+        self.assertIn("script-src 'self'",response.headers.get('Content-Security-Policy-Report-Only',''))
+
+    def test_authenticated_desk_is_not_cached_persistently(self):
+        response=app.app.test_client().get('/')
+        self.assertEqual(response.headers.get('Cache-Control'),'no-store, max-age=0')
+        html=response.get_data(as_text=True)
+        self.assertIn("sessionStorage.setItem(DESK_CACHE_KEY",html)
+        self.assertIn("localStorage.removeItem('ashDeskCache')",html)
+        self.assertNotIn("localStorage.setItem('ashDeskCache'",html)
 
     def test_journal_escapes_stored_debrief_html(self):
         con=app.db()
