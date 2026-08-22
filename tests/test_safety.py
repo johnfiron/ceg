@@ -98,11 +98,15 @@ class SafetyTests(unittest.TestCase):
         self.assertIn('if(SKIP_INTRO)finishIntroImmediate()',html)
         self.assertIn('if(ASH_BASE||FROM_VAULT)applyMonitorLock',html)
         self.assertIn('href="manifest.webmanifest"',html)
-        self.assertIn("xhair=bars[index]?.t??null",html)
+        self.assertIn('function stepInspect(delta)',html)
+        self.assertIn("timeZone:'America/New_York'",html)
+        self.assertIn("document.body.classList.toggle('monitor-lock'",html)
         self.assertNotIn("[{date:null,cumPnl:0}]",html)
-        self.assertIn("Date.now()-(chartDataAt[t]||0)>60000",html)
+        self.assertIn("api('/api/sleeve_history?days=30'",html)
+        self.assertIn("api(`/api/live_bars/${ticker}`",html)
         self.assertIn("s.filter(x=>(x.closed||0)>0)",html)
-        self.assertIn("['SPY','QQQ','IWM'].includes(t)?'INDEX':'EQUITY'",html)
+        self.assertIn('id="heroChart"',html)
+        self.assertIn('id="inspectChart"',html)
         self.assertIn('amber squares = flat',html)
 
     def _paper_cfg(self):
@@ -312,6 +316,122 @@ class SafetyTests(unittest.TestCase):
             got=app.live_or_stored_account()
         self.assertEqual(got.get('source'),'snapshot')
         self.assertEqual(got.get('equity'),100000)
+
+    def _wipe_option_marks(self):
+        con=app.db()
+        con.execute('DELETE FROM option_mark_snapshots')
+        con.execute("DELETE FROM meta WHERE k='positions_snapshot'")
+        con.commit(); con.close()
+
+    def test_position_snapshot_persists_linked_marks_without_same_cycle_duplicates(self):
+        self._wipe_option_marks(); self._wipe_trades()
+        frozen=app.datetime(2026,8,21,11,0,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,
+                       trade_date,expiry,entry_fill,entry_filled_at,status)
+                       VALUES('ORB','QQQ','CALL','QQQ260821C00570000',2,?,'2026-08-21',
+                              '2026-08-21',1.0,?,'OPEN')""",
+                    (frozen.isoformat(),frozen.isoformat()))
+        tid=con.execute('SELECT last_insert_rowid() x').fetchone()['x']
+        con.commit(); con.close()
+        position={'symbol':'QQQ260821C00570000','qty':'2','side':'long','current_price':'1.50',
+                  'market_value':'300','cost_basis':'200','unrealized_pl':'100',
+                  'unrealized_plpc':'0.5','avg_entry_price':'1.0'}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            app.snapshot_positions([position])
+            app.snapshot_positions([position])
+        con=app.db()
+        rows=con.execute('SELECT * FROM option_mark_snapshots WHERE trade_id=?',(tid,)).fetchall()
+        indexes={r['name'] for r in con.execute("PRAGMA index_list('option_mark_snapshots')").fetchall()}
+        con.close()
+        self.assertEqual(len(rows),1)
+        self.assertEqual((rows[0]['strategy_id'],rows[0]['option_symbol'],rows[0]['mark'],rows[0]['source']),
+                         ('ORB','QQQ260821C00570000',1.5,'broker'))
+        self.assertIn('idx_option_marks_ts',indexes)
+        self.assertIn('idx_option_marks_sleeve',indexes)
+
+    def test_option_mark_snapshot_retention_is_bounded(self):
+        self._wipe_option_marks(); self._wipe_trades()
+        frozen=app.datetime(2026,8,21,12,0,tzinfo=app.NY)
+        old=(frozen-app.timedelta(days=app.OPTION_MARK_RETENTION_DAYS+1)).isoformat()
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,trade_date,status)
+                       VALUES('MVR','SPY','PUT','SPY260821P00640000',1,'2026-08-21','OPEN')""")
+        tid=con.execute('SELECT last_insert_rowid() x').fetchone()['x']
+        con.execute("""INSERT INTO option_mark_snapshots(
+                       ts,mark_ts,trade_date,trade_id,strategy_id,ticker,option_symbol,activity_qty,source)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (old,old,'2026-07-21',tid,'MVR','SPY','SPY260821P00640000',1,'broker'))
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            app.snapshot_positions([{'symbol':'SPY260821P00640000','qty':'1','current_price':'0.75'}])
+        con=app.db()
+        rows=con.execute('SELECT ts FROM option_mark_snapshots WHERE trade_id=? ORDER BY ts',(tid,)).fetchall()
+        con.close()
+        self.assertEqual([r['ts'] for r in rows],[frozen.isoformat()])
+
+    def test_sleeve_history_groups_contract_paths_fills_and_aggregate_pnl(self):
+        self._wipe_option_marks(); self._wipe_trades()
+        frozen=app.datetime(2026,8,21,13,0,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,
+                       trade_date,expiry,entry_fill,entry_filled_at,status)
+                       VALUES('ORB','QQQ','CALL','QQQ260821C00570000',2,?,'2026-08-21',
+                              '2026-08-21',1.0,?,'OPEN')""",(frozen.isoformat(),frozen.isoformat()))
+        con.execute("""INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,
+                       trade_date,expiry,entry_fill,entry_filled_at,exit_fill,exit_filled_at,status,pnl)
+                       VALUES('ORB','IWM','PUT','IWM260821P00300000',1,?,'2026-08-21',
+                              '2026-08-21',0.8,?,1.05,?,'CLOSED',25)""",
+                    (frozen.isoformat(),frozen.isoformat(),frozen.isoformat()))
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            app.snapshot_positions([{'symbol':'QQQ260821C00570000','qty':'2','current_price':'1.5',
+                                     'unrealized_pl':'100','unrealized_plpc':'0.5'}])
+            response=app.app.test_client().get('/api/sleeve_history?days=1&end=2026-08-21')
+        self.assertEqual(response.status_code,200)
+        body=response.get_json()
+        orb=next(x for x in body['strategies'] if x['strategy_id']=='ORB')
+        self.assertEqual(orb['pnl'],{'realized':25.0,'unrealized':100.0,'total':125.0})
+        self.assertEqual(len(orb['contracts']),2)
+        opened=next(x for x in orb['contracts'] if x['status']=='OPEN')
+        self.assertEqual(opened['quantity'],{'activity':2,'broker':2.0})
+        self.assertEqual(opened['current_mark']['price'],1.5)
+        self.assertEqual(opened['fills']['entry']['price'],1.0)
+        self.assertEqual(len(opened['path']),1)
+        client=app.app.test_client()
+        self.assertEqual(client.get('/api/sleeve_history?days=31').status_code,400)
+        self.assertEqual(client.get(
+            '/api/sleeve_history?start=2026-07-01&end=2026-08-21').status_code,400)
+
+    def test_position_fallback_and_production_history_read_use_runner_sqlite(self):
+        self._wipe_option_marks(); self._wipe_trades()
+        first=app.datetime(2026,8,21,13,30,tzinfo=app.NY)
+        second=app.datetime(2026,8,21,13,31,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,trade_date,
+                       entry_fill,entry_filled_at,status)
+                       VALUES('MVR','SPY','PUT','SPY260821P00640000',1,'2026-08-21',0.5,?,'OPEN')""",
+                    (first.isoformat(),))
+        con.commit(); con.close()
+        stored={'symbol':'SPY260821P00640000','qty':'1','current_price':'0.7','unrealized_pl':'20'}
+        with mock.patch.object(app,'now_ny',return_value=first):
+            app.snapshot_positions([stored])
+        with mock.patch.object(app,'now_ny',return_value=second), \
+             mock.patch.object(app,'broker_positions',side_effect=RuntimeError('paper API down')):
+            fallback=app.snapshot_positions()
+            positions=app.app.test_client().get('/api/positions').get_json()
+        self.assertEqual(fallback[0]['symbol'],stored['symbol'])
+        self.assertEqual(fallback[0]['current_price'],stored['current_price'])
+        self.assertEqual(positions['source'],'runner_snapshot')
+        self.assertEqual(positions['positions'][0]['current_price'],'0.7')
+        with mock.patch.object(app,'ENVIRONMENT','production'), \
+             mock.patch.object(app,'PROCESS_ROLE','web'), \
+             mock.patch.object(app,'broker_positions',side_effect=AssertionError('web touched broker')):
+            response=app.app.test_client().get('/api/sleeve_history?days=1&end=2026-08-21')
+        self.assertEqual(response.status_code,200)
+        contract=response.get_json()['strategies'][0]['contracts'][0]
+        self.assertEqual(contract['current_mark']['source'],'stored')
+        self.assertEqual(contract['current_mark']['mark_at'],first.isoformat())
 
     def test_dashboard_omits_unknown_closed_pnl_from_every_aggregate(self):
         self._wipe_trades(); app._MEM_CACHE.clear()

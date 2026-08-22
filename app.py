@@ -60,6 +60,7 @@ RETRYABLE_SIGNAL_STATUSES=('ERROR','SKIP_DNT','SKIP_STALE_QUOTE','SKIP_DAILY_CAP
                            'SKIP_CHECKLIST','SKIP_NO_0DTE','SKIP_NO_CONTRACT','SKIP_BP','SKIP_OPPOSITE','SKIP_GUEST')
 PENDING_SIGNAL_STALE_SEC=120
 DESK_WINDOW_DAYS=30
+OPTION_MARK_RETENTION_DAYS=30
 _HIST_THREAD=None
 NOTES=ROOT/'notes.md'
 BACKUP_DIR=DATA/'backups'
@@ -628,6 +629,14 @@ def init_db():
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, trade_date TEXT, ticker TEXT,
       bid REAL, ask REAL, last REAL, bid_sz REAL, ask_sz REAL, payload TEXT
     );
+    CREATE TABLE IF NOT EXISTS option_mark_snapshots(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, mark_ts TEXT NOT NULL,
+      trade_date TEXT, trade_id INTEGER NOT NULL, strategy_id TEXT NOT NULL, ticker TEXT,
+      option_symbol TEXT NOT NULL, activity_qty INTEGER, broker_qty REAL, side TEXT,
+      mark REAL, market_value REAL, cost_basis REAL, unrealized_pl REAL,
+      unrealized_plpc REAL, avg_entry_price REAL, source TEXT NOT NULL,
+      UNIQUE(trade_id,ts)
+    );
     CREATE TABLE IF NOT EXISTS midday_evals(
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, trade_date TEXT, strategy_id TEXT,
       ticker TEXT, window TEXT, eligible INTEGER, direction TEXT, score REAL, reason TEXT, metrics TEXT,
@@ -649,6 +658,9 @@ def init_db():
     );
     CREATE INDEX IF NOT EXISTS idx_live_bars_lookup ON live_bars(trade_date, ticker, timeframe, t);
     CREATE INDEX IF NOT EXISTS idx_live_quotes_lookup ON live_quotes(trade_date, ticker, ts);
+    CREATE INDEX IF NOT EXISTS idx_option_marks_ts ON option_mark_snapshots(ts);
+    CREATE INDEX IF NOT EXISTS idx_option_marks_sleeve ON option_mark_snapshots(strategy_id, trade_id, ts);
+    CREATE INDEX IF NOT EXISTS idx_option_marks_contract ON option_mark_snapshots(option_symbol, ts);
     ''')
     def addcol(table,col,spec):
         names={r[1] for r in con.execute(f'PRAGMA table_info({table})')}
@@ -1674,20 +1686,171 @@ def live_or_stored_account():
         return stored_account()
 
 def snapshot_positions(rows=None):
-    rows=broker_positions() if rows is None else rows
+    ts=now_ny().isoformat()
+    source='broker'
+    mark_ts=ts
+    if rows is None:
+        try:
+            rows=broker_positions()
+        except Exception:
+            stored=stored_positions_payload()
+            rows=stored['rows']
+            mark_ts=stored.get('snapshot_at') or ts
+            source='stored'
     safe=[]
     for x in rows or []:
         safe.append({k:x.get(k) for k in ('symbol','qty','side','market_value','cost_basis',
                     'unrealized_pl','unrealized_plpc','current_price','avg_entry_price','change_today')})
-    meta_set('positions_snapshot',json.dumps({'rows':safe,'snapshot_at':now_ny().isoformat()},default=str))
+    if source=='broker':
+        meta_set('positions_snapshot',json.dumps({'rows':safe,'snapshot_at':ts},default=str))
+    by_symbol={x.get('symbol'):x for x in safe if x.get('symbol')}
+    con=db()
+    trades=[dict(x) for x in con.execute(
+        f"""SELECT id,trade_date,strategy_id,ticker,option_symbol,qty FROM trades
+            WHERE status IN ({_sql_in(OPEN_TRADE_STATUSES)}) AND IFNULL(option_symbol,'')!=''""",
+        OPEN_TRADE_STATUSES).fetchall()]
+    def number(value):
+        try: return float(value) if value not in (None,'') else None
+        except (TypeError,ValueError): return None
+    for tr in trades:
+        p=by_symbol.get(tr['option_symbol']) or {}
+        con.execute(
+            '''INSERT OR IGNORE INTO option_mark_snapshots(
+                 ts,mark_ts,trade_date,trade_id,strategy_id,ticker,option_symbol,activity_qty,
+                 broker_qty,side,mark,market_value,cost_basis,unrealized_pl,unrealized_plpc,
+                 avg_entry_price,source)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+            (ts,mark_ts,tr.get('trade_date'),tr['id'],tr['strategy_id'],tr.get('ticker'),
+             tr['option_symbol'],tr.get('qty'),number(p.get('qty')),p.get('side'),
+             number(p.get('current_price')),number(p.get('market_value')),number(p.get('cost_basis')),
+             number(p.get('unrealized_pl')),number(p.get('unrealized_plpc')),
+             number(p.get('avg_entry_price')),source))
+    con.execute('DELETE FROM option_mark_snapshots WHERE ts<?',
+                ((now_ny()-timedelta(days=OPTION_MARK_RETENTION_DAYS)).isoformat(),))
+    con.commit(); con.close()
     return safe
 
-def stored_positions():
+def stored_positions_payload():
     try:
         value=json.loads(meta_get('positions_snapshot') or '{}')
-        return value.get('rows') or []
+        rows=value.get('rows') or []
+        return {'rows':rows if isinstance(rows,list) else [],
+                'snapshot_at':value.get('snapshot_at')}
     except Exception:
-        return []
+        return {'rows':[],'snapshot_at':None}
+
+def stored_positions():
+    return stored_positions_payload()['rows']
+
+def sleeve_history_range(args):
+    """Inclusive New York dates, capped to the snapshot retention window."""
+    today=now_ny().date()
+    raw_days=args.get('days')
+    try:
+        days=int(raw_days or 7)
+    except (TypeError,ValueError):
+        raise ValueError('days must be an integer')
+    if not 1<=days<=OPTION_MARK_RETENTION_DAYS:
+        raise ValueError(f'days must be between 1 and {OPTION_MARK_RETENTION_DAYS}')
+    try:
+        end=date_cls.fromisoformat(args.get('end')) if args.get('end') else today
+        start=date_cls.fromisoformat(args.get('start')) if args.get('start') else end-timedelta(days=days-1)
+    except (TypeError,ValueError):
+        raise ValueError('start and end must be ISO dates')
+    if end<start:
+        raise ValueError('end must be on or after start')
+    span=(end-start).days+1
+    if span>OPTION_MARK_RETENTION_DAYS:
+        raise ValueError(f'range cannot exceed {OPTION_MARK_RETENTION_DAYS} days')
+    return start,end,span
+
+def sleeve_history_payload(args):
+    start,end,span=sleeve_history_range(args)
+    start_s=start.isoformat()
+    end_exclusive=(end+timedelta(days=1)).isoformat()
+    con=db()
+    marks=[dict(x) for x in con.execute(
+        '''SELECT * FROM option_mark_snapshots
+           WHERE ts>=? AND ts<? ORDER BY strategy_id,trade_id,ts,id''',
+        (start_s,end_exclusive)).fetchall()]
+    mark_trade_ids={int(x['trade_id']) for x in marks}
+    params=[*OPEN_TRADE_STATUSES,start_s,end_exclusive,start_s,end_exclusive]
+    trade_sql=f"""SELECT * FROM trades
+                  WHERE status IN ({_sql_in(OPEN_TRADE_STATUSES)})
+                     OR (IFNULL(trade_date,'')>=? AND IFNULL(trade_date,'')<?)
+                     OR (IFNULL(substr(exit_filled_at,1,10),'')>=?
+                         AND IFNULL(substr(exit_filled_at,1,10),'')<?)"""
+    if mark_trade_ids:
+        trade_sql+=f" OR id IN ({_sql_in(mark_trade_ids)})"
+        params.extend(sorted(mark_trade_ids))
+    trade_sql+=' ORDER BY strategy_id,id'
+    trades=[dict(x) for x in con.execute(trade_sql,params).fetchall()]
+    con.close()
+    paths={}
+    for m in marks:
+        paths.setdefault(int(m['trade_id']),[]).append({
+            'captured_at':m['ts'],'mark_at':m['mark_ts'],'source':m['source'],
+            'mark':m['mark'],'activity_qty':m['activity_qty'],'broker_qty':m['broker_qty'],
+            'market_value':m['market_value'],'cost_basis':m['cost_basis'],
+            'unrealized_pl':m['unrealized_pl'],'unrealized_plpc':m['unrealized_plpc'],
+        })
+    names={s['id']:s['name'] for s in STRATEGIES}
+    grouped={}
+    for tr in trades:
+        sid=tr.get('strategy_id') or 'UNKNOWN'
+        sleeve=grouped.setdefault(sid,{
+            'strategy_id':sid,'strategy_name':names.get(sid,sid),
+            'pnl':{'realized':0.0,'unrealized':0.0,'total':0.0},
+            'contracts':[],
+        })
+        path=paths.get(int(tr['id']),[])
+        latest=path[-1] if path else None
+        current_mark=(None if not latest else {
+            'price':latest['mark'],'mark_at':latest['mark_at'],
+            'captured_at':latest['captured_at'],'source':latest['source'],
+        })
+        realized=float(tr.get('pnl') or 0) if tr.get('status')=='CLOSED' and tr.get('pnl') is not None else 0.0
+        unrealized=0.0
+        has_unrealized=False
+        if tr.get('status') in OPEN_TRADE_STATUSES and latest:
+            if latest.get('mark') is not None and tr.get('entry_fill') is not None:
+                unrealized=option_pnl(tr.get('entry_fill'),latest['mark'],tr.get('qty')) or 0.0
+                has_unrealized=True
+            elif latest.get('unrealized_pl') is not None:
+                unrealized=float(latest['unrealized_pl'])
+                has_unrealized=True
+        sleeve['pnl']['realized']+=realized
+        sleeve['pnl']['unrealized']+=unrealized
+        sleeve['contracts'].append({
+            'trade_id':tr['id'],'ticker':tr.get('ticker'),'direction':tr.get('direction'),
+            'option_symbol':tr.get('option_symbol'),'status':tr.get('status'),
+            'trade_date':tr.get('trade_date'),'expiry':tr.get('expiry'),
+            'quantity':{
+                'activity':tr.get('qty'),
+                'broker':latest.get('broker_qty') if latest else None,
+            },
+            'fills':{
+                'entry':{'price':tr.get('entry_fill'),'filled_at':tr.get('entry_filled_at')},
+                'exit':{'price':tr.get('exit_fill'),'filled_at':tr.get('exit_filled_at')},
+            },
+            'current_mark':current_mark,
+            'pnl':{
+                'realized':realized if tr.get('status')=='CLOSED' else None,
+                'unrealized':unrealized if has_unrealized else None,
+            },
+            'path':path,
+        })
+    strategies=[]
+    for sleeve in grouped.values():
+        sleeve['pnl']={k:round(v,2) for k,v in sleeve['pnl'].items()}
+        sleeve['pnl']['total']=round(sleeve['pnl']['realized']+sleeve['pnl']['unrealized'],2)
+        strategies.append(sleeve)
+    strategies.sort(key=lambda x:x['strategy_id'])
+    return {
+        'range':{'start':start_s,'end':end.isoformat(),'days':span,
+                 'max_days':OPTION_MARK_RETENTION_DAYS,'timezone':str(NY)},
+        'as_of':now_ny().isoformat(),'source':'runner_sqlite','strategies':strategies,
+    }
 
 def balance_curve(days=None):
     cutoff=desk_cutoff(days)
@@ -3298,9 +3461,16 @@ def positions():
             rows.append({k:x.get(k) for k in ("symbol","qty","side","market_value","cost_basis",
                                               "unrealized_pl","unrealized_plpc","current_price",
                                               "avg_entry_price","change_today")})
-        return jsonify({"positions":rows})
+        return jsonify({"positions":rows,"source":"broker"})
     except Exception as e:
-        return jsonify({"positions":[],"error":str(e)})
+        return jsonify({"positions":stored_positions(),"source":"runner_snapshot","error":str(e)})
+
+@app.get('/api/sleeve_history')
+def sleeve_history():
+    try:
+        return jsonify(sleeve_history_payload(request.args))
+    except ValueError as e:
+        return jsonify({'error':str(e)}),400
 
 @app.get('/api/market_chart/<sym>')
 def market_chart(sym):
@@ -3912,7 +4082,8 @@ def trade_board():
     pos={}
     try:
         for x in broker_positions(): pos[x.get('symbol')]=x
-    except Exception: pass
+    except Exception:
+        for x in stored_positions(): pos[x.get('symbol')]=x
     packs=[build_trade_pack(r,pos) for r in rows]
     packs.sort(key=lambda p:(0 if p['trade'].get('status') in ('OPEN','ENTRY_SUBMITTED','EXIT_SUBMITTED') else 1, -(p['trade'].get('id') or 0)))
     out={'trades':packs}; mem_set('ui:board',out); return jsonify(out)
@@ -3924,7 +4095,8 @@ def trade_chart(tid):
     pos={}
     try:
         for x in broker_positions(): pos[x.get('symbol')]=x
-    except Exception: pass
+    except Exception:
+        for x in stored_positions(): pos[x.get('symbol')]=x
     return jsonify(build_trade_pack(dict(tr),pos))
 @app.get('/api/signals')
 def signals():
