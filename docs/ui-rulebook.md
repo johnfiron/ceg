@@ -12,6 +12,16 @@ ASH is a **session research terminal on a phone first**, then tablet/LAN. Home m
 
 Stack today: one Flask page, inline CSS, 2D canvas (no Chart.js/D3), HTML bars for progress/pareto. Keep that stack unless a later research pass replaces it.
 
+### Shipped desk hierarchy
+
+- **Home:** session explanation → session total → fixed account equity path → closest setup → open sleeves/exits → disclosed evidence.
+- **Charts:** one ticker, one time window, paired price/volume, then trades on that tape. Resolution changes do not replace time isolation.
+- **Activity:** as-of/window/count → open → closed → failed/incomplete → disclosed reconciliation, debrief, signals, and events.
+- **Models / Replay / Lab:** understanding first, playback second, research density behind purpose-based disclosures.
+- **Settings:** health/capability → integrity → preferences → notifications → disclosed intro and backups.
+
+Page stacks own spacing. Panels are surfaces, not layout spacers. Use the structural `--space-*`, `--surface-*`, `--border-*`, and `--radius-*` aliases; do not reintroduce panel bottom margins or ad-hoc 10px rhythm.
+
 Readable numbers and honest graphs sit **inside** the look the product already chose. Do not restyle toward Material, Linear-cyan, or Bloomberg neon. Do not strip the atmosphere to look “more professional.”
 
 ---

@@ -25,7 +25,13 @@ def load_plan(days):
     )
     if not isinstance(orders,list):
         raise RuntimeError('Alpaca returned an invalid order list')
-    return broker_ledger_repair_plan(orders)
+    activities=getj(
+        paper_api_url('/account/activities/OPEXP'),ah(),
+        {'after':after,'direction':'asc','page_size':100},timeout=30,
+    )
+    if not isinstance(activities,list):
+        raise RuntimeError('Alpaca returned an invalid expiration activity list')
+    return broker_ledger_repair_plan(orders,activities)
 
 
 def fingerprint(plan):

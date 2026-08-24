@@ -50,7 +50,8 @@ MD='https://data.alpaca.markets'
 FRED='https://api.stlouisfed.org/fred'
 TICKERS=['SPY','QQQ','IWM']
 MIDDAY_TICKERS=['SPY','QQQ','IWM','AAPL','MSFT','NVDA','AMD','TSLA','META','AMZN']
-ALL_TICKERS=list(dict.fromkeys(TICKERS+MIDDAY_TICKERS))
+READING_TICKERS=['AVGO','GOOGL','NFLX','JPM','BAC','XOM','COIN','PLTR','SMH','DIA']
+ALL_TICKERS=list(dict.fromkeys(TICKERS+MIDDAY_TICKERS+READING_TICKERS))
 EOD_STRATEGY_IDS=['CEG','VCT','XED','LAR','RSI2','BB','MACD','DON','STO','KEL']
 MIDDAY_STRATEGY_IDS=['OPN','OSF','ORB','VRC','MVR']
 OPEN_TRADE_STATUSES=('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED')
@@ -83,6 +84,24 @@ STRATEGIES=[
  {'id':'VRC','name':'VWAP Reclaim','origin':'New midday','author':'Trend continuation','session':'10:30-13:00','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Ride a reclaim of session VWAP rather than fading a stretch. ATM 0DTE.','plain':'Opposite of MVR. If price spent time on one side of VWAP and then reclaims it with volume, go with the reclaim (CALL reclaim from below, PUT lose VWAP from above).'},
  {'id':'MVR','name':'Midday VWAP Reversion','origin':'New midday','author':'Intraday session','session':'11:00-14:30','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Fade a 5-min RSI extreme stretched from session VWAP; ATM same-day option so a VWAP snapback can show in P&L.','plain':'Mean-reversion sleeve. Only when stretched ≥1.25 ATR from VWAP and 5-min RSI is extreme. Today’s 2¢ 0DTEs did not express this; ATM is the point of the style.'},
 ]
+STRATEGY_VERSIONS={s['id']:'1.0.0' for s in STRATEGIES}
+PREDICTION_MODELS={
+ 'CEG':(.004,.012,'one trading session','Close back through the washout low'),
+ 'VCT':(.003,.009,'one trading session','Close below the reversal-tail low'),
+ 'XED':(.003,.009,'one trading session','Cross-index divergence converges against the trade'),
+ 'LAR':(.003,.010,'one trading session','Price loses the absorbed late-day low'),
+ 'RSI2':(.0025,.008,'one trading session','Price closes below the pullback low'),
+ 'BB':(.003,.010,'one trading session','Price extends away from the Bollinger mean'),
+ 'MACD':(.003,.010,'one trading session','MACD crosses back through its signal'),
+ 'DON':(.004,.012,'one trading session','Price closes back inside the prior channel'),
+ 'STO':(.003,.009,'one trading session','Stochastic reverses back through its trigger'),
+ 'KEL':(.004,.012,'one trading session','Price closes back inside the Keltner channel'),
+ 'OPN':(.002,.007,'30–120 minutes','Price crosses back through the prior close'),
+ 'OSF':(.002,.007,'30–120 minutes','Price reclaims the failed opening drive'),
+ 'ORB':(.002,.008,'30–180 minutes','Price closes back inside the opening range'),
+ 'VRC':(.002,.006,'30–150 minutes','Price closes back across VWAP'),
+ 'MVR':(.002,.006,'30–120 minutes','VWAP stretch extends by 0.4 ATR'),
+}
 
 def now_ny(): return datetime.now(NY)
 
@@ -449,11 +468,128 @@ def greeks_snap(S,K,expiry,mid,direction):
     call=str(direction).upper()!='PUT'
     iv=implied_vol(float(S),float(K),T,float(mid or 0),call)
     if not iv:
-        return {'iv':None,'delta':None,'gamma':None,'t_years':round(T,6)}
+        return {'iv':None,'delta':None,'gamma':None,'theta':None,'vega':None,'t_years':round(T,6)}
     d1=(math.log(float(S)/float(K))+(0.045+0.5*iv*iv)*T)/(iv*math.sqrt(T))
+    d2=d1-iv*math.sqrt(T)
     delta=_ncdf(d1) if call else _ncdf(d1)-1
     gamma=_npdf(d1)/(float(S)*iv*math.sqrt(T))
-    return {'iv':iv,'delta':round(delta,4),'gamma':round(gamma,6),'t_years':round(T,6)}
+    vega=float(S)*_npdf(d1)*math.sqrt(T)/100.0
+    carry=(0.045*float(K)*math.exp(-0.045*T)*(_ncdf(d2) if call else _ncdf(-d2)))
+    theta=(-(float(S)*_npdf(d1)*iv)/(2*math.sqrt(T))-carry)/365.0 if call else (
+           -(float(S)*_npdf(d1)*iv)/(2*math.sqrt(T))+carry)/365.0
+    return {'iv':iv,'delta':round(delta,4),'gamma':round(gamma,6),
+            'theta':round(theta,4),'vega':round(vega,4),'t_years':round(T,6)}
+
+OCC_RE=re.compile(r'^([A-Z0-9.]{1,8})(\d{6})([CP])(\d{8})$')
+
+def parse_occ_symbol(symbol):
+    """Parse Alpaca/OCC compact option symbols without guessing malformed rows."""
+    raw=str(symbol or '').strip().upper()
+    m=OCC_RE.fullmatch(raw)
+    if not m:
+        return {'raw':raw,'valid':False,'underlying':None,'type':None,'strike':None,'expiry':None}
+    try:
+        expiry=datetime.strptime(m.group(2),'%y%m%d').date().isoformat()
+        strike=int(m.group(4))/1000.0
+    except (TypeError,ValueError):
+        return {'raw':raw,'valid':False,'underlying':None,'type':None,'strike':None,'expiry':None}
+    return {'raw':raw,'valid':True,'underlying':m.group(1),
+            'type':'CALL' if m.group(3)=='C' else 'PUT','strike':strike,'expiry':expiry}
+
+def contract_identity(tr):
+    parsed=parse_occ_symbol((tr or {}).get('option_symbol'))
+    direction=(tr or {}).get('direction') or parsed.get('type')
+    strike=parsed.get('strike')
+    expiry=str((tr or {}).get('expiry') or parsed.get('expiry') or '')[:10] or None
+    ticker=(tr or {}).get('ticker') or parsed.get('underlying')
+    return {
+        'ticker':ticker,'type':direction,'arrow':'↓' if direction=='PUT' else '↑' if direction=='CALL' else '',
+        'strike':strike,'expiry':expiry,'occ_symbol':parsed.get('raw'),'occ_valid':parsed.get('valid'),
+        'label':f"{ticker or '—'} · {direction or 'OPTION'} {'↓' if direction=='PUT' else '↑' if direction=='CALL' else ''}".strip(),
+    }
+
+def option_value_state(direction, strike, spot, mark=None, atm_threshold=0.001):
+    try:
+        strike=float(strike); spot=float(spot)
+    except (TypeError,ValueError):
+        return {'state':None,'distance_value':None,'distance_pct':None,'intrinsic':None,'extrinsic':None}
+    if not spot:
+        return {'state':None,'distance_value':None,'distance_pct':None,'intrinsic':None,'extrinsic':None}
+    signed=(spot-strike) if str(direction).upper()=='CALL' else (strike-spot)
+    distance_pct=abs(spot-strike)/spot
+    state='ATM' if distance_pct<=atm_threshold else ('ITM' if signed>0 else 'OTM')
+    intrinsic=max(0.0,signed)
+    try: extrinsic=max(0.0,float(mark)-intrinsic) if mark not in (None,'') else None
+    except (TypeError,ValueError): extrinsic=None
+    return {'state':state,'distance_value':round(abs(spot-strike),4),
+            'distance_pct':round(distance_pct,6),'intrinsic':round(intrinsic,4),
+            'extrinsic':round(extrinsic,4) if extrinsic is not None else None}
+
+def _json_obj(value, fallback=None):
+    if isinstance(value,(dict,list)): return value
+    try: return json.loads(value) if value else (fallback if fallback is not None else {})
+    except (TypeError,ValueError,json.JSONDecodeError): return fallback if fallback is not None else {}
+
+def trade_audit(trade_id, code, summary='', payload=None, source='ASH', ts=None, con=None):
+    own=con is None; con=con or db()
+    con.execute('''INSERT INTO trade_audit_events(trade_id,ts,code,source,summary,payload)
+                   VALUES(?,?,?,?,?,?)''',
+                (int(trade_id),ts or now_ny().isoformat(),str(code),str(source),
+                 str(summary or '')[:240],json.dumps(payload or {},default=str)))
+    if own: con.commit(); con.close()
+
+def persist_trade_snapshot(trade_id, phase, *, source, spot=None, mark=None, quote=None,
+                           greeks=None, volume=None, open_interest=None, ts=None, payload=None, con=None):
+    quote=quote or {}; greeks=greeks or {}
+    own=con is None; con=con or db()
+    tr=con.execute('SELECT * FROM trades WHERE id=?',(int(trade_id),)).fetchone()
+    if not tr:
+        if own: con.close()
+        return None
+    tr=dict(tr); ident=contract_identity(tr)
+    state=option_value_state(ident.get('type'),ident.get('strike'),spot,mark)
+    bid=quote.get('bid'); ask=quote.get('ask'); spread=quote.get('spread')
+    if spread is None and bid not in (None,'') and ask not in (None,''):
+        try: spread=float(ask)-float(bid)
+        except (TypeError,ValueError): spread=None
+    mid=None
+    try: mid=(float(bid)+float(ask))/2 if bid not in (None,'') and ask not in (None,'') else None
+    except (TypeError,ValueError): mid=None
+    spread_pct=(float(spread)/mid) if spread is not None and mid else None
+    stamp=ts or now_ny().isoformat()
+    cur=con.execute('''INSERT OR IGNORE INTO trade_snapshots(
+      trade_id,phase,ts,source,underlying_price,option_mark,bid,ask,spread,spread_pct,
+      quote_ts,quote_age_sec,volume,open_interest,moneyness,distance_value,distance_pct,
+      intrinsic,extrinsic,iv,delta,gamma,theta,vega,payload)
+      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+      (int(trade_id),str(phase).upper(),stamp,str(source),spot,mark,bid,ask,spread,spread_pct,
+       quote.get('ts'),quote.get('age_sec'),volume,open_interest,state.get('state'),
+       state.get('distance_value'),state.get('distance_pct'),state.get('intrinsic'),state.get('extrinsic'),
+       greeks.get('iv'),greeks.get('delta'),greeks.get('gamma'),greeks.get('theta'),greeks.get('vega'),
+       json.dumps(payload or {},default=str)))
+    if own: con.commit(); con.close()
+    return cur.lastrowid
+
+def capture_exit_snapshot(trade_id, source='BROKER', ts=None):
+    con=db(); row=con.execute('SELECT * FROM trades WHERE id=?',(int(trade_id),)).fetchone()
+    if not row:
+        con.close(); return
+    tr=dict(row); ident=contract_identity(tr); spot=None
+    try:
+        state=local_intraday_state(tr.get('ticker'),str(tr.get('exit_filled_at') or tr.get('trade_date') or '')[:10])
+        spot=(state or {}).get('c')
+    except Exception:
+        spot=None
+    mark=tr.get('exit_fill')
+    gk=greeks_snap(spot,ident.get('strike'),ident.get('expiry'),mark,ident.get('type')) if (
+        spot and ident.get('strike') and ident.get('expiry') and mark is not None) else {}
+    persist_trade_snapshot(trade_id,'EXIT',source=source,spot=spot,mark=mark,greeks=gk,
+                           ts=ts or tr.get('exit_filled_at') or now_ny().isoformat(),
+                           payload={'realized_pnl':tr.get('pnl'),'exit_kind':tr.get('exit_kind')},con=con)
+    trade_audit(trade_id,'EXIT_FILLED',f"Exit {money_number(mark)} · P&L {money_number(tr.get('pnl'))}",
+                {'exit_kind':tr.get('exit_kind'),'pnl':tr.get('pnl')},source=source,
+                ts=ts or tr.get('exit_filled_at'),con=con)
+    con.commit(); con.close()
 
 def parse_ny(ts):
     if not ts:return None
@@ -637,6 +773,31 @@ def init_db():
       unrealized_plpc REAL, avg_entry_price REAL, source TEXT NOT NULL,
       UNIQUE(trade_id,ts)
     );
+    CREATE TABLE IF NOT EXISTS trade_snapshots(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL, phase TEXT NOT NULL,
+      ts TEXT NOT NULL, source TEXT NOT NULL, underlying_price REAL, option_mark REAL,
+      bid REAL, ask REAL, spread REAL, spread_pct REAL, quote_ts TEXT, quote_age_sec REAL,
+      volume REAL, open_interest REAL, moneyness TEXT, distance_value REAL, distance_pct REAL,
+      intrinsic REAL, extrinsic REAL, iv REAL, delta REAL, gamma REAL, theta REAL, vega REAL,
+      payload TEXT, UNIQUE(trade_id,phase,ts)
+    );
+    CREATE TABLE IF NOT EXISTS trade_predictions(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL, kind TEXT NOT NULL,
+      ts TEXT NOT NULL, direction TEXT, horizon TEXT, confidence REAL, invalidation TEXT,
+      underlying_lo REAL, underlying_hi REAL, option_return_lo REAL, option_return_hi REAL,
+      target_premium_lo REAL, target_premium_hi REAL, expected_value REAL,
+      scenarios TEXT, model TEXT, payload TEXT
+    );
+    CREATE TABLE IF NOT EXISTS trade_candidates(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL, rank INTEGER,
+      option_symbol TEXT NOT NULL, strike REAL, expiry TEXT, dte INTEGER, selected INTEGER,
+      score REAL, grade TEXT, reason TEXT, components TEXT,
+      UNIQUE(trade_id,option_symbol)
+    );
+    CREATE TABLE IF NOT EXISTS trade_audit_events(
+      id INTEGER PRIMARY KEY AUTOINCREMENT, trade_id INTEGER NOT NULL, ts TEXT NOT NULL,
+      code TEXT NOT NULL, source TEXT NOT NULL, summary TEXT, payload TEXT
+    );
     CREATE TABLE IF NOT EXISTS midday_evals(
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, trade_date TEXT, strategy_id TEXT,
       ticker TEXT, window TEXT, eligible INTEGER, direction TEXT, score REAL, reason TEXT, metrics TEXT,
@@ -687,6 +848,17 @@ def init_db():
     addcol('trades','scaled_qty','INTEGER')
     addcol('trades','ab_book','TEXT')
     addcol('trades','greeks','TEXT')
+    addcol('trades','origin','TEXT')
+    addcol('trades','strategy_version','TEXT')
+    addcol('trades','parameter_hash','TEXT')
+    addcol('trades','fees','REAL')
+    addcol('trades','slippage','REAL')
+    addcol('trades','modeled_slippage','REAL')
+    addcol('trades','actual_slippage','REAL')
+    addcol('trades','costs_source','TEXT')
+    addcol('trades','exit_bid','REAL')
+    addcol('trades','exit_ask','REAL')
+    addcol('trades','exit_spread','REAL')
     addcol('events','seen','INTEGER')
     addcol('events','code','TEXT')
     con.execute('''CREATE TABLE IF NOT EXISTS lab_snapshots(
@@ -708,6 +880,10 @@ def init_db():
     con.execute('CREATE INDEX IF NOT EXISTS idx_trades_dates ON trades(trade_date, status, exit_filled_at)')
     con.execute('CREATE INDEX IF NOT EXISTS idx_desk_comments_target ON desk_comments(target_type, target_id)')
     con.execute('CREATE INDEX IF NOT EXISTS idx_desk_comments_date ON desk_comments(trade_date)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_trade_snapshots_trade ON trade_snapshots(trade_id,phase,ts)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_trade_predictions_trade ON trade_predictions(trade_id,ts)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_trade_candidates_trade ON trade_candidates(trade_id,rank)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_trade_audit_trade ON trade_audit_events(trade_id,ts,id)')
     _seed_trade_comments(con)
     con.commit(); con.close()
     _log_split_development_ledger()
@@ -1578,6 +1754,30 @@ def attach_broker_mark(d, pos=None):
         d['unrealized_plpc']=None
     return d
 
+def trade_summary(tr):
+    d=dict(tr or {}); ident=contract_identity(d); st=d.get('status')
+    if st in OPEN_TRADE_STATUSES:
+        availability='FRESH' if d.get('mark') is not None else 'NO_BROKER_QUOTE'
+        pnl=d.get('unrealized_pl')
+    elif d.get('exit_kind')=='EXPIRED':
+        availability='EXPIRED'; pnl=d.get('pnl')
+    elif st=='CLOSED':
+        availability='CLOSED'; pnl=d.get('pnl')
+    else:
+        availability='NOT_CAPTURED'; pnl=d.get('pnl')
+    d['identity']=ident
+    d['display_contract']=f"{money_number(ident.get('strike'))} · {ident.get('expiry') or 'expiry unknown'}"
+    d['availability']={'mark':availability,'reason':availability.replace('_',' ').title()}
+    d['display_pnl']=pnl
+    return d
+
+def money_number(value):
+    try:
+        n=float(value)
+        return f"${n:,.0f}" if n.is_integer() else f"${n:,.2f}"
+    except (TypeError,ValueError):
+        return '—'
+
 def desk_cutoff(days=None):
     days=int(days if days is not None else DESK_WINDOW_DAYS)
     days=max(1,min(days,365))
@@ -1617,8 +1817,325 @@ def desk_trades(days=None, pos=None):
     for r in rows:
         item=attach_broker_mark(dict(r), pos)
         item['dates']=trade_date_fields(item)
-        out.append(item)
+        out.append(trade_summary(item))
     return out,cutoff
+
+def underlying_beta(symbol, through_date=None, sessions=60):
+    """Rolling close-to-close beta sourced from the local Alpaca daily cache."""
+    symbol=str(symbol or '').upper()
+    if not symbol: return {'value':None,'source':'NOT_CAPTURED','as_of':None,'sessions':0}
+    if symbol=='SPY':
+        return {'value':1.0,'source':'ALPACA_DAILY_CLOSE_60S_VS_SPY','as_of':through_date,'sessions':sessions}
+    end=str(through_date or now_ny().date().isoformat())[:10]
+    start=(date_cls.fromisoformat(end)-timedelta(days=max(180,sessions*3))).isoformat()
+    asset=load_local_bars_since(symbol,'1Day',start)
+    bench=load_local_bars_since('SPY','1Day',start)
+    def closes(rows):
+        out={}
+        for row in rows:
+            day=str(row.get('t') or '')[:10]
+            if day and day<=end and row.get('c') not in (None,''): out[day]=float(row['c'])
+        return out
+    a,b=closes(asset),closes(bench)
+    days=sorted(set(a)&set(b))
+    pairs=[]
+    for prev,cur in zip(days,days[1:]):
+        if a.get(prev) and b.get(prev):
+            pairs.append((a[cur]/a[prev]-1,b[cur]/b[prev]-1,cur))
+    pairs=pairs[-sessions:]
+    if len(pairs)<20:
+        return {'value':None,'source':'ALPACA_DAILY_CLOSE_60S_VS_SPY','as_of':pairs[-1][2] if pairs else None,
+                'sessions':len(pairs),'reason':'INSUFFICIENT_OVERLAP'}
+    ar=[x[0] for x in pairs]; br=[x[1] for x in pairs]
+    bm=sum(br)/len(br); am=sum(ar)/len(ar)
+    variance=sum((x-bm)**2 for x in br)
+    beta=sum((x-am)*(y-bm) for x,y in zip(ar,br))/variance if variance else None
+    return {'value':round(beta,4) if beta is not None else None,'source':'ALPACA_DAILY_CLOSE_60S_VS_SPY',
+            'as_of':pairs[-1][2],'sessions':len(pairs)}
+
+def execution_costs(tr, entry_order=None, exit_order=None):
+    qty=int((tr or {}).get('qty') or 1); multiplier=100
+    def mid(bid,ask):
+        try: return (float(bid)+float(ask))/2
+        except (TypeError,ValueError): return None
+    entry_mid=mid(tr.get('entry_bid'),tr.get('entry_ask'))
+    exit_mid=mid(tr.get('exit_bid'),tr.get('exit_ask'))
+    modeled=0.0; modeled_parts=0
+    for spread in (tr.get('entry_spread'),tr.get('exit_spread')):
+        try: modeled+=max(0,float(spread))/2*qty*multiplier; modeled_parts+=1
+        except (TypeError,ValueError): pass
+    actual=0.0; actual_parts=0
+    try:
+        if entry_mid is not None and tr.get('entry_fill') is not None:
+            actual+=max(0,float(tr['entry_fill'])-entry_mid)*qty*multiplier; actual_parts+=1
+    except (TypeError,ValueError): pass
+    try:
+        if exit_mid is not None and tr.get('exit_fill') is not None:
+            actual+=max(0,exit_mid-float(tr['exit_fill']))*qty*multiplier; actual_parts+=1
+    except (TypeError,ValueError): pass
+    fees=None
+    fee_values=[]
+    for order in (entry_order,exit_order):
+        if not order: continue
+        value=order.get('commission')
+        if value is None: value=order.get('fee')
+        if value is not None:
+            try: fee_values.append(float(value))
+            except (TypeError,ValueError): pass
+    if fee_values: fees=sum(fee_values)
+    elif entry_order or exit_order: fees=0.0
+    return {'modeled_slippage':round(modeled,2) if modeled_parts else None,
+            'actual_slippage':round(actual,2) if actual_parts else None,
+            'fees':round(fees,2) if fees is not None else None,
+            'source':'BROKER_ORDER_AND_CAPTURED_NBBO' if entry_order or exit_order else 'CAPTURED_NBBO'}
+
+def pnl_reconciliation(trades=None, session_date=None, account=None):
+    rows=list(trades or [])
+    session_date=session_date or now_ny().date().isoformat()
+    selected=[t for t in rows if t.get('status') in OPEN_TRADE_STATUSES
+              or str(t.get('trade_date') or '')[:10]==session_date
+              or realized_date(t)==session_date]
+    realized=sum(float(t.get('pnl') or 0) for t in selected if t.get('status')=='CLOSED')
+    unrealized=sum(float(t.get('unrealized_pl') or 0) for t in selected if t.get('status') in OPEN_TRADE_STATUSES)
+    fees=sum(float(t.get('fees') or 0) for t in selected)
+    slippage=sum(float(t.get('actual_slippage') if t.get('actual_slippage') is not None else t.get('slippage') or 0) for t in selected)
+    missing_costs=sum(1 for t in selected if t.get('fees') is None or (
+        t.get('actual_slippage') is None and t.get('slippage') is None))
+    total=realized+unrealized-fees-slippage
+    account=account or {}
+    broker_change=None
+    try: broker_change=float(account.get('equity'))-float(account.get('last_equity'))
+    except (TypeError,ValueError): pass
+    return {'session_date':session_date,'realized':round(realized,2),'unrealized':round(unrealized,2),
+            'fees':round(fees,2),'slippage':round(slippage,2),'session_total':round(total,2),
+            'account_daily_change':round(broker_change,2) if broker_change is not None else None,
+            'difference':round(broker_change-total,2) if broker_change is not None else None,
+            'formula':'realized + unrealized - fees - actual slippage',
+            'cost_capture':{'complete':bool(selected) and missing_costs==0,'missing_trades':missing_costs},
+            'difference_explanation':'Broker daily change may include positions outside Activity, prior-close mark changes, cash movements, and uncaptured legacy costs.'}
+
+def service_states():
+    clk=session_clock(); rh=runner_health(); ing=meta_get('last_ingest'); age=None
+    if ing:
+        dt=parse_ny(ing)
+        if dt: age=max(0,(now_ny()-dt).total_seconds())
+    broker='UNAVAILABLE'
+    snap=stored_positions_payload()
+    if snap.get('snapshot_at'): broker='SNAPSHOT'
+    if not WEB_READ_ONLY and cfg().get('alpaca_key') and cfg().get('alpaca_secret'): broker='CONNECTED'
+    return {
+        'market':clk.get('phase') or 'UNKNOWN',
+        'strategies':'SCANNING' if clk.get('current') else 'IDLE',
+        'session_scan':'PROCESSING' if age is not None and age<=90 else 'STALE' if ing else 'NOT_STARTED',
+        'broker':broker,
+        'broker_quotes':'FRESH' if age is not None and age<=90 else 'STALE' if ing else 'UNAVAILABLE',
+        'runner':'HEALTHY' if rh.get('ok') else 'STALE',
+    }
+
+def _strategy_record(strategy_id):
+    s=next((x for x in STRATEGIES if x.get('id')==strategy_id),{}) or {}
+    stable={k:s.get(k) for k in ('id','name','session','horizon','opt','desc')}
+    stable['thresholds']=thresh()
+    version=STRATEGY_VERSIONS.get(strategy_id,'legacy')
+    return {'id':strategy_id,'name':s.get('name') or strategy_id,'version':version,
+            'parameter_hash':hashlib.sha256(json.dumps(stable,sort_keys=True,default=str).encode()).hexdigest()[:12]}
+
+def prediction_snapshot(sig, strategy=None, *, spot=None, quote=None, greeks=None):
+    details=dict((sig or {}).get('details') or {})
+    pred=dict(details.get('prediction') or {})
+    sid=(strategy or {}).get('id') or (sig or {}).get('strategy_id')
+    model=PREDICTION_MODELS.get(sid,(.002,.006,'one trading session','Strategy trigger reverses'))
+    move_lo,move_hi,default_horizon,default_invalidation=model
+    sign=-1 if (sig or {}).get('direction')=='PUT' else 1
+    score=(sig or {}).get('score')
+    confidence=pred.get('confidence')
+    if confidence is None and score is not None:
+        try: confidence=round(max(.5,min(.8,.55+abs(float(score))*.08)),4)
+        except (TypeError,ValueError): confidence=None
+    invalidation=pred.get('invalidation') or details.get('invalidation') or default_invalidation
+    horizon=pred.get('horizon') or default_horizon
+    ulo=pred.get('underlying_lo')
+    uhi=pred.get('underlying_hi')
+    if ulo is None: ulo=round(sign*move_lo,6)
+    if uhi is None: uhi=round(sign*move_hi,6)
+    if float(ulo)>float(uhi): ulo,uhi=uhi,ulo
+    quote=quote or {}; greeks=greeks or {}
+    mid=None
+    try:
+        if quote.get('bid') is not None and quote.get('ask') is not None:
+            mid=(float(quote['bid'])+float(quote['ask']))/2
+    except (TypeError,ValueError): pass
+    option_lo=pred.get('option_return_lo'); option_hi=pred.get('option_return_hi')
+    target_lo=pred.get('target_premium_lo'); target_hi=pred.get('target_premium_hi')
+    scenarios=pred.get('scenarios') or []
+    if mid and spot:
+        try:
+            leverage=min(80.0,max(1.0,abs(float(greeks.get('delta') if greeks.get('delta') is not None else .5))*float(spot)/mid))
+            decay=.08 if (sig or {}).get('horizon')=='EOD' else .03
+            favorable=sorted((abs(float(ulo)),abs(float(uhi))))
+            if option_lo is None: option_lo=round(max(-.95,leverage*favorable[0]-decay),6)
+            if option_hi is None: option_hi=round(min(3.0,leverage*favorable[1]-decay),6)
+            if target_lo is None: target_lo=round(mid*(1+float(option_lo)),4)
+            if target_hi is None: target_hi=round(mid*(1+float(option_hi)),4)
+            if not scenarios:
+                scenarios=[
+                    {'name':'WRONG_WAY','underlying_return':round(-sign*move_hi,6),
+                     'option_return':round(max(-.95,-leverage*move_hi-decay),6)},
+                    {'name':'FLAT','underlying_return':0.0,'option_return':round(-decay,6)},
+                    {'name':'BASE','underlying_return':round(sign*(move_lo+move_hi)/2,6),
+                     'option_return':round(min(3.0,leverage*(move_lo+move_hi)/2-decay),6)},
+                    {'name':'FAVORABLE','underlying_return':round(sign*move_hi,6),
+                     'option_return':round(min(3.0,leverage*move_hi-decay),6)},
+                ]
+        except (TypeError,ValueError,ZeroDivisionError):
+            pass
+    return {
+        'ts':now_ny().isoformat(),'kind':'ENTRY','direction':(sig or {}).get('direction'),
+        'horizon':horizon,'confidence':confidence,'invalidation':invalidation,
+        'underlying_lo':ulo,'underlying_hi':uhi,
+        'option_return_lo':option_lo,'option_return_hi':option_hi,
+        'target_premium_lo':target_lo,'target_premium_hi':target_hi,
+        'expected_value':pred.get('expected_value'),'scenarios':scenarios,
+        'model':pred.get('model') or f'ash-expected-move/{sid}/v1',
+        'payload':{'signal_score':score,'details':details,
+                   'confidence_provenance':'RULE_STRENGTH_HEURISTIC_NOT_CALIBRATED_PROBABILITY',
+                   'strategy_version':(strategy or {}).get('version'),
+                   'parameter_hash':(strategy or {}).get('parameter_hash'),
+                   'pricing_method':'DELTA_LEVERAGE_WITH_FIXED_HORIZON_DECAY'},
+    }
+
+def persist_prediction(trade_id, pred, con=None):
+    own=con is None; con=con or db()
+    con.execute('''INSERT INTO trade_predictions(
+      trade_id,kind,ts,direction,horizon,confidence,invalidation,underlying_lo,underlying_hi,
+      option_return_lo,option_return_hi,target_premium_lo,target_premium_hi,expected_value,
+      scenarios,model,payload) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+      (int(trade_id),pred.get('kind') or 'ENTRY',pred.get('ts') or now_ny().isoformat(),
+       pred.get('direction'),pred.get('horizon'),pred.get('confidence'),pred.get('invalidation'),
+       pred.get('underlying_lo'),pred.get('underlying_hi'),pred.get('option_return_lo'),
+       pred.get('option_return_hi'),pred.get('target_premium_lo'),pred.get('target_premium_hi'),
+       pred.get('expected_value'),json.dumps(pred.get('scenarios') or [],default=str),
+       pred.get('model'),json.dumps(pred.get('payload') or {},default=str)))
+    if own: con.commit(); con.close()
+
+def canonical_trade(trade_id, include_tape=False):
+    con=db(); row=con.execute('SELECT * FROM trades WHERE id=?',(int(trade_id),)).fetchone()
+    if not row:
+        con.close(); return None
+    try: pos={x.get('symbol'):x for x in broker_positions()}
+    except Exception: pos={}
+    tr=trade_summary(attach_broker_mark(dict(row), pos))
+    snapshots=[dict(x) for x in con.execute(
+        'SELECT * FROM trade_snapshots WHERE trade_id=? ORDER BY ts,id',(int(trade_id),)).fetchall()]
+    predictions=[dict(x) for x in con.execute(
+        'SELECT * FROM trade_predictions WHERE trade_id=? ORDER BY ts,id',(int(trade_id),)).fetchall()]
+    candidates=[dict(x) for x in con.execute(
+        'SELECT * FROM trade_candidates WHERE trade_id=? ORDER BY rank,id',(int(trade_id),)).fetchall()]
+    audits=[dict(x) for x in con.execute(
+        'SELECT * FROM trade_audit_events WHERE trade_id=? ORDER BY ts,id',(int(trade_id),)).fetchall()]
+    marks=[dict(x) for x in con.execute(
+        'SELECT * FROM option_mark_snapshots WHERE trade_id=? ORDER BY ts,id',(int(trade_id),)).fetchall()]
+    signal=con.execute('''SELECT * FROM signals WHERE strategy_id=? AND ticker=? AND trade_date=?
+                          ORDER BY ABS(julianday(ts)-julianday(?)) LIMIT 1''',
+                       (tr.get('strategy_id'),tr.get('ticker'),tr.get('trade_date'),tr.get('signal_ts'))).fetchone()
+    comments=[dict(x) for x in con.execute(
+        "SELECT * FROM desk_comments WHERE target_type='trade' AND target_id=? ORDER BY ts,id",
+        (str(trade_id),)).fetchall()]
+    con.close()
+    for collection in (snapshots,predictions,candidates,audits):
+        for item in collection:
+            for key in ('payload','components','scenarios'):
+                if key in item: item[key]=_json_obj(item.get(key),[] if key=='scenarios' else {})
+    ident=tr['identity']; entry=next((x for x in snapshots if x.get('phase')=='ENTRY'),None)
+    exit_snap=next((x for x in reversed(snapshots) if x.get('phase')=='EXIT'),None)
+    current=next((x for x in reversed(snapshots) if x.get('phase') in ('CURRENT','ENTRY')),entry)
+    latest_mark=marks[-1] if marks else None
+    if current is None and latest_mark:
+        current={'phase':'CURRENT','ts':latest_mark.get('ts'),'source':latest_mark.get('source'),
+                 'option_mark':latest_mark.get('mark'),'payload':{'availability':'PARTIAL'}}
+    pred_entry=next((x for x in predictions if x.get('kind')=='ENTRY'),None)
+    actual_return=None
+    if tr.get('entry_fill') not in (None,0) and tr.get('exit_fill') is not None:
+        actual_return=float(tr['exit_fill'])/float(tr['entry_fill'])-1
+    prediction_error={}
+    if pred_entry and tr.get('status')=='CLOSED':
+        lo,hi=pred_entry.get('option_return_lo'),pred_entry.get('option_return_hi')
+        prediction_error={'actual_option_return':actual_return,
+                          'option_range_hit':None if actual_return is None or lo is None or hi is None else float(lo)<=actual_return<=float(hi),
+                          'premium_error':None if actual_return is None or lo is None or hi is None else
+                                          round(actual_return-(float(lo)+float(hi))/2,6)}
+        entry_spot=(entry or {}).get('underlying_price') or tr.get('atm_spot')
+        exit_spot=(exit_snap or {}).get('underlying_price')
+        try: actual_move=float(exit_spot)/float(entry_spot)-1
+        except (TypeError,ValueError,ZeroDivisionError): actual_move=None
+        expected_direction=pred_entry.get('direction')
+        prediction_error['actual_underlying_move']=actual_move
+        prediction_error['direction_correct']=None if actual_move is None else (
+            actual_move<0 if expected_direction=='PUT' else actual_move>0)
+        ulo,uhi=pred_entry.get('underlying_lo'),pred_entry.get('underlying_hi')
+        if actual_move is not None and ulo is not None and uhi is not None:
+            ulo,uhi=sorted((float(ulo),float(uhi)))
+            prediction_error['magnitude_error']=round(
+                0.0 if ulo<=actual_move<=uhi else min(abs(actual_move-ulo),abs(actual_move-uhi)),6)
+    delta=(current or entry or {}).get('delta')
+    qty=int(tr.get('qty') or 1)
+    delta_equivalent=round(float(delta)*qty*100,2) if delta is not None else None
+    beta=underlying_beta(tr.get('ticker'))
+    beta_adjusted=(round(delta_equivalent*float(beta['value']),2)
+                   if delta_equivalent is not None and beta.get('value') is not None else None)
+    availability=tr.get('availability') or {}
+    if snapshots:
+        availability={**availability,'contract_intelligence':'CAPTURED'}
+    else:
+        availability={**availability,'contract_intelligence':'NOT_CAPTURED'}
+    payload={
+        'id':tr.get('id'),'status':tr.get('status'),'origin':tr.get('origin') or 'SYSTEM',
+        'identity':ident,
+        'strategy':{**_strategy_record(tr.get('strategy_id')),
+                    'version':tr.get('strategy_version') or _strategy_record(tr.get('strategy_id'))['version'],
+                    'parameter_hash':tr.get('parameter_hash') or _strategy_record(tr.get('strategy_id'))['parameter_hash']},
+        'signal':dict(signal) if signal else None,
+        'prediction':{'entry':pred_entry,'updates':[x for x in predictions if x is not pred_entry],
+                      'error':prediction_error},
+        'option':{'entry':entry,'current':current,'exit':exit_snap,'candidates':candidates,
+                  'history':[{'t':x.get('mark_ts') or x.get('ts'),'mark':x.get('mark'),
+                              'pnl':x.get('unrealized_pl'),'source':x.get('source')} for x in marks],
+                  'break_even':(ident.get('strike')+(tr.get('entry_fill') or 0)) if ident.get('type')=='CALL' and ident.get('strike') is not None and tr.get('entry_fill') is not None else
+                               (ident.get('strike')-(tr.get('entry_fill') or 0)) if ident.get('type')=='PUT' and ident.get('strike') is not None and tr.get('entry_fill') is not None else None},
+        'execution':{'entry_fill':tr.get('entry_fill'),'exit_fill':tr.get('exit_fill'),
+                     'entry_bid':tr.get('entry_bid'),'entry_ask':tr.get('entry_ask'),
+                     'entry_spread':tr.get('entry_spread'),
+                     'exit_bid':tr.get('exit_bid'),'exit_ask':tr.get('exit_ask'),
+                     'exit_spread':tr.get('exit_spread'),'fill_quality':fill_quality(tr),
+                     'fees':tr.get('fees'),'modeled_slippage':tr.get('modeled_slippage'),
+                     'actual_slippage':tr.get('actual_slippage'),'costs_source':tr.get('costs_source'),
+                     'checklist':_json_obj(tr.get('checklist'),{}),'latency_sec':None},
+        'position':{'quantity':qty,'multiplier':100,'mark':tr.get('mark') if tr.get('mark') is not None else (current or {}).get('option_mark'),
+                    'pnl':tr.get('display_pnl') if tr.get('display_pnl') is not None else tr.get('unrealized_pl'),
+                    'mfe':tr.get('mfe'),'mae':tr.get('mae'),
+                    'delta_equivalent_shares':delta_equivalent,
+                    'underlying_beta':beta,'beta_adjusted_equivalent_shares':beta_adjusted},
+        'risk':{'horizon':tr.get('horizon'),'exit_due_date':tr.get('exit_due_date'),
+                'premium_at_risk':round(float(tr.get('entry_fill') or 0)*100*qty,2)},
+        'outcome':{'realized_pnl':tr.get('pnl'),'return_pct':actual_return,
+                   'exit_kind':tr.get('exit_kind'),'hold_seconds':None},
+        'availability':availability,'audit':audits,'comments':comments,
+        'raw_trade':tr,
+    }
+    a,b=parse_ny(tr.get('signal_ts')),parse_ny(tr.get('entry_filled_at'))
+    if a and b: payload['execution']['latency_sec']=(b-a).total_seconds()
+    a,b=parse_ny(tr.get('entry_filled_at')),parse_ny(tr.get('exit_filled_at'))
+    if a and b:
+        hold=(b-a).total_seconds(); payload['outcome']['hold_seconds']=hold
+        if pred_entry:
+            nums=[float(x) for x in re.findall(r'\d+(?:\.\d+)?',str(pred_entry.get('horizon') or ''))[:2]]
+            if nums and 'min' in str(pred_entry.get('horizon') or '').lower():
+                lo=nums[0]*60; hi=(nums[1] if len(nums)>1 else nums[0])*60
+                prediction_error['timing_error_seconds']=round(0 if lo<=hold<=hi else min(abs(hold-lo),abs(hold-hi)),2)
+    if include_tape:
+        pack=build_trade_pack(tr,{})
+        payload['tape']={k:v for k,v in pack.items() if k not in ('trade',)}
+    return payload
 
 def stored_account():
     raw=meta_get('account_snapshot')
@@ -1725,6 +2242,24 @@ def snapshot_positions(rows=None):
              number(p.get('current_price')),number(p.get('market_value')),number(p.get('cost_basis')),
              number(p.get('unrealized_pl')),number(p.get('unrealized_plpc')),
              number(p.get('avg_entry_price')),source))
+        spot=None
+        try:
+            # CURRENT evidence follows today's tape even when the position was
+            # opened in an earlier session.
+            state=local_intraday_state(tr.get('ticker'),now_ny().date().isoformat())
+            spot=number((state or {}).get('c'))
+        except Exception:
+            spot=None
+        ident=contract_identity(tr)
+        mark=number(p.get('current_price'))
+        gk=greeks_snap(spot,ident.get('strike'),ident.get('expiry'),mark,ident.get('type')) if (
+            spot and ident.get('strike') and ident.get('expiry') and mark) else {}
+        persist_trade_snapshot(
+            tr['id'],'CURRENT',source=source.upper(),spot=spot,mark=mark,
+            quote={'ts':mark_ts},greeks=gk,ts=ts,
+            payload={'market_value':number(p.get('market_value')),
+                     'unrealized_pl':number(p.get('unrealized_pl')),
+                     'broker_qty':number(p.get('qty'))},con=con)
     con.execute('DELETE FROM option_mark_snapshots WHERE ts<?',
                 ((now_ny()-timedelta(days=OPTION_MARK_RETENTION_DAYS)).isoformat(),))
     con.commit(); con.close()
@@ -1881,6 +2416,35 @@ def latest_vix():
         except:pass
     out=vals[-1] if vals else (None,None)
     cache_set('fred:vix',list(out)); return out
+
+def latest_stock_news(symbols=None):
+    """Latest Alpaca headline per supported reading symbol, cached as desk context."""
+    names=list(dict.fromkeys(str(x or '').upper() for x in (symbols or ALL_TICKERS)
+                             if str(x or '').upper() in ALL_TICKERS))
+    if not names:return {}
+    key='stock_news|'+','.join(names)
+    hit=cache_get(key,300)
+    if hit is not None:return hit
+    try:
+        payload=getj(f'{MD}/v1beta1/news',ah(),{
+            'symbols':','.join(names),'limit':min(50,max(10,len(names)*2)),
+            'sort':'desc','include_content':'false',
+        },timeout=12)
+        articles=payload.get('news') if isinstance(payload,dict) else []
+        out={}
+        for article in articles or []:
+            if not isinstance(article,dict):continue
+            row={'headline':article.get('headline'),'summary':article.get('summary'),
+                 'source':article.get('source'),'url':article.get('url'),
+                 'created_at':article.get('created_at')}
+            for sym in article.get('symbols') or []:
+                sym=str(sym or '').upper()
+                if sym in names and sym not in out and row['headline']:out[sym]=row
+        cache_set(key,out)
+        return out
+    except Exception as e:
+        event(f'Stock news: {e}','WARN')
+        return {}
 
 def macro_dates(start,end):
     out=set()
@@ -2080,45 +2644,112 @@ def midday_signals(states, which='ALL', ignore_clock=False):
     return out,evals,{'clock':hm,'opn':run_opn,'osf':run_osf,'orb':run_orb,'vrc':run_vrc,'mvr':run_mvr}
 
 def option_quote(symbol):
-    if not symbol: return {}
+    return option_quotes([symbol]).get(symbol,{}) if symbol else {}
+
+def option_quotes(symbols):
+    symbols=[str(x) for x in (symbols or []) if x]
+    if not symbols: return {}
     try:
-        j=getj_cached(f'{MD}/v1beta1/options/quotes/latest',ah(),{'symbols':symbol},ttl=8,key='oq:'+symbol)
-        q=(j.get('quotes') or {}).get(symbol) or (j.get('quote') if isinstance(j.get('quote'),dict) else {})
-        if not q and isinstance(j.get('quotes'),dict):
-            q=next(iter(j['quotes'].values()),{})
-        bid=q.get('bp') or q.get('bid_price'); ask=q.get('ap') or q.get('ask_price')
-        ts=q.get('t') or q.get('timestamp')
-        age=None
-        dt=parse_ny(ts)
-        if dt: age=(now_ny()-dt).total_seconds()
-        return {'bid':bid,'ask':ask,'spread':(float(ask)-float(bid)) if bid not in (None,0) and ask else None,
-                'ts':ts,'age_sec':age}
+        joined=','.join(symbols)
+        j=getj_cached(f'{MD}/v1beta1/options/quotes/latest',ah(),{'symbols':joined},ttl=8,key='oq:'+joined)
+        raw=j.get('quotes') if isinstance(j,dict) else {}
+        if not isinstance(raw,dict): raw={}
+        out={}
+        for symbol in symbols:
+            q=raw.get(symbol) or {}
+            if len(symbols)==1 and not q and isinstance(j.get('quote'),dict): q=j['quote']
+            bid=q.get('bp') if q.get('bp') is not None else q.get('bid_price')
+            ask=q.get('ap') if q.get('ap') is not None else q.get('ask_price')
+            ts=q.get('t') or q.get('timestamp')
+            age=None; dt=parse_ny(ts)
+            if dt: age=max(0,(now_ny()-dt).total_seconds())
+            spread=None
+            try:
+                if bid is not None and ask is not None: spread=float(ask)-float(bid)
+            except (TypeError,ValueError): pass
+            out[symbol]={'bid':bid,'ask':ask,'spread':spread,'ts':ts,'age_sec':age,
+                         'bid_size':q.get('bs') if q.get('bs') is not None else q.get('bid_size'),
+                         'ask_size':q.get('as') if q.get('as') is not None else q.get('ask_size')}
+        return out
     except Exception:
         return {}
 
-def contract_quality(spot, strike, expiry, direction, quote, style):
-    notes=[]; score=100.0
+def option_latest_volumes(symbols):
+    symbols=[str(x) for x in (symbols or []) if x]
+    if not symbols: return {}
+    try:
+        joined=','.join(symbols)
+        j=getj_cached(f'{MD}/v1beta1/options/bars/latest',ah(),{'symbols':joined},ttl=30,key='ob:'+joined)
+        bars=j.get('bars') if isinstance(j,dict) else {}
+        if not isinstance(bars,dict): return {}
+        return {symbol:(bars.get(symbol) or {}).get('v') for symbol in symbols}
+    except Exception:
+        return {}
+
+def component_grade(deduction):
+    try: n=float(deduction or 0)
+    except (TypeError,ValueError): return None
+    return 'A' if n<=0 else 'B' if n<=8 else 'C' if n<=20 else 'D'
+
+def contract_quality(spot, strike, expiry, direction, quote, style, greeks=None):
+    notes=[]; score=100.0; components={}
+    greeks=greeks or {}
     try: dte=(datetime.strptime(str(expiry)[:10],'%Y-%m-%d').date()-now_ny().date()).days
     except Exception: dte=None
     moneyness=(style or {}).get('moneyness') or ''
     if dte==0:
-        score-=25; notes.append('0DTE')
+        score-=25; notes.append('0DTE'); components['dte']={'deduction':25,'value':dte}
     elif dte is not None and dte<=1:
-        score-=10; notes.append(f'{dte}DTE')
+        score-=10; notes.append(f'{dte}DTE'); components['dte']={'deduction':10,'value':dte}
+    else:
+        components['dte']={'deduction':0,'value':dte}
     if spot:
         otm=abs(float(strike)-float(spot))/float(spot)
         if otm>0.012:
-            score-=min(40, otm*800); notes.append(f'{otm*100:.1f}% from spot')
+            deduction=min(40,otm*800); score-=deduction; notes.append(f'{otm*100:.1f}% from spot')
+            components['distance']={'deduction':round(deduction,2),'value_pct':round(otm,6)}
+        else:
+            components['distance']={'deduction':0,'value_pct':round(otm,6)}
     spr=quote.get('spread'); mid=None
     if quote.get('bid') and quote.get('ask'):
         mid=(float(quote['bid'])+float(quote['ask']))/2
         if mid>0 and spr is not None and spr/mid>0.25:
-            score-=20; notes.append('wide option spread')
+            score-=20; notes.append('wide option spread'); components['spread']={'deduction':20,'value_pct':round(spr/mid,6)}
         elif mid>0 and spr is not None and spr/mid>0.12:
-            score-=8; notes.append('elevated option spread')
-    if moneyness=='otm1': score-=12; notes.append('otm1')
+            score-=8; notes.append('elevated option spread'); components['spread']={'deduction':8,'value_pct':round(spr/mid,6)}
+        else:
+            components['spread']={'deduction':0,'value_pct':round(spr/mid,6) if mid and spr is not None else None}
+    if moneyness=='otm1':
+        score-=12; notes.append('otm1'); components['moneyness']={'deduction':12,'style':moneyness}
+    else:
+        components['moneyness']={'deduction':0,'style':moneyness}
+    age=quote.get('age_sec')
+    freshness_deduction=0 if age is not None and age<=thresh()['quote_max_age_sec'] else 8 if age is not None else 12
+    components['freshness']={'deduction':freshness_deduction,'age_sec':age}
+    if freshness_deduction:
+        score-=freshness_deduction
+        notes.append('quote freshness not confirmed' if age is None else 'stale option quote')
+    volume=quote.get('volume'); oi=quote.get('open_interest')
+    try: liquid=float(volume or 0)+float(oi or 0)
+    except (TypeError,ValueError): liquid=0
+    liquidity_deduction=0 if liquid>=500 else 8 if liquid>=100 else 20 if liquid>0 else 25
+    score-=liquidity_deduction
+    components['liquidity']={'deduction':liquidity_deduction,'volume':volume,'open_interest':oi}
+    delta=greeks.get('delta')
+    target_delta=.5 if moneyness=='atm' else .25
+    try: delta_gap=abs(abs(float(delta))-target_delta)
+    except (TypeError,ValueError): delta_gap=None
+    delta_deduction=12 if delta_gap is None else 0 if delta_gap<=.1 else 8 if delta_gap<=.2 else 20
+    score-=delta_deduction
+    components['delta_fit']={'deduction':delta_deduction,'value':delta,'target_abs':target_delta}
+    premium_deduction=0 if quote.get('bid') not in (None,0) and quote.get('ask') not in (None,0) else 20
+    score-=premium_deduction
+    components['premium_efficiency']={'deduction':premium_deduction,'bid':quote.get('bid'),'ask':quote.get('ask')}
+    for component in components.values():
+        component['grade']=component_grade(component.get('deduction'))
     grade='A' if score>=80 else 'B' if score>=65 else 'C' if score>=50 else 'D'
-    return {'score':round(max(0,score),1),'grade':grade,'dte':dte,'notes':notes,'quote':quote}
+    return {'score':round(max(0,score),1),'grade':grade,'dte':dte,'notes':notes,
+            'components':components,'quote':quote}
 
 def pretrade_checklist(sig, states, coverage, quote, quality):
     date=now_ny().date().isoformat(); sid=sig['strategy_id']; ticker=sig['ticker']
@@ -2478,9 +3109,24 @@ def orders_allowed():
 def submit_exit(tr, kind='SCHEDULE'):
     client=f"x53-{int(tr['id'])}"[:48]
     qty=int(tr['qty'] or 1)
+    q=option_quote(tr.get('option_symbol'))
+    mid=None
+    try:
+        if q.get('bid') is not None and q.get('ask') is not None:
+            mid=(float(q['bid'])+float(q['ask']))/2
+    except (TypeError,ValueError): pass
+    persist_trade_snapshot(tr['id'],'EXIT_INTENT',source='OPTION_QUOTE',mark=mid,quote=q,
+                           volume=q.get('volume'),open_interest=q.get('open_interest'),
+                           payload={'exit_kind':kind,'client_id':client})
+    trade_audit(tr['id'],'EXIT_INTENT',f'{kind} exit evidence frozen before submission',
+                {'client_id':client,'quote':q})
     o=place_broker_order({'symbol':tr['option_symbol'],'qty':str(qty),'side':'sell','type':'market','time_in_force':'day','client_order_id':client})
-    con=db(); con.execute("UPDATE trades SET exit_order_id=?,exit_client_id=?,status='EXIT_SUBMITTED',exit_kind=? WHERE id=?",
-                          (o.get('id'),client,kind,tr['id'])); con.commit(); con.close()
+    con=db(); con.execute("""UPDATE trades SET exit_order_id=?,exit_client_id=?,status='EXIT_SUBMITTED',exit_kind=?,
+                             exit_bid=?,exit_ask=?,exit_spread=? WHERE id=?""",
+                          (o.get('id'),client,kind,q.get('bid'),q.get('ask'),q.get('spread'),tr['id']))
+    trade_audit(tr['id'],'EXIT_SUBMITTED','Paper exit order submitted',
+                {'order_id':o.get('id'),'client_id':client},con=con)
+    con.commit(); con.close()
     event(f"Exit {kind} {tr['strategy_id']} {tr['ticker']} {tr['option_symbol']}")
     return o
 
@@ -2581,6 +3227,51 @@ def option_contract(ticker,direction,spot,allow_0dte=False,style=None):
     if dte=='0dte' and exp!=td:
         raise RuntimeError(f'same-day contract expiry {exp} != {td}')
     reason=f"{style.get('dte',dte)} {moneyness} target {target:.2f} vs spot {spot:.2f}"
+    candidate_rows=arr[:20]
+    symbols=[row.get('symbol') for row in candidate_rows if row.get('symbol')]
+    quotes=option_quotes(symbols)
+    volumes=option_latest_volumes(symbols)
+    candidates=[]
+    for i,row in enumerate(candidate_rows):
+        row_strike=float(row.get('strike_price') or 0)
+        distance=abs(row_strike-target)/float(spot) if spot else None
+        symbol=row.get('symbol')
+        quote=dict(quotes.get(symbol) or {})
+        quote['volume']=volumes.get(symbol)
+        quote['open_interest']=row.get('open_interest')
+        candidate_mid=None
+        try:
+            if quote.get('bid') is not None and quote.get('ask') is not None:
+                candidate_mid=(float(quote['bid'])+float(quote['ask']))/2
+        except (TypeError,ValueError): pass
+        candidate_greeks=(greeks_snap(spot,row_strike,row.get('expiration_date'),candidate_mid,direction)
+                          if candidate_mid else {})
+        candidate_quality=contract_quality(
+            spot,row_strike,row.get('expiration_date'),direction,quote,style,candidate_greeks)
+        selected=row.get('symbol')==c.get('symbol')
+        try: candidate_dte=(datetime.strptime((row.get('expiration_date') or '')[:10],'%Y-%m-%d').date()-today).days
+        except (TypeError,ValueError): candidate_dte=None
+        candidates.append({
+            'rank':i+1,'option_symbol':symbol,'strike':row_strike,
+            'expiry':(row.get('expiration_date') or '')[:10],
+            'dte':candidate_dte,
+            'bid':quote.get('bid'),'ask':quote.get('ask'),'spread':quote.get('spread'),
+            'quote_ts':quote.get('ts'),'quote_age_sec':quote.get('age_sec'),
+            'volume':quote.get('volume'),'open_interest':quote.get('open_interest'),'selected':selected,
+            'score':candidate_quality.get('score'),'grade':candidate_quality.get('grade'),
+            'components':{'target_strike':target,'distance_to_target_pct':round(distance,6) if distance is not None else None,
+                          'bid':quote.get('bid'),'ask':quote.get('ask'),'spread':quote.get('spread'),
+                          'quote_ts':quote.get('ts'),'quote_age_sec':quote.get('age_sec'),
+                          'volume':quote.get('volume'),'open_interest':quote.get('open_interest'),
+                          'greeks':candidate_greeks,
+                          'grades':candidate_quality.get('components')},
+            'reason':'nearest permitted strike and expiry' if selected else 'farther from the configured strike target',
+        })
+    style['_candidates']=candidates
+    style['_selected_quote']=next(({
+        'bid':x.get('bid'),'ask':x.get('ask'),'spread':x.get('spread'),'ts':x.get('quote_ts'),
+        'age_sec':x.get('quote_age_sec'),'volume':x.get('volume'),'open_interest':x.get('open_interest')
+    } for x in candidates if x.get('selected')),None)
     return c['symbol'],c.get('expiration_date'),float(c.get('strike_price')),reason,style
 
 def log_contract(sid,ticker,direction,spot,symbol,expiry,strike,style,reason):
@@ -2629,14 +3320,16 @@ def submit_entry(sig,states):
         status='SKIP_NO_0DTE' if horizon=='EOD' else 'SKIP_NO_CONTRACT'
         extra={'skip_reason':str(e),'ab_book':book}
         log_shadow(sig,status,extra); return status,extra
-    q=option_quote(option)
-    quality=contract_quality(spot,strike,expiry,direction,q,style)
+    q=style.get('_selected_quote') or option_quote(option)
     mid=None
     if q.get('bid') and q.get('ask'):
         try: mid=(float(q['bid'])+float(q['ask']))/2
         except Exception: mid=None
     gk=greeks_snap(spot,strike,expiry,mid,direction) if mid else {'iv':None,'delta':None,'gamma':None}
+    quality=contract_quality(spot,strike,expiry,direction,q,style,gk)
     check=pretrade_checklist(sig,states,coverage,q,quality)
+    strategy=_strategy_record(sid)
+    pred=prediction_snapshot(sig,strategy,spot=spot,quote=q,greeks=gk)
     log_contract(sid,ticker,direction,spot,option,expiry,strike,style,reason)
     extra={'option':option,'expiry':expiry,'strike':strike,'horizon':horizon,'window':window,'spot':spot,'opt':style,
            'reason':reason,'quality':quality,'checklist':check,'cluster_n':clus,'dnt':dnt,'greeks':gk,
@@ -2655,14 +3348,47 @@ def submit_entry(sig,states):
     if not orders_allowed():
         extra['skip_reason']='guest LAN read-only'; log_shadow(sig,'SKIP_GUEST',extra); return 'SKIP_GUEST',extra
     client=f'a53-{date.replace("-","")}-{sid.lower()}-{ticker.lower()}'[:48]
-    o=place_broker_order({'symbol':option,'qty':str(qty),'side':'buy','type':'market','time_in_force':'day','client_order_id':client})
     exit_due=now_ny().date().isoformat() if horizon=='EOD' else next_trading_date(now_ny().date().isoformat())
-    con=db(); con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,entry_order_id,entry_client_id,exit_due_date,status,broker_note,horizon,window,entry_bid,entry_ask,entry_spread,contract_score,checklist,cluster_n,atm_spot,entry_iv,entry_delta,entry_gamma,ab_book,greeks)
-                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                          (sid,ticker,direction,option,qty,now_ny().isoformat(),date,expiry,o.get('id'),client,exit_due,'ENTRY_SUBMITTED','paper market order',horizon,window,
+    con=db(); con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,entry_order_id,entry_client_id,exit_due_date,status,broker_note,horizon,window,entry_bid,entry_ask,entry_spread,contract_score,checklist,cluster_n,atm_spot,entry_iv,entry_delta,entry_gamma,ab_book,greeks,origin,strategy_version,parameter_hash)
+                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                          (sid,ticker,direction,option,qty,sig.get('ts') or pred['ts'],date,expiry,None,client,exit_due,'ENTRY_SUBMITTED','paper order intent',horizon,window,
                            q.get('bid'),q.get('ask'),q.get('spread'),quality.get('score'),json.dumps(check,default=str),clus,spot,
-                           gk.get('iv'),gk.get('delta'),gk.get('gamma'),book,json.dumps(gk,default=str)))
-    con.commit(); tid=con.execute('SELECT last_insert_rowid() x').fetchone()['x']; con.close()
+                           gk.get('iv'),gk.get('delta'),gk.get('gamma'),book,json.dumps(gk,default=str),
+                           'SYSTEM',strategy.get('version'),strategy.get('parameter_hash')))
+    tid=con.execute('SELECT last_insert_rowid() x').fetchone()['x']
+    for candidate in style.get('_candidates') or []:
+        selected=bool(candidate.get('selected'))
+        con.execute('''INSERT OR IGNORE INTO trade_candidates(
+                       trade_id,rank,option_symbol,strike,expiry,dte,selected,score,grade,reason,components)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?)''',
+                    (tid,candidate.get('rank'),candidate.get('option_symbol'),candidate.get('strike'),
+                     candidate.get('expiry'),candidate.get('dte'),1 if selected else 0,
+                     quality.get('score') if selected else candidate.get('score'),
+                     quality.get('grade') if selected else candidate.get('grade'),
+                     candidate.get('reason'),json.dumps({**(candidate.get('components') or {}),
+                     'selected_quality':quality.get('components') if selected else None,
+                     'target':reason},default=str)))
+    persist_trade_snapshot(tid,'ENTRY',source='OPTION_QUOTE',spot=spot,mark=mid,quote=q,greeks=gk,
+                           volume=q.get('volume'),open_interest=q.get('open_interest'),ts=pred['ts'],
+                           payload={'quality':quality,'selection_reason':reason},con=con)
+    persist_prediction(tid,pred,con=con)
+    trade_audit(tid,'SIGNAL_FIRED',f'{sid} {ticker} {direction}',sig,ts=sig.get('ts') or pred['ts'],con=con)
+    trade_audit(tid,'CONTRACT_SELECTED',f'{option} selected',{'reason':reason,'quality':quality},ts=pred['ts'],con=con)
+    trade_audit(tid,'PREDICTION_SNAPSHOT','Entry expectation frozen',{'model':pred.get('model')},ts=pred['ts'],con=con)
+    trade_audit(tid,'ORDER_INTENT','Paper entry evidence frozen before submission',{'client_id':client},con=con)
+    con.commit(); con.close()
+    try:
+        o=place_broker_order({'symbol':option,'qty':str(qty),'side':'buy','type':'market','time_in_force':'day','client_order_id':client})
+    except Exception as exc:
+        con=db()
+        con.execute("UPDATE trades SET status='ERROR',broker_note=? WHERE id=?",(f'entry submission failed: {str(exc)[:180]}',tid))
+        trade_audit(tid,'ORDER_ERROR','Paper entry order submission failed',{'client_id':client,'error':str(exc)[:240]},con=con)
+        con.commit(); con.close()
+        raise
+    con=db()
+    con.execute("UPDATE trades SET entry_order_id=?,broker_note='paper market order' WHERE id=?",(o.get('id'),tid))
+    trade_audit(tid,'ORDER_SUBMITTED','Paper entry order submitted',{'order_id':o.get('id'),'client_id':client},con=con)
+    con.commit(); con.close()
     extra['trade_id']=tid; extra['order_id']=o.get('id'); extra['quality']=quality
     return 'ENTRY_SUBMITTED',extra
 
@@ -2721,23 +3447,46 @@ def reconcile():
     con=db(); rows=con.execute("SELECT * FROM trades WHERE status IN ('ENTRY_SUBMITTED','EXIT_SUBMITTED')").fetchall(); con.close()
     for tr in rows:
         oid=tr['entry_order_id'] if tr['status']=='ENTRY_SUBMITTED' else tr['exit_order_id']
+        o=None
+        if not oid and tr['status']=='ENTRY_SUBMITTED' and tr['entry_client_id']:
+            o=broker_order_by_client_id(tr['entry_client_id'])
+            if o and o.get('id'):
+                oid=o.get('id')
+                con=db(); con.execute('UPDATE trades SET entry_order_id=? WHERE id=?',(oid,tr['id'])); con.commit(); con.close()
         if not oid:continue
-        try:o=getj(paper_api_url(f'/orders/{oid}'),ah(),timeout=8)
+        try:o=o or getj(paper_api_url(f'/orders/{oid}'),ah(),timeout=8)
         except Exception as e:event(f'Order reconcile {oid}: {e}','WARN');continue
         st=o.get('status')
         if st=='filled':
             fp=float(o.get('filled_avg_price') or 0); ft=o.get('filled_at'); con=db()
             if tr['status']=='ENTRY_SUBMITTED':
-                con.execute("UPDATE trades SET entry_fill=?,entry_filled_at=?,status='OPEN' WHERE id=?",(fp,ft,tr['id']))
+                priced={**dict(tr),'entry_fill':fp}
+                costs=execution_costs(priced,entry_order=o)
+                con.execute("""UPDATE trades SET entry_fill=?,entry_filled_at=?,status='OPEN',fees=?,
+                               modeled_slippage=?,actual_slippage=?,slippage=?,costs_source=? WHERE id=?""",
+                            (fp,ft,costs.get('fees'),costs.get('modeled_slippage'),costs.get('actual_slippage'),
+                             costs.get('actual_slippage'),costs.get('source'),tr['id']))
                 msg=f"FILLED entry {tr['strategy_id']} {tr['ticker']} {tr['option_symbol']} @ {fp}"
             else:
-                pnl=option_pnl(tr['entry_fill'],fp,tr['qty']); con.execute("UPDATE trades SET exit_fill=?,exit_filled_at=?,status='CLOSED',pnl=? WHERE id=?",(fp,ft,pnl,tr['id']))
+                pnl=option_pnl(tr['entry_fill'],fp,tr['qty'])
+                priced={**dict(tr),'exit_fill':fp}
+                costs=execution_costs(priced,exit_order=o)
+                con.execute("""UPDATE trades SET exit_fill=?,exit_filled_at=?,status='CLOSED',pnl=?,fees=?,
+                               modeled_slippage=?,actual_slippage=?,slippage=?,costs_source=? WHERE id=?""",
+                            (fp,ft,pnl,costs.get('fees'),costs.get('modeled_slippage'),costs.get('actual_slippage'),
+                             costs.get('actual_slippage'),costs.get('source'),tr['id']))
                 try:
                     mae,mfe=mae_mfe_from_tape({**dict(tr),'exit_filled_at':ft,'status':'CLOSED'})
                     if mae is not None: con.execute('UPDATE trades SET mae=?,mfe=? WHERE id=?',(mae,mfe,tr['id']))
                 except Exception: pass
                 msg=f"CLOSED {tr['strategy_id']} {tr['ticker']} P&L ${pnl:.2f}"
-            con.commit(); con.close(); event(msg)
+            con.commit(); con.close()
+            if tr['status']=='ENTRY_SUBMITTED':
+                trade_audit(tr['id'],'ENTRY_FILLED',f'Filled at {money_number(fp)}',
+                            {'order_id':oid,'fill':fp},source='BROKER',ts=ft)
+            else:
+                capture_exit_snapshot(tr['id'],'BROKER',ft)
+            event(msg)
         elif st in ('canceled','expired','rejected'):
             con=db(); con.execute("UPDATE trades SET status='ERROR',broker_note=? WHERE id=?",(f'order {st}',tr['id'])); con.commit(); con.close()
             event(f"Order {st} {tr['strategy_id']} {tr['ticker']} {tr['option_symbol']}",'WARN')
@@ -2778,6 +3527,7 @@ def _expire_trade(tr, note='expired / no quote after close'):
     con=db(); con.execute("UPDATE trades SET status='CLOSED',pnl=?,exit_kind='EXPIRED',broker_note=?,exit_filled_at=? WHERE id=?",
                           (pnl,note,n.isoformat(),tr['id']))
     con.commit(); con.close()
+    capture_exit_snapshot(tr['id'],'EXPIRY',n.isoformat())
     event(f"EXPIRED {tr['strategy_id']} {tr['ticker']} {tr.get('option_symbol')} P&L ${pnl:.2f}")
 
 def _broker_order_time(order):
@@ -2874,9 +3624,20 @@ def _matching_exit_fill(tr, orders, used_order_ids=None, allow_generic=False, re
         return take(generic)
     return None
 
-def broker_ledger_repair_plan(orders):
+def broker_ledger_repair_plan(orders, activities=None):
     """Build a deterministic, broker-sourced repair plan without changing SQLite."""
     broker_orders=[o for o in (orders or []) if isinstance(o,dict)]
+    expiry_remaining={}
+    expiry_dates={}
+    for activity in activities or []:
+        if not isinstance(activity,dict) or str(activity.get('activity_type') or '')!='OPEXP':
+            continue
+        symbol=str(activity.get('symbol') or '')
+        try: qty=abs(int(float(activity.get('qty') or 0)))
+        except (TypeError,ValueError): qty=0
+        if not symbol or qty<=0:continue
+        expiry_remaining[symbol]=expiry_remaining.get(symbol,0)+qty
+        expiry_dates[symbol]=str(activity.get('date') or '')[:10]
     con=db(); trades=[dict(r) for r in con.execute('SELECT * FROM trades ORDER BY id').fetchall()]; con.close()
     remaining=_exit_remaining(broker_orders,trades)
     plan=[]
@@ -2887,7 +3648,7 @@ def broker_ledger_repair_plan(orders):
         key=lambda t:(parse_ny(t.get('entry_filled_at') or t.get('signal_ts')) or datetime.min.replace(tzinfo=NY),int(t.get('id') or 0)),
     )
     for tr in guessed:
-        sell=_matching_exit_fill(tr,broker_orders,remaining_qty=remaining,allow_symbol=True)
+        sell=_matching_exit_fill(tr,broker_orders,remaining_qty=remaining,allow_generic=True,allow_symbol=True)
         if not sell:continue
         oid=str(sell.get('id') or '')
         exit_fill=float(sell.get('filled_avg_price') or 0)
@@ -2922,29 +3683,44 @@ def broker_ledger_repair_plan(orders):
             'strategy_id':sid,'ticker':ticker,'option_symbol':buy.get('symbol'),
             'entry_filled_at':buy.get('filled_at'),'signal_ts':submitted.isoformat(),
         }
-        sell=_matching_exit_fill(probe,broker_orders,remaining_qty=remaining,allow_generic=True)
-        if not sell:continue
-        exit_oid=str(sell.get('id') or '')
         qty=int(float(buy.get('filled_qty') or buy.get('qty') or 0))
         if qty<=0:continue
         entry_fill=float(buy.get('filled_avg_price') or 0)
-        exit_fill=float(sell.get('filled_avg_price') or 0)
         horizon='EOD' if sid in MIDDAY_STRATEGY_IDS else 'OVERNIGHT'
         exit_due=trade_date if horizon=='EOD' else next_trading_date(trade_date)
+        sell=_matching_exit_fill(probe,broker_orders,remaining_qty=remaining,allow_generic=True,allow_symbol=True)
+        if sell:
+            exit_oid=str(sell.get('id') or '')
+            exit_fill=float(sell.get('filled_avg_price') or 0)
+            exit_client_id=sell.get('client_order_id')
+            exit_filled_at=sell.get('filled_at')
+            exit_kind='BROKER_REPAIR'
+        elif expiry_remaining.get(str(buy.get('symbol') or ''),0)>=qty:
+            symbol=str(buy.get('symbol') or '')
+            expiry_remaining[symbol]-=qty
+            exit_oid=None
+            exit_fill=0.0
+            exit_client_id=None
+            expiry_day=expiry_dates.get(symbol) or expiry or trade_date
+            exit_filled_at=f'{expiry_day}T16:00:00-04:00'
+            exit_kind='BROKER_EXPIRY'
+        else:
+            continue
         plan.append({
             'action':'insert','strategy_id':sid,'ticker':ticker,'direction':direction,
             'option_symbol':buy.get('symbol'),'qty':qty,'signal_ts':submitted.isoformat(),'trade_date':trade_date,
             'expiry':expiry,'entry_order_id':oid,'entry_client_id':cid,'entry_fill':entry_fill,
             'entry_filled_at':buy.get('filled_at'),'exit_due_date':exit_due,'exit_order_id':exit_oid,
-            'exit_client_id':sell.get('client_order_id'),'exit_fill':exit_fill,'exit_filled_at':sell.get('filled_at'),
+            'exit_client_id':exit_client_id,'exit_fill':exit_fill,'exit_filled_at':exit_filled_at,
             'status':'CLOSED','pnl':option_pnl(entry_fill,exit_fill,qty),'horizon':horizon,
-            'window':sid if horizon=='EOD' else '15:45',
+            'window':sid if horizon=='EOD' else '15:45','exit_kind':exit_kind,
         })
     return plan
 
 def apply_broker_ledger_repair(plan):
     """Apply a reviewed repair plan in one short transaction."""
     updated=inserted=0
+    repaired=[]
     con=db()
     try:
         con.execute('BEGIN IMMEDIATE')
@@ -2956,11 +3732,12 @@ def apply_broker_ledger_repair(plan):
                                 (item.get('exit_order_id'),item.get('exit_client_id'),item.get('exit_fill'),
                                  item.get('exit_filled_at'),item.get('pnl'),'corrected from Alpaca sell fill',item.get('trade_id')))
                 updated+=cur.rowcount
+                if cur.rowcount: repaired.append((int(item.get('trade_id')),'update',dict(item)))
             elif item.get('action')=='insert':
                 exists=con.execute('SELECT id FROM trades WHERE entry_order_id=? OR entry_client_id=? LIMIT 1',
                                    (item.get('entry_order_id'),item.get('entry_client_id'))).fetchone()
                 if exists:continue
-                con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,
+                cur=con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,
                                entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,exit_order_id,
                                exit_client_id,exit_fill,exit_filled_at,status,pnl,broker_note,horizon,window,exit_kind)
                                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
@@ -2970,13 +3747,27 @@ def apply_broker_ledger_repair(plan):
                              item.get('entry_filled_at'),item.get('exit_due_date'),item.get('exit_order_id'),
                              item.get('exit_client_id'),item.get('exit_fill'),item.get('exit_filled_at'),'CLOSED',
                              item.get('pnl'),'recovered closed round trip from Alpaca',item.get('horizon'),
-                             item.get('window'),'BROKER_REPAIR'))
+                             item.get('window'),item.get('exit_kind') or 'BROKER_REPAIR'))
                 inserted+=1
+                repaired.append((int(cur.lastrowid),'insert',dict(item)))
         con.commit()
     except Exception:
         con.rollback(); raise
     finally:
         con.close()
+    for trade_id,action,item in repaired:
+        if action=='insert':
+            persist_trade_snapshot(trade_id,'ENTRY',source='BROKER_REPAIR',mark=item.get('entry_fill'),
+                                   ts=item.get('entry_filled_at') or item.get('signal_ts'),
+                                   payload={'availability':'BROKER_FILL_ONLY','order_id':item.get('entry_order_id')})
+            trade_audit(trade_id,'TRADE_RECOVERED','Closed broker round trip restored to Activity',
+                        {'entry_order_id':item.get('entry_order_id'),'exit_order_id':item.get('exit_order_id')},
+                        source='BROKER_REPAIR',ts=item.get('exit_filled_at'))
+        else:
+            trade_audit(trade_id,'EXPIRY_REPAIRED','Guessed expiry replaced by broker sell fill',
+                        {'old_pnl':item.get('old_pnl'),'exit_order_id':item.get('exit_order_id')},
+                        source='BROKER_REPAIR',ts=item.get('exit_filled_at'))
+        capture_exit_snapshot(trade_id,'BROKER_REPAIR',item.get('exit_filled_at'))
     mem_set('ui:dash',None)
     return {'updated':updated,'inserted':inserted}
 
@@ -2984,12 +3775,16 @@ def _close_trade_from_broker_exit(tr, order):
     fp=float(order.get('filled_avg_price') or 0)
     ft=order.get('filled_at')
     pnl=option_pnl(tr.get('entry_fill'),fp,tr.get('qty'))
+    costs=execution_costs({**dict(tr),'exit_fill':fp},exit_order=order)
     con=db(); con.execute("""UPDATE trades SET exit_order_id=?,exit_client_id=?,exit_fill=?,exit_filled_at=?,
                              status='CLOSED',pnl=?,exit_kind=COALESCE(NULLIF(exit_kind,''),'BROKER'),
-                             broker_note=? WHERE id=?""",
+                             broker_note=?,fees=?,modeled_slippage=?,actual_slippage=?,slippage=?,costs_source=?
+                             WHERE id=?""",
                           (order.get('id'),order.get('client_order_id'),fp,ft,pnl,
-                           'closed from broker sell on startup',tr['id']))
+                           'closed from broker sell on startup',costs.get('fees'),costs.get('modeled_slippage'),
+                           costs.get('actual_slippage'),costs.get('actual_slippage'),costs.get('source'),tr['id']))
     con.commit(); con.close()
+    capture_exit_snapshot(tr['id'],'BROKER_RECONCILE',ft)
     event(f"CLOSED {tr['strategy_id']} {tr['ticker']} P&L ${pnl:.2f} (startup broker sell)")
 
 def startup_reconcile():
@@ -3040,12 +3835,21 @@ def startup_reconcile():
         direction,expiry=_option_direction_expiry(symbol)
         horizon='EOD' if sid in MIDDAY_STRATEGY_IDS else 'OVERNIGHT'
         exit_due=trade_date if horizon=='EOD' else next_trading_date(trade_date)
-        con=db(); con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,
+        con=db(); cur=con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,
                                  entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,status,broker_note,horizon,window)
                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                               (sid,ticker,direction,symbol,int(float(order.get('qty') or 0)),submitted.isoformat(),trade_date,expiry,
                                order.get('id'),cid,float(order.get('filled_avg_price') or 0) or None,order.get('filled_at'),exit_due,status,
                                'recovered by startup reconciliation',horizon,sid if horizon=='EOD' else '15:45'))
+        trade_id=int(cur.lastrowid)
+        entry_fill=float(order.get('filled_avg_price') or 0) or None
+        if broker_status=='filled':
+            persist_trade_snapshot(trade_id,'ENTRY',source='BROKER_RECOVERY',mark=entry_fill,
+                                   ts=order.get('filled_at') or submitted.isoformat(),
+                                   payload={'availability':'BROKER_FILL_ONLY','order_id':order.get('id')},con=con)
+        trade_audit(trade_id,'ORDER_RECOVERED','Broker order restored to Activity',
+                    {'order_id':order.get('id'),'client_id':cid,'broker_status':broker_status},
+                    source='BROKER_RECOVERY',ts=order.get('filled_at') or submitted.isoformat(),con=con)
         con.commit(); con.close(); recovered+=1
         event(f'Recovered broker order {cid} into the local trade ledger','WARN')
     today=now_ny().date().isoformat()
@@ -3380,7 +4184,7 @@ def status_payload():
         'heartbeat':meta_get('heartbeat'),'last_eval':meta_get('last_eval'),
         'last_ingest':ing,'last_ingest_source':meta_get('last_ingest_source'),
         'last_midday_eval':meta_get('last_midday_eval'),'last_midday_scan':meta_get('last_midday_scan'),
-        'live_tickers':MIDDAY_TICKERS,'time_ny':now_ny().isoformat(),
+        'live_tickers':ALL_TICKERS,'execution_tickers':MIDDAY_TICKERS,'time_ny':now_ny().isoformat(),
         'session_complete_pct':float(cov_pct) if cov_pct not in (None,'') else None,
         'clock':session_clock(),'stale_sec':stale,'data_stale':bool(stale is not None and stale>90),
         'watchdog_stale':not rh['ok'],
@@ -3391,6 +4195,7 @@ def status_payload():
         'unread_errors':unread,
         'thresholds':thresh(),
         'account_snapshot_at':snap.get('snapshot_at') or snap.get('ts'),
+        'services':service_states(),
         'cache':{'hits':_API_STATS['hits'],'misses':_API_STATS['misses'],'http_calls':_API_STATS['calls'],
                  'hit_rate':(_API_STATS['hits']/max(1,_API_STATS['hits']+_API_STATS['misses'])),
                  'local_bars':bars,'api_log_rows':calls}
@@ -3471,6 +4276,14 @@ def sleeve_history():
         return jsonify(sleeve_history_payload(request.args))
     except ValueError as e:
         return jsonify({'error':str(e)}),400
+
+@app.get('/api/news')
+def stock_news():
+    requested=[x.strip().upper() for x in str(request.args.get('symbols') or '').split(',') if x.strip()]
+    unsupported=[x for x in requested if x not in ALL_TICKERS]
+    if unsupported:return jsonify({'error':'unsupported ticker','symbols':unsupported}),400
+    names=requested or ALL_TICKERS
+    return jsonify({'news':latest_stock_news(names),'as_of':now_ny().isoformat(),'source':'alpaca'})
 
 @app.get('/api/market_chart/<sym>')
 def market_chart(sym):
@@ -3991,7 +4804,9 @@ def trades():
     try: days=int(days) if days not in (None,'') else DESK_WINDOW_DAYS
     except (TypeError,ValueError): days=DESK_WINDOW_DAYS
     out,cutoff=desk_trades(days)
-    return jsonify({'trades':out,'window_days':days,'cutoff':cutoff,'as_of':now_ny().isoformat()})
+    acct=live_or_stored_account()
+    return jsonify({'trades':out,'window_days':days,'cutoff':cutoff,'as_of':now_ny().isoformat(),
+                    'reconciliation':pnl_reconciliation(out,account=acct)})
 
 @app.get('/api/bootstrap')
 def bootstrap():
@@ -4319,8 +5134,11 @@ def set_thresholds():
         preview={'error':str(e)}
     return jsonify({'ok':True,'thresholds':thresh(),'preview':preview})
 
-@app.route('/api/trades/<int:tid>', methods=['PATCH','POST'])
+@app.route('/api/trades/<int:tid>', methods=['GET','PATCH','POST'])
 def patch_trade(tid):
+    if request.method=='GET':
+        item=canonical_trade(tid,include_tape=str(request.args.get('tape') or '').lower() in ('1','true','yes'))
+        return (jsonify(item),200) if item else (jsonify({'error':'trade not found'}),404)
     d=request.get_json(force=True) or {}
     con=db()
     if 'comment' in d:

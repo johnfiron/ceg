@@ -1,146 +1,20 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test } from '@playwright/test';
+import { openDesk } from './helpers';
 
-const now = '2026-08-21T16:00:00-04:00';
-
-function status(environment = 'development') {
-  return {
-    configured: true,
-    paper_only: true,
-    broker_orders_enabled: false,
-    environment,
-    process_role: 'web',
-    clock: {
-      hm: '16:00',
-      phase: 'CLOSED',
-      label: 'CLOSED',
-      current: [],
-      next: { id: 'OPN', start: '09:35' },
-      remaining: null,
-    },
-    session_complete_pct: 1,
-    watchdog_stale: false,
-    data_stale: false,
-    guest: false,
-    unread_errors: 0,
-  };
-}
-
-const live = {
-  clock: {
-    hm: '16:00',
-    phase: 'CLOSED',
-    label: 'CLOSED',
-    current: [],
-    next: { id: 'OPN', start: '09:35' },
-    remaining: null,
-  },
-  session_complete_pct: 1,
-  bar_count: 390,
-  last_ingest: now,
-  watchlist: [
-    {
-      sym: 'SPY',
-      c: 650.12,
-      setup: { score: 0.91, fired: false, bottleneck_en: 'waiting on RVOL', book_label: 'OPN' },
-    },
-  ],
-  tickers: {
-    SPY: {
-      sym: 'SPY',
-      c: 650.12,
-      ret: 0.012,
-      setup: { score: 0.91, fired: false, bottleneck_en: 'waiting on RVOL' },
-      regime: 'TREND',
-    },
-  },
-  explain: {
-    headline: 'Market is closed',
-    paragraphs: ['No sleeve is live. ASH is waiting for OPN at 09:35.'],
-    why_not: [],
-    books: [],
-  },
-};
-
-const bootstrap = {
-  as_of: now,
-  window_days: 30,
-  cutoff: '2026-07-22',
-  status: status(),
-  account: { equity: 100504, portfolio_value: 100504, cash: 98000, last_equity: 100000 },
-  trades: {
-    trades: [
-      { id: 11, status: 'CLOSED', strategy_id: 'ORB', ticker: 'QQQ', pnl: 120, trade_date: '2026-08-21' },
-      { id: 12, status: 'CLOSED', strategy_id: 'MVR', ticker: 'SPY', pnl: -40, trade_date: '2026-08-21' },
-    ],
-  },
-  dashboard: {
-    curve: [{ date: '2026-08-21', cumPnl: 80 }],
-    balanceCurve: [
-      { t: '2026-08-21T09:30:00-04:00', equity: 100000, portfolio_value: 100000 },
-      { t: now, equity: 100504, portfolio_value: 100504 },
-    ],
-    totals: { realizedToday: 80, open: 0, sessionDate: '2026-08-21' },
-    openTrades: [],
-    strategies: [],
-    tickerStats: {},
-  },
-};
-
-const bars = {
-  ticker: 'SPY',
-  date: '2026-08-21',
-  state: { or_high: 648, or_low: 646, prev_close: 642.5, vwap: 647 },
-  bars: [
-    { t: '2026-08-21T09:30:00-04:00', o: 643, h: 644, l: 642, c: 643.5, v: 1000, vwap: 643.2 },
-    { t: '2026-08-21T09:35:00-04:00', o: 643.5, h: 646, l: 643, c: 645, v: 1200, vwap: 644.1 },
-    { t: '2026-08-21T15:59:00-04:00', o: 649, h: 651, l: 648, c: 650.12, v: 900, vwap: 647 },
-  ],
-};
-
-async function mockDesk(page: Page, environment = 'development') {
-  await page.route('**/api/**', async (route) => {
-    const url = new URL(route.request().url());
-    const path = url.pathname.replace(/^\/ash/, '');
-    if (path === '/api/status') return route.fulfill({ json: status(environment) });
-    if (path === '/api/bootstrap') return route.fulfill({ json: { ...bootstrap, status: status(environment) } });
-    if (path === '/api/live') return route.fulfill({ json: live });
-    if (path === '/api/sleeve_history') return route.fulfill({ json: { strategies: [] } });
-    if (path === '/api/workspace') return route.fulfill({ json: { playbook: [] } });
-    if (path === '/api/trade_board') return route.fulfill({ json: { trades: [] } });
-    if (path === '/api/dashboard') return route.fulfill({ json: bootstrap.dashboard });
-    if (path.startsWith('/api/live_bars/')) return route.fulfill({ json: bars });
-    if (path.startsWith('/api/market_chart/')) return route.fulfill({ json: { bars: bars.bars } });
-    if (path === '/api/comments') return route.fulfill({ json: { comments: [] } });
-    return route.fulfill({ json: {} });
-  });
-}
-
-async function openDesk(page: Page, environment = 'development') {
-  await mockDesk(page, environment);
-  await page.addInitScript(() => {
-    localStorage.setItem('ashIdle', 'pause');
-  });
-  await page.goto('/?from=vault');
-  await page.waitForFunction(() => {
-    const home = document.getElementById('home');
-    return !document.body.classList.contains('needs-keys') &&
-      home && home.classList.contains('active') &&
-      !document.getElementById('terminal')?.classList.contains('hidden');
-  });
-}
-
-test('phone Home is clock, book facts, one hero, then watched names', async ({ page }) => {
+test('Home leads with context, one P&L, account equity, then closest setup', async ({ page }) => {
   await openDesk(page);
+  const order = await page.locator('#home > .panel').evaluateAll((els) => els.map((el) => el.id || el.className));
+  expect(order[0]).toBe('explainBox');
   await expect(page.locator('#sessionClock')).toBeVisible();
   await expect(page.locator('#sessionPnl')).toContainText('+');
   await expect(page.locator('#portfolioValue')).toContainText('$100,504');
   await expect(page.locator('#dailyMove')).toBeVisible();
   await expect(page.locator('#heroChart')).toBeVisible();
-  await expect(page.locator('#heroTitle')).toBeVisible();
-  await expect(page.getByRole('button', { name: /Largest win/i })).toContainText('ORB');
-  await expect(page.getByRole('button', { name: /Largest loss/i })).toContainText('MVR');
+  await expect(page.locator('#heroTitle')).toHaveText('ACCOUNT');
+  await expect(page.locator('#heroChip')).toHaveText('ACCOUNT');
+  await expect(page.locator('.factRail')).toHaveCount(0);
   await expect(page.locator('#watchlist')).toContainText('SPY');
-  await expect(page.locator('#homeKpis')).toBeHidden();
+  await expect(page.locator('#homeKpis')).toHaveCount(0);
   await expect(page.getByRole('heading', { name: 'Tape pulse' })).toHaveCount(0);
   const box = await page.locator('.heroChartFrame').boundingBox();
   expect(box?.height || 0).toBeGreaterThanOrEqual(200);
@@ -155,8 +29,33 @@ test('watchlist opens the tall inspect surface with step controls', async ({ pag
   await expect(page.getByRole('button', { name: 'BAR →' })).toBeVisible();
   await expect(page.getByRole('button', { name: '← BAR' })).toBeVisible();
   await expect(page.locator('#inspectTitle')).toContainText('SPY');
+  await expect(page.locator('#liveGrid')).toContainText('NEWS · Market opens with a measured tone · wire');
   const box = await page.locator('#charts .chartTall').boundingBox();
   expect(box?.height || 0).toBeGreaterThanOrEqual(300);
+});
+
+test('inspect brush keeps price and volume in one resettable window', async ({ page }) => {
+  await openDesk(page);
+  await page.locator('#watchlist [data-ticker="SPY"]').click();
+  const chart = page.locator('#inspectChart');
+  await expect(chart).toBeVisible();
+  await expect(page.locator('#inspectReadout')).toContainText('O $');
+  const box = await chart.boundingBox();
+  expect(box).toBeTruthy();
+
+  const y = box!.y + box!.height / 2;
+  await chart.dispatchEvent('pointerdown', { pointerId: 7, pointerType: 'touch', clientX: box!.x + 72, clientY: y });
+  await chart.dispatchEvent('pointermove', { pointerId: 7, pointerType: 'touch', clientX: box!.x + box!.width / 2, clientY: y });
+  await expect(page.locator('#inspectReadout')).toContainText('ZOOM');
+  await chart.dispatchEvent('pointerup', { pointerId: 7, pointerType: 'touch', clientX: box!.x + box!.width / 2, clientY: y });
+
+  await expect(page.locator('#inspectReset')).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'FULL SESSION' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: '← WINDOW' })).toBeVisible();
+  await page.getByRole('button', { name: '1m', exact: true }).click();
+  await expect(page.locator('#inspectReset')).toBeEnabled();
+  await page.keyboard.press('Escape');
+  await expect(page.locator('#inspectReset')).toBeDisabled();
 });
 
 test('production monitor hides Connect, Lab, and mutation chrome', async ({ page }) => {
@@ -166,5 +65,62 @@ test('production monitor hides Connect, Lab, and mutation chrome', async ({ page
   await expect(page.getByRole('button', { name: 'Connect' })).toHaveCount(0);
   await expect(page.locator('.nav[data-page="research"]')).toBeHidden();
   await expect(page.getByRole('button', { name: 'RECONCILE' })).toBeHidden();
-  await expect(page.getByRole('button', { name: 'Change local keys/settings' })).toBeHidden();
+  await expect(page.getByRole('button', { name: /CHANGE LOCAL KEYS/i })).toBeHidden();
+});
+
+test('Replay pairs price and volume and exposes explicit transport state', async ({ page }) => {
+  await openDesk(page);
+  await page.locator('.nav[data-page="strategies"]').click();
+  await page.getByRole('button', { name: /OPEN REPLAY/ }).click();
+  await expect(page.locator('#replay')).toHaveClass(/active/);
+  await expect(page.locator('#replayPlay')).toBeDisabled();
+  await page.getByRole('button', { name: 'LOAD 3:45' }).click();
+  await expect(page.locator('#replayPlay')).toBeEnabled();
+  const price = await page.locator('#replayChart').boundingBox();
+  const volume = await page.locator('#replayVolume').boundingBox();
+  expect(price?.width).toBe(volume?.width);
+  await page.locator('#replayPlay').click();
+  await expect(page.locator('#replayPlay')).toHaveText(/PAUSE/);
+  await expect(page.locator('.replayStep').first()).toBeDisabled();
+});
+
+test('Activity separates exceptional entries and missing quantity stays uncaptured', async ({ page }) => {
+  await openDesk(page);
+  await page.locator('.nav[data-page="activity"]').click();
+  await expect(page.locator('#activitySummary')).toContainText('3 records');
+  await expect(page.locator('#tradeRows')).not.toContainText('ENTRY_FAILED');
+  await expect(page.locator('#failedTradeRows')).toContainText('ENTRY_FAILED');
+  await page.locator('#failedTradeRows .activityTrade').click();
+  await expect(page.locator('#tradeContract')).toContainText('NOT CAPTURED');
+});
+
+test('Settings communicates state and persists pressed preferences', async ({ page }) => {
+  await openDesk(page);
+  await page.getByRole('button', { name: 'Open settings' }).click();
+  await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible();
+  await expect(page.locator('#lanOrders')).toHaveText('DISABLED');
+  await page.getByRole('button', { name: 'MONITOR' }).click();
+  await expect(page.getByRole('button', { name: 'MONITOR' })).toHaveAttribute('aria-pressed', 'true');
+  await page.reload();
+  await page.getByRole('button', { name: 'Open settings' }).click();
+  await expect(page.getByRole('button', { name: 'MONITOR' })).toHaveAttribute('aria-pressed', 'true');
+});
+
+test('Lab keeps extended endpoints lazy until a purpose section opens', async ({ page }) => {
+  let requests = 0;
+  page.on('request', (request) => {
+    if (/\/api\/(near_misses|research_surface)/.test(request.url())) requests += 1;
+  });
+  await openDesk(page);
+  await page.locator('.nav[data-page="research"]').click();
+  await expect(page.getByRole('heading', { name: 'Strategy lab' })).toBeVisible();
+  expect(requests).toBe(0);
+  await page.getByText('Distributions & misses', { exact: true }).click();
+  await expect.poll(() => requests).toBeGreaterThan(0);
+});
+
+test('typing letter shortcuts never changes the active page', async ({ page }) => {
+  await openDesk(page);
+  for (const key of ['a', 'c', 'h', 'i', 'l', 'm', 'r', 's', 'R']) await page.keyboard.press(key);
+  await expect(page.locator('#home')).toHaveClass(/active/);
 });

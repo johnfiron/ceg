@@ -38,6 +38,25 @@ class SafetyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'non-paper'):
                 app.paper_api_url('/orders')
 
+    def test_expanded_reading_universe_stays_out_of_execution_and_maps_news(self):
+        self.assertTrue({'AVGO','GOOGL','NFLX','JPM','BAC','XOM','COIN','PLTR','SMH','DIA'}.issubset(app.ALL_TICKERS))
+        self.assertTrue(set(app.READING_TICKERS).isdisjoint(app.MIDDAY_TICKERS))
+        payload={'news':[
+            {'headline':'Chip headline','summary':'Context','source':'wire','url':'https://example.test/1',
+             'created_at':'2026-08-24T12:00:00Z','symbols':['AVGO','SMH']},
+            {'headline':'Older headline','source':'wire','symbols':['AVGO']},
+        ]}
+        with mock.patch.object(app,'cache_get',return_value=None), \
+             mock.patch.object(app,'cache_set') as store, \
+             mock.patch.object(app,'getj',return_value=payload) as fetch:
+            rows=app.latest_stock_news(['AVGO','SMH'])
+        self.assertEqual(rows['AVGO']['headline'],'Chip headline')
+        self.assertEqual(rows['SMH']['source'],'wire')
+        self.assertIn('/v1beta1/news',fetch.call_args.args[0])
+        store.assert_called_once()
+        response=app.app.test_client().get('/api/news?symbols=NOTREAL')
+        self.assertEqual(response.status_code,400)
+
     def test_production_web_role_cannot_arm_or_read_broker_credentials(self):
         app.CFG.write_text(json.dumps({
             'alpaca_key':'key','alpaca_secret':'secret','broker_orders_enabled':True,
@@ -94,6 +113,7 @@ class SafetyTests(unittest.TestCase):
         self.assertIn("catch(e){$('setupMsg').textContent=e.message||String(e)}",html)
         self.assertIn('function applyMonitorLock(s)',html)
         self.assertIn("const FROM_VAULT=INTRO_Q.get('from')==='vault'",html)
+        self.assertIn("INTRO_Q.get('intro')==='skip'",html)
         self.assertIn('function finishIntroImmediate()',html)
         self.assertIn('if(SKIP_INTRO)finishIntroImmediate()',html)
         self.assertIn('if(ASH_BASE||FROM_VAULT)applyMonitorLock',html)
@@ -270,9 +290,58 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(plan[0]['action'],'insert')
         self.assertEqual(plan[0]['pnl'],-30.0)
         self.assertEqual(app.apply_broker_ledger_repair(plan),{'updated':0,'inserted':1})
-        con=app.db(); row=con.execute('SELECT strategy_id,ticker,status,pnl,exit_order_id FROM trades').fetchone(); con.close()
+        con=app.db()
+        row=con.execute('SELECT id,strategy_id,ticker,status,pnl,exit_order_id FROM trades').fetchone()
+        phases=[r['phase'] for r in con.execute('SELECT phase FROM trade_snapshots WHERE trade_id=? ORDER BY id',(row['id'],)).fetchall()]
+        codes=[r['code'] for r in con.execute('SELECT code FROM trade_audit_events WHERE trade_id=? ORDER BY id',(row['id'],)).fetchall()]
+        con.close()
         self.assertEqual((row['strategy_id'],row['ticker'],row['status'],row['pnl'],row['exit_order_id']),
                          ('ORB','IWM','CLOSED',-30.0,'sell1'))
+        self.assertEqual(phases,['ENTRY','EXIT'])
+        self.assertIn('TRADE_RECOVERED',codes)
+        self.assertIn('EXIT_FILLED',codes)
+
+    def test_ledger_repair_recovers_missing_uuid_liquidation_round_trip(self):
+        self._wipe_trades()
+        buy={'id':'buy1','client_order_id':'a53-20260820-opn-iwm','side':'buy','status':'filled',
+             'symbol':'IWM260820P00300000','qty':'1','filled_qty':'1','filled_avg_price':'0.83',
+             'submitted_at':'2026-08-20T13:51:15Z','filled_at':'2026-08-20T13:51:15Z'}
+        sell={'id':'liq1','client_order_id':'21b17cf4-8dbf-4dac-867b-d36d27ffa9c8','side':'sell','status':'filled',
+              'symbol':'IWM260820P00300000','qty':'1','filled_qty':'1','filled_avg_price':'2.36',
+              'filled_at':'2026-08-20T19:45:06Z'}
+        plan=app.broker_ledger_repair_plan([buy,sell])
+        self.assertEqual([(x['action'],x['pnl'],x['exit_order_id']) for x in plan],
+                         [('insert',153.0,'liq1')])
+
+    def test_ledger_repair_uses_broker_expiration_evidence_only(self):
+        self._wipe_trades()
+        buy={'id':'buy1','client_order_id':'a53-mvr-qqq-1786984649','side':'buy','status':'filled',
+             'symbol':'QQQ260817C00740000','qty':'1','filled_qty':'1','filled_avg_price':'0.02',
+             'submitted_at':'2026-08-17T16:37:29Z','filled_at':'2026-08-17T16:37:29Z'}
+        self.assertEqual(app.broker_ledger_repair_plan([buy]),[])
+        expiry={'activity_type':'OPEXP','symbol':'QQQ260817C00740000','qty':'-1','date':'2026-08-18'}
+        plan=app.broker_ledger_repair_plan([buy],[expiry])
+        self.assertEqual([(x['action'],x['pnl'],x['exit_kind']) for x in plan],
+                         [('insert',-2.0,'BROKER_EXPIRY')])
+        self.assertEqual(app.apply_broker_ledger_repair(plan),{'updated':0,'inserted':1})
+        con=app.db(); row=con.execute('SELECT status,pnl,exit_kind FROM trades').fetchone(); con.close()
+        self.assertEqual((row['status'],row['pnl'],row['exit_kind']),('CLOSED',-2.0,'BROKER_EXPIRY'))
+
+    def test_ledger_repair_corrects_expiry_from_same_symbol_generic_exit(self):
+        self._wipe_trades()
+        con=app.db()
+        con.execute("""INSERT INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,
+                       expiry,entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,status,pnl,exit_kind)
+                       VALUES(11,'RSI2','QQQ','CALL','QQQ260820C00723000',1,'2026-08-19T19:45:17Z',
+                       '2026-08-19','2026-08-20','buy11','a53-20260819-rsi2-qqq',0.45,
+                       '2026-08-19T19:45:17Z','2026-08-20','CLOSED',-45,'EXPIRED')""")
+        con.commit(); con.close()
+        sell={'id':'sell24','client_order_id':'x53-24','side':'sell','status':'filled',
+              'symbol':'QQQ260820C00723000','qty':'1','filled_qty':'1','filled_avg_price':'0.08',
+              'filled_at':'2026-08-20T13:35:04Z'}
+        plan=app.broker_ledger_repair_plan([sell])
+        self.assertEqual([(x['trade_id'],x['pnl'],x['exit_order_id']) for x in plan],
+                         [(11,-37.0,'sell24')])
 
     def test_startup_fails_closed_when_live_open_is_unexplained(self):
         self._paper_cfg(); self._wipe_trades()
@@ -349,6 +418,18 @@ class SafetyTests(unittest.TestCase):
                          ('ORB','QQQ260821C00570000',1.5,'broker'))
         self.assertIn('idx_option_marks_ts',indexes)
         self.assertIn('idx_option_marks_sleeve',indexes)
+
+    def test_current_snapshot_uses_current_session_for_overnight_position(self):
+        self._wipe_option_marks(); self._wipe_trades()
+        frozen=app.datetime(2026,8,21,11,0,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,trade_date,expiry,status)
+                       VALUES('MACD','QQQ','CALL','QQQ260824C00570000',1,'2026-08-20','2026-08-24','OPEN')""")
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen), \
+             mock.patch.object(app,'local_intraday_state',return_value={'c':570}) as state:
+            app.snapshot_positions([{'symbol':'QQQ260824C00570000','qty':'1','current_price':'1.50'}])
+        self.assertEqual(state.call_args.args,('QQQ','2026-08-21'))
 
     def test_option_mark_snapshot_retention_is_bounded(self):
         self._wipe_option_marks(); self._wipe_trades()
@@ -510,6 +591,26 @@ class SafetyTests(unittest.TestCase):
         params=gj.call_args[0][2]
         self.assertEqual(params['expiration_date_gte'],'2026-08-19')
         self.assertEqual(params['expiration_date_lte'],'2026-08-19')
+
+    def test_option_candidates_capture_quotes_volume_oi_and_component_grades(self):
+        frozen=app.datetime(2026,8,19,11,0,tzinfo=app.NY)
+        symbol='META260819C00100000'
+        payload={'option_contracts':[{
+            'symbol':symbol,'expiration_date':'2026-08-19','strike_price':'100','open_interest':321,
+        }]}
+        quote={symbol:{'bid':1.0,'ask':1.08,'spread':.08,'ts':frozen.isoformat(),'age_sec':0}}
+        with mock.patch.object(app,'now_ny',return_value=frozen), \
+             mock.patch.object(app,'getj',return_value=payload), \
+             mock.patch.object(app,'ah',return_value={}), \
+             mock.patch.object(app,'option_quotes',return_value=quote), \
+             mock.patch.object(app,'option_latest_volumes',return_value={symbol:456}):
+            _,_,_,_,style=app.option_contract(
+                'META','CALL',100,allow_0dte=True,style={'dte':'0dte','moneyness':'atm'})
+        candidate=style['_candidates'][0]
+        self.assertEqual((candidate['bid'],candidate['ask'],candidate['spread']),(1.0,1.08,.08))
+        self.assertEqual((candidate['volume'],candidate['open_interest']),(456,321))
+        self.assertEqual(candidate['components']['grades']['freshness']['grade'],'A')
+        self.assertEqual(style['_selected_quote']['volume'],456)
 
     def test_pdt_blocks_flagged_eod_under_25k_not_overnight(self):
         acct={'equity':10000,'daytrade_count':0,'pattern_day_trader':True}
@@ -927,6 +1028,130 @@ class SafetyTests(unittest.TestCase):
         con=app.db(); row=con.execute('SELECT broker_note,status FROM trades WHERE id=1').fetchone(); con.close()
         self.assertEqual(row['status'],'OPEN')
         self.assertEqual(row['broker_note'],'paper market order')
+
+    def test_canonical_trade_schema_migrates_without_replacing_activity(self):
+        con=app.db()
+        names={r['name'] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'trade_%'").fetchall()}
+        trade_cols={r['name'] for r in con.execute('PRAGMA table_info(trades)').fetchall()}
+        con.close()
+        self.assertTrue({'trade_snapshots','trade_predictions','trade_candidates','trade_audit_events'}<=names)
+        self.assertTrue({'origin','strategy_version','parameter_hash','fees','slippage','modeled_slippage',
+                         'actual_slippage','costs_source','exit_bid','exit_ask','exit_spread'}<=trade_cols)
+
+    def test_occ_identity_and_option_value_state_are_deterministic(self):
+        parsed=app.parse_occ_symbol('QQQ260824P00707000')
+        self.assertEqual((parsed['underlying'],parsed['type'],parsed['strike'],parsed['expiry']),
+                         ('QQQ','PUT',707.0,'2026-08-24'))
+        self.assertFalse(app.parse_occ_symbol('not-an-occ')['valid'])
+        otm=app.option_value_state('PUT',707,713.20,.75)
+        self.assertEqual(otm['state'],'OTM')
+        self.assertAlmostEqual(otm['distance_value'],6.2)
+        self.assertEqual((otm['intrinsic'],otm['extrinsic']),(0.0,.75))
+        itm=app.option_value_state('CALL',707,710.15,4.8)
+        self.assertEqual(itm['state'],'ITM')
+        self.assertAlmostEqual(itm['intrinsic'],3.15)
+        self.assertAlmostEqual(itm['extrinsic'],1.65)
+
+    def test_greeks_include_theta_and_vega(self):
+        frozen=app.datetime(2026,8,19,12,0,tzinfo=app.NY)
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            greeks=app.greeks_snap(713,707,'2026-08-21',4.8,'CALL')
+        self.assertIsNotNone(greeks['delta'])
+        self.assertIsNotNone(greeks['gamma'])
+        self.assertIsNotNone(greeks['theta'])
+        self.assertIsNotNone(greeks['vega'])
+
+    def test_canonical_endpoint_is_shared_for_open_and_closed_legacy_rows(self):
+        self._wipe_trades()
+        con=app.db()
+        con.execute("""INSERT INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,status,trade_date,
+                       expiry,entry_fill,exit_fill,pnl,exit_kind,origin)
+                       VALUES(9001,'MVR','QQQ','PUT','QQQ260824P00707000',1,'CLOSED','2026-08-22',
+                       '2026-08-24',.70,.92,22,'TARGET','SYSTEM')""")
+        con.commit(); con.close()
+        response=app.app.test_client().get('/api/trades/9001')
+        self.assertEqual(response.status_code,200)
+        item=response.get_json()
+        self.assertEqual(item['identity']['label'],'QQQ · PUT ↓')
+        self.assertEqual(item['identity']['strike'],707.0)
+        self.assertEqual(item['availability']['contract_intelligence'],'NOT_CAPTURED')
+        self.assertEqual(item['outcome']['realized_pnl'],22.0)
+
+    def test_prediction_snapshots_append_without_rewriting_entry(self):
+        con=app.db()
+        con.execute("""INSERT OR IGNORE INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,status,trade_date)
+                       VALUES(9001,'MVR','QQQ','PUT','QQQ260824P00707000',1,'CLOSED','2026-08-22')""")
+        con.execute('DELETE FROM trade_predictions WHERE trade_id=9001')
+        con.commit(); con.close()
+        entry={'kind':'ENTRY','ts':'2026-08-22T10:30:00-04:00','direction':'PUT',
+               'horizon':'45-120 minutes','confidence':.68,'model':'test'}
+        update={'kind':'UPDATE','ts':'2026-08-22T10:52:00-04:00','direction':'PUT',
+                'horizon':'45-120 minutes','confidence':.75,'model':'test'}
+        app.persist_prediction(9001,entry)
+        app.persist_prediction(9001,update)
+        con=app.db()
+        rows=[dict(r) for r in con.execute(
+            'SELECT kind,confidence FROM trade_predictions WHERE trade_id=9001 ORDER BY id').fetchall()]
+        con.close()
+        self.assertEqual(rows,[{'kind':'ENTRY','confidence':.68},{'kind':'UPDATE','confidence':.75}])
+
+    def test_prediction_model_freezes_scenarios_premium_and_version_provenance(self):
+        frozen=app.datetime(2026,8,22,10,30,tzinfo=app.NY)
+        sig={'strategy_id':'MVR','ticker':'QQQ','direction':'PUT','score':1.25,
+             'horizon':'EOD','details':{}}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            strategy=app._strategy_record('MVR')
+            pred=app.prediction_snapshot(
+                sig,strategy,spot=700,quote={'bid':.70,'ask':.74},greeks={'delta':-.48})
+        self.assertEqual(strategy['version'],'1.0.0')
+        self.assertNotEqual(strategy['version'],'unversioned')
+        self.assertEqual(len(strategy['parameter_hash']),12)
+        self.assertEqual(len(pred['scenarios']),4)
+        self.assertIsNotNone(pred['target_premium_lo'])
+        self.assertIsNotNone(pred['target_premium_hi'])
+        self.assertIn('NOT_CALIBRATED',pred['payload']['confidence_provenance'])
+
+    def test_execution_costs_distinguish_modeled_and_actual_slippage(self):
+        costs=app.execution_costs({
+            'qty':1,'entry_bid':1.0,'entry_ask':1.10,'entry_spread':.10,'entry_fill':1.08,
+            'exit_bid':1.38,'exit_ask':1.42,'exit_spread':.04,'exit_fill':1.39,
+        },entry_order={'commission':'0'},exit_order={'commission':'0'})
+        self.assertEqual(costs['modeled_slippage'],7.0)
+        self.assertEqual(costs['actual_slippage'],4.0)
+        self.assertEqual(costs['fees'],0.0)
+
+    def test_pnl_reconciliation_keeps_account_change_distinct(self):
+        rows=[
+            {'status':'CLOSED','trade_date':'2026-08-22','pnl':20,'fees':1,'slippage':2},
+            {'status':'OPEN','trade_date':'2026-08-22','unrealized_pl':5,'fees':0,'slippage':0},
+        ]
+        got=app.pnl_reconciliation(rows,'2026-08-22',{'equity':10530,'last_equity':10000})
+        self.assertEqual(got['session_total'],22.0)
+        self.assertEqual(got['account_daily_change'],530.0)
+        self.assertEqual(got['difference'],508.0)
+        overnight=app.pnl_reconciliation(
+            [{'status':'OPEN','trade_date':'2026-08-21','unrealized_pl':5,'fees':None,'slippage':None}],
+            '2026-08-22',{'equity':10000,'last_equity':10015})
+        self.assertEqual(overnight['unrealized'],5.0)
+        self.assertFalse(overnight['cost_capture']['complete'])
+        empty=app.pnl_reconciliation([],'2026-08-22',{'equity':10000,'last_equity':10000})
+        self.assertFalse(empty['cost_capture']['complete'])
+
+    def test_activity_is_a_tappable_ledger_with_one_inspector(self):
+        response=app.app.test_client().get('/')
+        html=response.get_data(as_text=True)
+        response.close()
+        self.assertIn('id="tradeInspector"',html)
+        self.assertIn('function openTradeInspector(id,preserveReturn=false)',html)
+        self.assertIn('class=activityTrade',html)
+        self.assertIn('OPEN TRADE INSPECTOR',html)
+        self.assertIn('Candidate set not captured for this legacy trade.',html)
+        self.assertIn('TRADES ON THIS CHART',html)
+        self.assertIn('function renderInspectTrades(rows)',html)
+        self.assertIn('let svc=s.services||{}',html)
+        self.assertIn('BROKER QUOTES',html)
+        self.assertNotIn('id="closedThreads"',html)
 
     def _submit(self, sig, states):
         os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
