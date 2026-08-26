@@ -3,5 +3,14 @@
   "alpaca_secret": "",
   "fred_key": "",
   "broker_orders_enabled": false,
+  "new_entries_enabled": false,
+  "adaptive_allocator_enabled": true,
+  "adaptive_exploration_enabled": false,
+  "max_daily_explore": 1,
+  "nlp_api_url": "http://HOME_TAILSCALE_IP:8790",
+  "nlp_shared_secret": "",
+  "nlp_timeout_sec": 1.5,
+  "nlp_min_confidence": 0.45,
+  "nlp_max_age_sec": 1800,
   "contracts_per_trade": 1
 }

@@ -32,6 +32,43 @@ class SafetyTests(unittest.TestCase):
         os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
         self.assertTrue(app.broker_orders_enabled())
 
+    def test_entry_interlock_is_separate_from_risk_reducing_orders(self):
+        app.CFG.write_text(json.dumps({
+            'broker_orders_enabled':True,
+            'new_entries_enabled':False,
+        }))
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
+        self.assertTrue(app.broker_orders_enabled())
+        self.assertFalse(app.new_entries_enabled())
+        with mock.patch.object(app,'postj',return_value={'id':'sell-ok'}):
+            order=app.place_broker_order({
+                'client_order_id':'x53-1','symbol':'SPY260826C00700000',
+                'qty':'1','side':'sell','type':'market','time_in_force':'day',
+            })
+        self.assertEqual(order['id'],'sell-ok')
+
+    def test_buy_order_rechecks_entry_pause_at_submission_boundary(self):
+        app.CFG.write_text(json.dumps({
+            'broker_orders_enabled':True,
+            'new_entries_enabled':False,
+        }))
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
+        payload={'client_order_id':'a53-20260826-opn-spy','symbol':'SPY260826C00700000',
+                 'qty':'1','side':'buy','type':'market','time_in_force':'day'}
+        with mock.patch.object(app,'broker_order_by_client_id',return_value=None), \
+             mock.patch.object(app,'postj') as post:
+            with self.assertRaisesRegex(RuntimeError,'paused'):
+                app.place_broker_order(payload)
+        post.assert_not_called()
+
+    def test_alpaca_nanosecond_timestamp_is_fresh(self):
+        frozen=app.datetime(2026,8,26,9,51,20,tzinfo=app.NY)
+        parsed=app.parse_ny('2026-08-26T13:51:19.013472866Z')
+        self.assertEqual(parsed.microsecond,13472)
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            age=(app.now_ny()-parsed).total_seconds()
+        self.assertLess(age,2)
+
     def test_broker_endpoint_is_permanently_paper_only(self):
         self.assertEqual(app.paper_api_url('/account'),'https://paper-api.alpaca.markets/v2/account')
         with mock.patch.object(app,'PAPER','https://api.alpaca.markets/v2'):
@@ -79,7 +116,7 @@ class SafetyTests(unittest.TestCase):
         self.assertTrue((response.get_json() or {}).get('configured'))
 
     def test_order_retry_recovers_deterministic_client_id(self):
-        app.CFG.write_text(json.dumps({'broker_orders_enabled':True}))
+        app.CFG.write_text(json.dumps({'broker_orders_enabled':True,'new_entries_enabled':True}))
         os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
         expected={'id':'existing','client_order_id':'a53-20260818-ceg-spy'}
         with mock.patch.object(app,'broker_order_by_client_id',side_effect=[None,expected]), \
@@ -87,6 +124,16 @@ class SafetyTests(unittest.TestCase):
             got=app.place_broker_order({'client_order_id':expected['client_order_id'],'symbol':'SPY','qty':'1'})
         self.assertEqual(got,expected)
         post.assert_called_once()
+
+    def test_lost_buy_response_is_reported_as_ambiguous(self):
+        app.CFG.write_text(json.dumps({'broker_orders_enabled':True,'new_entries_enabled':True}))
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
+        payload={'client_order_id':'a53-20260826-opn-spy','symbol':'SPY260826C00700000',
+                 'qty':'1','side':'buy','type':'market','time_in_force':'day'}
+        with mock.patch.object(app,'broker_order_by_client_id',return_value=None), \
+             mock.patch.object(app,'postj',side_effect=TimeoutError('response lost')):
+            with self.assertRaises(app.AmbiguousBrokerOrder):
+                app.place_broker_order(payload)
 
     def test_health_fails_without_runner_heartbeat(self):
         con=app.db(); con.execute("DELETE FROM meta WHERE k='heartbeat'"); con.commit(); con.close()
@@ -612,6 +659,26 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(candidate['components']['grades']['freshness']['grade'],'A')
         self.assertEqual(style['_selected_quote']['volume'],456)
 
+    def test_contract_quality_tie_keeps_exact_target(self):
+        frozen=app.datetime(2026,8,19,11,0,tzinfo=app.NY)
+        exact='META260819C00100000'; farther='META260819C00101000'
+        payload={'option_contracts':[
+            {'symbol':exact,'expiration_date':'2026-08-19','strike_price':'100','open_interest':500},
+            {'symbol':farther,'expiration_date':'2026-08-19','strike_price':'101','open_interest':500},
+        ]}
+        quotes={s:{'bid':1.0,'ask':1.05,'spread':.05,'ts':frozen.isoformat(),'age_sec':0} for s in (exact,farther)}
+        quality={'score':75,'grade':'B','components':{},'quote':{}}
+        with mock.patch.object(app,'now_ny',return_value=frozen), \
+             mock.patch.object(app,'getj',return_value=payload), \
+             mock.patch.object(app,'ah',return_value={}), \
+             mock.patch.object(app,'option_quotes',return_value=quotes), \
+             mock.patch.object(app,'option_latest_volumes',return_value={exact:500,farther:500}), \
+             mock.patch.object(app,'greeks_snap',return_value={'delta':.5}), \
+             mock.patch.object(app,'contract_quality',return_value=quality):
+            symbol,_,_,_,_=app.option_contract(
+                'META','CALL',100,allow_0dte=True,style={'dte':'0dte','moneyness':'atm'})
+        self.assertEqual(symbol,exact)
+
     def test_pdt_blocks_flagged_eod_under_25k_not_overnight(self):
         acct={'equity':10000,'daytrade_count':0,'pattern_day_trader':True}
         with mock.patch.object(app,'broker_account',return_value=acct):
@@ -742,7 +809,7 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(app.already_signaled('2026-08-19','OSF','NVDA'))
         self.assertTrue(app.already_signaled('2026-08-19','ORB','QQQ'))
 
-    def test_daily_cap_counts_open_risk_not_scratches(self):
+    def test_daily_cap_counts_closed_trades_but_cluster_stays_time_bounded(self):
         self._wipe_trades()
         frozen=app.datetime(2026,8,19,10,38,tzinfo=app.NY)
         con=app.db()
@@ -752,7 +819,7 @@ class SafetyTests(unittest.TestCase):
                        VALUES('ORB','TSLA','CALL','OPEN','2026-08-19','2026-08-19T10:28:00-04:00')""")
         con.commit(); con.close()
         with mock.patch.object(app,'now_ny',return_value=frozen):
-            self.assertEqual(app.daily_fire_count('ORB','2026-08-19'),1)
+            self.assertEqual(app.daily_fire_count('ORB','2026-08-19'),2)
             self.assertEqual(app.cluster_count('2026-08-19',20),1)
         self.assertTrue(app.loser_cooldown('ORB','2026-08-19','QQQ'))
         self.assertFalse(app.loser_cooldown('ORB','2026-08-19','SPY'))
@@ -826,7 +893,7 @@ class SafetyTests(unittest.TestCase):
         self.assertFalse(app.already_signaled('2026-08-19','ORB','NVDA'))
         self.assertTrue(app.already_signaled('2026-08-19','ORB','AAPL'))
 
-    def test_three_open_orbs_cap_fourth_then_retry_after_scratch(self):
+    def test_daily_cap_remains_consumed_after_a_trade_closes(self):
         self._paper_cfg(); self._wipe_trades()
         frozen=app.datetime(2026,8,19,10,38,tzinfo=app.NY)
         con=app.db()
@@ -843,9 +910,9 @@ class SafetyTests(unittest.TestCase):
         con.execute("UPDATE trades SET status='CLOSED',pnl=-75 WHERE ticker='QQQ'")
         con.commit(); con.close()
         with mock.patch.object(app,'now_ny',return_value=frozen):
-            self.assertEqual(app.daily_fire_count('ORB','2026-08-19'),2)
+            self.assertEqual(app.daily_fire_count('ORB','2026-08-19'),3)
             status,_=self._submit(sig,states)
-        self.assertEqual(status,'ENTRY_SUBMITTED')
+        self.assertEqual(status,'SKIP_DAILY_CAP')
 
     def test_submit_opn_with_22_bars_and_iex_junk_is_not_dnt(self):
         self._paper_cfg(); self._wipe_trades()
@@ -975,6 +1042,23 @@ class SafetyTests(unittest.TestCase):
         ex.assert_not_called()
         con=app.db(); row=con.execute('SELECT status FROM trades WHERE id=1').fetchone(); con.close()
         self.assertEqual(row['status'],'OPEN')
+
+    def test_premium_loss_boundary_exits_one_lot(self):
+        self._wipe_trades()
+        frozen=app.datetime(2026,8,19,10,20,tzinfo=app.NY)
+        con=app.db()
+        con.execute("""INSERT INTO trades(id,strategy_id,ticker,direction,option_symbol,qty,status,trade_date,
+                       entry_fill,entry_filled_at,horizon,atm_spot)
+                       VALUES(1,'MVR','QQQ','CALL','QQQ260819C00710000',1,'OPEN','2026-08-19',
+                       2.0,'2026-08-19T10:00:00-04:00','EOD',710.0)""")
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen), \
+             mock.patch.object(app,'mae_mfe_from_tape',return_value=(-0.005,0.002)), \
+             mock.patch.object(app,'option_quote',return_value={'bid':1.1,'ask':1.2,'age_sec':1}), \
+             mock.patch.object(app,'local_intraday_state',return_value={'c':706.0,'vwap_dist_atr':-1.0}), \
+             mock.patch.object(app,'submit_exit') as ex:
+            app.refresh_excursions_and_stops()
+        self.assertEqual(ex.call_args.args[1],'RISK')
 
     def test_option_pnl_rounds_to_cents(self):
         self.assertEqual(app.option_pnl(1.6,0.96,1),-64.0)
@@ -1153,17 +1237,156 @@ class SafetyTests(unittest.TestCase):
         self.assertIn('BROKER QUOTES',html)
         self.assertNotIn('id="closedThreads"',html)
 
+    def test_unproven_context_stays_shadow_only(self):
+        self._wipe_trades()
+        con=app.db(); con.execute('DELETE FROM shadow_trades'); con.commit(); con.close()
+        app.CFG.write_text(json.dumps({
+            'broker_orders_enabled':True,'new_entries_enabled':True,
+            'adaptive_allocator_enabled':True,
+        }))
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
+        sig={'strategy_id':'OPN','ticker':'TSLA','direction':'CALL','score':1.4}
+        got=app.adaptive_entry_decision(sig,{'TSLA':{'regime':'TREND','ret':0.01,'rvol':1.5}})
+        self.assertFalse(got['allow'])
+        self.assertEqual(got['state'],'SHADOW')
+        self.assertEqual(got['regime'],'TREND_UP')
+
+    def test_active_override_cannot_bypass_missing_evidence(self):
+        self._wipe_trades()
+        con=app.db(); con.execute('DELETE FROM shadow_trades'); con.commit(); con.close()
+        app.CFG.write_text(json.dumps({
+            'broker_orders_enabled':True,'new_entries_enabled':True,
+            'adaptive_allocator_enabled':True,
+            'adaptive_strategy_states':{'OPN':'ACTIVE'},
+        }))
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
+        got=app.adaptive_entry_decision(
+            {'strategy_id':'OPN','ticker':'TSLA','direction':'CALL','score':1},
+            {'TSLA':{'regime':'TREND','ret':.01,'rvol':1.5}})
+        self.assertFalse(got['allow'])
+        self.assertEqual(got['state'],'SHADOW')
+
+    def test_contextual_shadow_evidence_can_naturally_activate(self):
+        self._wipe_trades()
+        con=app.db(); con.execute('DELETE FROM shadow_trades')
+        base=app.date_cls(2026,7,1)
+        for i in range(30):
+            day=(base+app.timedelta(days=i)).isoformat()
+            con.execute("""INSERT INTO shadow_trades(
+                           ts,trade_date,strategy_id,ticker,direction,status,entry_regime,
+                           outcome_pnl,evaluated_at)
+                           VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (day+'T10:00:00-04:00',day,'OPN','TSLA','CALL','SKIP_ADAPTIVE_SHADOW',
+                         'TREND_UP',25,day+'T15:50:00-04:00'))
+        con.commit(); con.close()
+        app.CFG.write_text(json.dumps({
+            'broker_orders_enabled':True,'new_entries_enabled':True,
+            'adaptive_allocator_enabled':True,'adaptive_min_days':30,
+            'adaptive_min_regime_days':10,
+        }))
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
+        frozen=app.datetime(2026,8,26,10,0,tzinfo=app.NY)
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            got=app.adaptive_entry_decision(
+                {'strategy_id':'OPN','ticker':'TSLA','direction':'CALL','score':1},
+                {'TSLA':{'regime':'TREND','ret':.01,'rvol':1.5}})
+        self.assertTrue(got['allow'])
+        self.assertEqual(got['state'],'ACTIVE')
+
+    def test_paused_shadow_candidate_records_executable_outcome(self):
+        self._wipe_trades()
+        con=app.db(); con.execute('DELETE FROM shadow_trades'); con.commit(); con.close()
+        entry_time=app.datetime(2026,8,26,9,51,tzinfo=app.NY)
+        sig={'strategy_id':'OPN','ticker':'TSLA','direction':'CALL','horizon':'EOD','window':'09:51'}
+        extra={
+            'option':'TSLA260826C00350000','spot':350,'strike':350,'expiry':'2026-08-26',
+            'horizon':'EOD','window':'09:51','qty':1,'regime':'TREND_UP',
+            'quality':{'quote':{'bid':0.95,'ask':1.0}},'greeks':{'iv':0.5,'delta':0.5},
+            'allocator':{'state':'SHADOW','version':app.ALLOCATOR_VERSION,'regime':'TREND_UP'},
+            'skip_reason':'collecting evidence',
+        }
+        with mock.patch.object(app,'now_ny',return_value=entry_time):
+            app.log_shadow(sig,'SKIP_ADAPTIVE_SHADOW',extra)
+        exit_time=app.datetime(2026,8,26,15,51,tzinfo=app.NY)
+        with mock.patch.object(app,'now_ny',return_value=exit_time), \
+             mock.patch.object(app,'option_quote',return_value={'bid':1.5,'ask':1.55}):
+            app.evaluate_shadow_outcomes()
+            evidence=app.sleeve_evidence('OPN','TSLA','TREND_UP')
+        con=app.db(); row=con.execute('SELECT outcome_pnl,evaluated_at FROM shadow_trades').fetchone(); con.close()
+        self.assertEqual(row['outcome_pnl'],50.0)
+        self.assertIsNotNone(row['evaluated_at'])
+        self.assertEqual(evidence['context']['trades'],1)
+
+    def test_weekly_high_water_pauses_new_risk(self):
+        frozen=app.datetime(2026,8,26,10,0,tzinfo=app.NY)
+        con=app.db(); con.execute('DELETE FROM account_snapshots')
+        con.execute("""INSERT INTO account_snapshots(ts,equity) VALUES
+                       ('2026-08-25T15:55:00-04:00',101000),
+                       ('2026-08-26T09:30:00-04:00',100500)""")
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            reason,snap=app.account_equity_guard({'equity':100000})
+        self.assertIn('weekly high-water giveback',reason)
+        self.assertEqual(snap['weekly_high'],101000)
+
+    def test_daily_equity_guard_uses_broker_previous_close(self):
+        frozen=app.datetime(2026,8,26,10,0,tzinfo=app.NY)
+        con=app.db(); con.execute('DELETE FROM account_snapshots')
+        con.execute("INSERT INTO account_snapshots(ts,equity) VALUES('2026-08-26T09:55:00-04:00',99500)")
+        con.commit(); con.close()
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            reason,snap=app.account_equity_guard({'equity':99400,'last_equity':100000})
+        self.assertIn('daily equity loss limit',reason)
+        self.assertEqual(snap['daily_start'],100000)
+
+    def test_unconfirmed_entry_consumes_caps_and_unknown_debit_fails_closed(self):
+        self._wipe_trades()
+        con=app.db()
+        con.execute("""INSERT INTO trades(strategy_id,ticker,direction,status,trade_date,signal_ts,qty)
+                       VALUES('OPN','SPY','CALL','ENTRY_UNCONFIRMED','2026-08-26',
+                              '2026-08-26T09:51:00-04:00',1)""")
+        con.commit(); con.close()
+        self.assertEqual(app.daily_fire_count('OPN','2026-08-26'),1)
+        reason,_=app.portfolio_risk_block('IWM',1.0,1,{'equity':100000})
+        self.assertIn('open debit unknown',reason)
+
+    def test_portfolio_cap_blocks_third_concurrent_trade(self):
+        self._wipe_trades()
+        con=app.db()
+        for ticker in ('SPY','QQQ'):
+            con.execute("""INSERT INTO trades(strategy_id,ticker,direction,status,trade_date,qty,entry_fill)
+                           VALUES('OPN',?,'CALL','OPEN','2026-08-26',1,1.0)""",(ticker,))
+        con.commit(); con.close()
+        reason,snap=app.portfolio_risk_block('IWM',1.0,1,{'equity':100000})
+        self.assertIn('concurrent trade cap',reason)
+        self.assertEqual(snap['open'],2)
+
+    def test_grade_c_contract_fails_the_pretrade_checklist(self):
+        self._wipe_trades()
+        frozen=app.datetime(2026,8,19,9,51,tzinfo=app.NY)
+        states={'IWM':{'c':302.22,'bars':22,'session_pct':0.95,'sym':'IWM'}}
+        sig={'strategy_id':'OPN','ticker':'IWM','direction':'CALL','horizon':'EOD','window':'09:51'}
+        quality={'score':60,'grade':'C','components':{},'quote':{}}
+        with mock.patch.object(app,'now_ny',return_value=frozen), \
+             mock.patch.object(app,'contract_quality',return_value=quality):
+            status,extra=self._submit(sig,states)
+        self.assertEqual(status,'SKIP_CHECKLIST')
+        self.assertIn('grade C',extra['skip_reason'])
+
     def _submit(self, sig, states):
         os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
         app.CFG.write_text(json.dumps({
             'alpaca_key':'k','alpaca_secret':'s','fred_key':'f','keys_ok':True,
-            'broker_orders_enabled':True,'max_daily_fires':3,'max_cluster':5,
+            'broker_orders_enabled':True,'new_entries_enabled':True,
+            'adaptive_allocator_enabled':False,'max_daily_fires':3,'max_cluster':5,
         }))
         spot=states[sig['ticker']]['c']
         opt=f"{sig['ticker']}260819C00001000"
         with mock.patch.object(app,'option_contract',return_value=(opt,'2026-08-19',spot,'0dte atm',{'dte':'0dte','moneyness':'atm'})), \
-             mock.patch.object(app,'option_quote',return_value={'bid':1.0,'ask':1.05,'spread':0.05,'age_sec':1}), \
+             mock.patch.object(app,'option_quote',return_value={'bid':1.0,'ask':1.05,'spread':0.05,'age_sec':1,'volume':1000}), \
              mock.patch.object(app,'pdt_block',return_value=None), \
+             mock.patch.object(app,'account_equity_guard',return_value=(None,{'equity':100000})), \
+             mock.patch.object(app,'portfolio_risk_block',return_value=(None,{'open':0})), \
              mock.patch.object(app,'session_coverage',return_value={sig['ticker']:{'pct':0.97}}), \
              mock.patch.object(app,'place_broker_order',return_value={'id':'ord-test'}), \
              mock.patch.object(app,'greeks_snap',return_value={'iv':0.2,'delta':0.5,'gamma':0.1}), \
@@ -1171,6 +1394,70 @@ class SafetyTests(unittest.TestCase):
              mock.patch.object(app,'log_shadow'), \
              mock.patch.object(app,'event'):
             return app.submit_entry(sig, states)
+
+    def test_nlp_outage_blocks_news_sensitive_but_not_quantitative_signal(self):
+        states={'SPY':{'news_nlp':{'status':'UNAVAILABLE'}}}
+        quant={'strategy_id':'ORB','ticker':'SPY'}
+        news={**quant,'strategy_id':'NEWS','requires_nlp':True}
+        self.assertIsNone(app.nlp_required_block(quant,states))
+        self.assertIn('unavailable',app.nlp_required_block(news,states))
+
+    def test_fresh_confident_nlp_allows_news_sensitive_signal(self):
+        frozen=app.datetime(2026,8,26,11,0,tzinfo=app.NY)
+        states={'SPY':{'news_nlp':{
+            'status':'READY','confidence':0.8,
+            'source_ts':'2026-08-26T10:55:00-04:00',
+        }}}
+        app.CFG.write_text(json.dumps({'nlp_min_confidence':0.45,'nlp_max_age_sec':1800}))
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            self.assertIsNone(app.nlp_required_block(
+                {'strategy_id':'NEWS','ticker':'SPY','requires_nlp':True},states))
+
+    def test_explicit_exploration_lane_allows_one_lot_candidate(self):
+        self._wipe_trades()
+        app.CFG.write_text(json.dumps({
+            'broker_orders_enabled':True,'new_entries_enabled':True,
+            'adaptive_allocator_enabled':True,'adaptive_exploration_enabled':True,
+        }))
+        os.environ['CEG_ALLOW_BROKER_ORDERS']='true'
+        got=app.adaptive_entry_decision(
+            {'strategy_id':'N0D','ticker':'SPY','direction':'CALL','score':1},
+            {'SPY':{'ret':.01,'rvol':1.3}})
+        self.assertTrue(got['allow'])
+        self.assertEqual(got['state'],'EXPLORE')
+
+    def test_news_event_routes_to_one_evidence_horizon(self):
+        frozen=app.datetime(2026,8,26,11,0,tzinfo=app.NY)
+        states={'AAPL':{
+            'rvol':1.1,
+            'news_nlp':{
+                'status':'READY','confidence':0.8,'novelty':0.9,'sentiment':0.6,
+                'event_class':'EARNINGS','content_hash':'x'*64,
+                'source_ts':'2026-08-26T10:55:00-04:00',
+            },
+        }}
+        with mock.patch.object(app,'now_ny',return_value=frozen):
+            signals,_=app.news_horizon_signals(states)
+        self.assertEqual(len(signals),1)
+        self.assertEqual(signals[0]['strategy_id'],'NWK')
+        self.assertEqual(signals[0]['horizon'],'WEEKLY')
+        self.assertTrue(signals[0]['requires_nlp'])
+
+    def test_multi_horizon_exit_dates_use_market_sessions(self):
+        self.assertEqual(app.horizon_exit_due('2026-04-02','OVERNIGHT'),'2026-04-06')
+        self.assertEqual(app.horizon_exit_due('2026-04-02','WEEKLY'),'2026-04-10')
+        self.assertGreater(app.horizon_exit_due('2026-04-02','MONTHLY'),'2026-04-20')
+
+    def test_learning_status_never_returns_nlp_secret(self):
+        app.CFG.write_text(json.dumps({
+            'nlp_api_url':'http://100.64.0.2:8790',
+            'nlp_shared_secret':'s'*40,
+        }))
+        response=app.app.test_client().get('/api/learning/status')
+        self.assertEqual(response.status_code,200)
+        payload=response.get_json()
+        self.assertTrue(payload['nlp']['configured'])
+        self.assertNotIn('secret',json.dumps(payload).lower())
 
 
 if __name__=='__main__':

@@ -8,7 +8,9 @@ Open http://127.0.0.1:8765
 
 - Session clock and plain-language explain on Home
 - Activity is the paper book (open/closed fills + comment threads). Replay stays in the file, hidden from the dock.
-- Fifteen models: 3:45 overnight (CEG, VCT, XED, …) and midday sleeves (OPN, OSF, ORB, VRC, MVR)
+- Eighteen models: 3:45 overnight, midday sleeves, and three event-learning horizons
+- Three paper-research headline horizons (0DTE, weekly, monthly) backed by the private home NLP service
+- Prospective full-spread labels and independent online horizon heads; unproven contexts remain shadow or explicitly capped exploration
 - Lab: shadow book, debrief, snapshots, research metrics
 - Title door: flakes or candles × white / market / pink. Identity default is **flakes + white**. Path-drawn A is shipped; do not rebuild it.
 
@@ -95,6 +97,11 @@ commit to `main`. Weekday promote to `main` after 16:10 ET.
 `ash-backup.timer` creates a consistent SQLite backup daily and retains 14.
 Deployment keeps the newest three immutable releases. Journald is capped at
 300 MB with a 14-day maximum retention so logs cannot silently fill a small VM.
+
+The required NLP service runs on the home device, not the e2-micro. See
+`docs/home-nlp.md`, `requirements-home-nlp.txt`, and
+`deploy/systemd/ash-home-nlp.service`. If it is unavailable, headline-sensitive
+entries fail closed while quantitative sleeves and all exits remain independent.
 
 Useful checks:
 

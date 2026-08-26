@@ -1,0 +1,6 @@
+# Install only on the home inference/training server after selecting
+# a CPU or GPU PyTorch build. The e2-micro continues to use requirements.txt.
+setuptools>=83
+transformers
+safetensors
+accelerate

@@ -4,6 +4,10 @@ from datetime import datetime, timedelta, date as date_cls
 from zoneinfo import ZoneInfo
 import requests, sqlite3, json, os, time, math, statistics, threading, traceback, subprocess, shutil, zipfile, io, random, hashlib, hmac, re
 from html import escape as html_escape
+from feeds.nlp_client import NlpClient, NlpQueue
+from learner.calendar import add_sessions, next_session_date
+from learner.runtime import LearningRuntime
+from learner.store import LearningStore
 
 ROOT=Path(__file__).resolve().parent
 ENVIRONMENT=(os.environ.get('CEG_ENV') or 'development').strip().lower()
@@ -54,15 +58,19 @@ READING_TICKERS=['AVGO','GOOGL','NFLX','JPM','BAC','XOM','COIN','PLTR','SMH','DI
 ALL_TICKERS=list(dict.fromkeys(TICKERS+MIDDAY_TICKERS+READING_TICKERS))
 EOD_STRATEGY_IDS=['CEG','VCT','XED','LAR','RSI2','BB','MACD','DON','STO','KEL']
 MIDDAY_STRATEGY_IDS=['OPN','OSF','ORB','VRC','MVR']
-OPEN_TRADE_STATUSES=('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED')
+NEWS_STRATEGY_IDS=['N0D','NWK','NMO']
+OPEN_TRADE_STATUSES=('ENTRY_SUBMITTED','ENTRY_UNCONFIRMED','OPEN','EXIT_SUBMITTED')
 OPENING_DNT_SLEEVES=frozenset(('OPN','OSF'))
 ORB_HELD_CLOSES=3
 RETRYABLE_SIGNAL_STATUSES=('ERROR','SKIP_DNT','SKIP_STALE_QUOTE','SKIP_DAILY_CAP','SKIP_CLUSTER',
-                           'SKIP_CHECKLIST','SKIP_NO_0DTE','SKIP_NO_CONTRACT','SKIP_BP','SKIP_OPPOSITE','SKIP_GUEST')
+                           'SKIP_CHECKLIST','SKIP_NO_0DTE','SKIP_NO_CONTRACT','SKIP_BP','SKIP_OPPOSITE',
+                           'SKIP_GUEST','SKIP_NLP_REQUIRED')
 PENDING_SIGNAL_STALE_SEC=120
 DESK_WINDOW_DAYS=30
 OPTION_MARK_RETENTION_DAYS=30
 _HIST_THREAD=None
+_NLP_QUEUE=None
+_LEARNING_RUNTIME=None
 NOTES=ROOT/'notes.md'
 BACKUP_DIR=DATA/'backups'
 app=Flask(__name__, static_folder=str(STATIC))
@@ -83,6 +91,9 @@ STRATEGIES=[
  {'id':'ORB','name':'Opening Range Breakout','origin':'New midday','author':'Intraday session','session':'10:05-11:30','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Held break of the 09:30-10:00 range (3 consecutive 1-minute closes still outside and ≥15bps through the box) with time-adjusted RVOL; ATM same-day option so the break can show in P&L.','plain':'After 10:00 the 30-minute range is locked. Three 1-minute closes outside, still outside, and at least 15bps through the box — not a one-bar poke or a 7bp leak, and not a name that was already outside at 10:05.'},
  {'id':'VRC','name':'VWAP Reclaim','origin':'New midday','author':'Trend continuation','session':'10:30-13:00','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Ride a reclaim of session VWAP rather than fading a stretch. ATM 0DTE.','plain':'Opposite of MVR. If price spent time on one side of VWAP and then reclaims it with volume, go with the reclaim (CALL reclaim from below, PUT lose VWAP from above).'},
  {'id':'MVR','name':'Midday VWAP Reversion','origin':'New midday','author':'Intraday session','session':'11:00-14:30','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Fade a 5-min RSI extreme stretched from session VWAP; ATM same-day option so a VWAP snapback can show in P&L.','plain':'Mean-reversion sleeve. Only when stretched ≥1.25 ATR from VWAP and 5-min RSI is extreme. Today’s 2¢ 0DTEs did not express this; ATM is the point of the style.'},
+ {'id':'N0D','name':'Headline Intraday Reaction','origin':'Research','author':'Event-conditioned learner','session':'09:35-14:30','horizon':'EOD','opt':{'dte':'0dte','moneyness':'atm'},'desc':'Novel, high-confidence macro or immediate event headline confirmed by the tape; paper exploration only until promoted.','plain':'A fresh event changes the intraday distribution. NLP cannot fire alone: the tape, option liquidity, costs, and learner all must agree.'},
+ {'id':'NWK','name':'Headline Weekly Drift','origin':'Research','author':'Event-conditioned learner','session':'09:35-14:30','horizon':'WEEKLY','opt':{'dte':'weekly','moneyness':'atm'},'desc':'Novel earnings or product event evaluated over one to five sessions.','plain':'Tests whether a fresh, specific event drifts over the next week after full option spread costs.'},
+ {'id':'NMO','name':'Headline Monthly Repricing','origin':'Research','author':'Event-conditioned learner','session':'09:35-14:30','horizon':'MONTHLY','opt':{'dte':'monthly','moneyness':'atm'},'desc':'Material regulatory, capital, or M&A event evaluated over roughly twenty sessions.','plain':'Longer-horizon repricing candidate. It remains exploration-only until independent monthly labels validate it.'},
 ]
 STRATEGY_VERSIONS={s['id']:'1.0.0' for s in STRATEGIES}
 PREDICTION_MODELS={
@@ -377,6 +388,116 @@ def cfg():
         except:pass
     return {}
 
+
+def nlp_queue():
+    """Lazy private NLP client; never create network workers in the web process."""
+    global _NLP_QUEUE
+    if _NLP_QUEUE is not None:return _NLP_QUEUE
+    if PROCESS_ROLE not in ('runner','test'):return None
+    c=cfg(); url=str(c.get('nlp_api_url') or '').strip(); secret=str(c.get('nlp_shared_secret') or '')
+    if not url or len(secret)<32:return None
+    _NLP_QUEUE=NlpQueue(NlpClient(
+        url,secret,timeout=float(c.get('nlp_timeout_sec',1.5)),
+        failure_threshold=int(c.get('nlp_failure_threshold',3)),
+        cooldown_sec=int(c.get('nlp_cooldown_sec',30))),
+        max_pending=int(c.get('nlp_max_pending',128)),
+        cache_ttl_sec=int(c.get('nlp_cache_ttl_sec',900)))
+    return _NLP_QUEUE
+
+
+def enrich_stock_news(rows):
+    """Queue home NLP without adding latency to the trading cycle."""
+    out={k:dict(v) for k,v in (rows or {}).items()}
+    q=nlp_queue()
+    for ticker,row in out.items():
+        headline=row.get('headline'); source_ts=row.get('created_at')
+        if not headline or not source_ts:
+            row['nlp']={'status':'UNAVAILABLE','reason':'headline timestamp unavailable'}
+            continue
+        if q is None:
+            row['nlp']={'status':'UNAVAILABLE','reason':'home NLP not configured'}
+            continue
+        payload={'headline':headline,'source':row.get('source') or 'unknown',
+                 'source_ts':source_ts,'tickers':[ticker]}
+        key,accepted=q.submit(payload); signal=q.get(key)
+        if signal:
+            row['nlp']={'status':'READY',**signal.as_dict()}
+            try:
+                con=db(); LearningStore(con).save_nlp(signal); con.close()
+            except Exception as exc:event(f'NLP evidence store: {exc}','WARN')
+        else:
+            status=q.status(key)
+            row['nlp']={'status':'PENDING' if accepted and not status.get('error') else 'UNAVAILABLE',
+                        'reason':status.get('error'),'queue_depth':status.get('queue_depth')}
+    return out
+
+
+def nlp_required_block(sig,states):
+    """News-sensitive entries fail closed; quantitative sleeves do not depend on NLP."""
+    if not (sig or {}).get('requires_nlp'):return None
+    row=((states or {}).get(sig.get('ticker')) or {}).get('news_nlp') or {}
+    if row.get('status')!='READY':return 'required home NLP unavailable'
+    try:
+        if float(row.get('confidence') or 0)<float(cfg().get('nlp_min_confidence',0.45)):
+            return 'required home NLP confidence too low'
+        source=parse_ny(row.get('source_ts'))
+        if not source or (now_ny()-source).total_seconds()>float(cfg().get('nlp_max_age_sec',1800)):
+            return 'required home NLP headline stale'
+    except (TypeError,ValueError):
+        return 'required home NLP evidence invalid'
+    return None
+
+
+def learning_runtime():
+    global _LEARNING_RUNTIME
+    if _LEARNING_RUNTIME is None and PROCESS_ROLE in ('runner','test'):
+        _LEARNING_RUNTIME=LearningRuntime(db,DATA/'models'/'horizons.json')
+    return _LEARNING_RUNTIME
+
+
+def record_learning_candidate(sig,state,option,quote,greeks):
+    """Freeze prospective labels for existing paper candidates across valid horizons."""
+    runtime=learning_runtime()
+    if runtime is None:return []
+    now=now_ny(); out=[]; horizon=sig.get('horizon','OVERNIGHT')
+    specs=[]
+    if horizon=='EOD':
+        close=now.replace(hour=15,minute=49,second=0,microsecond=0)
+        for hid,minutes in (('0DTE_15M',15),('0DTE_60M',60)):
+            due=now+timedelta(minutes=minutes)
+            if due<close:specs.append((hid,due))
+        if now<close:specs.append(('0DTE_CLOSE',close))
+    elif horizon in ('OVERNIGHT','WEEKLY'):
+        first=next_trading_date(now.date().isoformat())
+        fifth=add_sessions(now.date().isoformat(),5,(cfg().get('market_holiday_overrides') or []))
+        specs=[('WEEKLY_1D',datetime.strptime(first,'%Y-%m-%d').replace(hour=15,minute=45,tzinfo=NY))]
+        if horizon=='WEEKLY':
+            specs.append(('WEEKLY_5D',datetime.strptime(fifth,'%Y-%m-%d').replace(hour=15,minute=45,tzinfo=NY)))
+    elif horizon=='MONTHLY':
+        twentieth=add_sessions(now.date().isoformat(),20,(cfg().get('market_holiday_overrides') or []))
+        specs=[('MONTHLY_20D',datetime.strptime(twentieth,'%Y-%m-%d').replace(hour=15,minute=45,tzinfo=NY))]
+    else:
+        specs=[]
+    for hid,due in specs:
+        try:
+            out.append(runtime.record_candidate(
+                sig,state,hid,now.isoformat(),option,quote,greeks,due.isoformat()))
+        except Exception as exc:
+            event(f'Learning candidate {hid} {sig.get("ticker")}: {exc}','WARN')
+    return out
+
+
+def resolve_learning_labels():
+    runtime=learning_runtime()
+    if runtime is None:return []
+    rows=runtime.resolve_due(
+        now_ny().isoformat(),option_quotes,
+        quote_max_age_sec=thresh()['quote_max_age_sec'],limit=50)
+    if rows:
+        meta_set('learning_last_update',now_ny().isoformat())
+        event(f'Learning labels resolved: {len(rows)}')
+    return rows
+
 def broker_runtime_armed():
     """Second, process-level interlock. A config/UI change alone cannot arm orders."""
     return (PROCESS_ROLE in ('runner','test') and
@@ -385,6 +506,10 @@ def broker_runtime_armed():
 def broker_orders_enabled():
     """Fail closed unless both the config and runtime interlocks are explicitly armed."""
     return cfg().get('broker_orders_enabled') is True and broker_runtime_armed()
+
+def new_entries_enabled():
+    """Entry-only interlock. Risk-reducing exits keep using broker_orders_enabled()."""
+    return cfg().get('new_entries_enabled') is True and broker_orders_enabled()
 
 def keys_ok():
     c=cfg()
@@ -414,6 +539,7 @@ def thresh(book=None):
         'orb_break_pct':float(d.get('orb_break_pct',0.0015)),
         'max_daily_fires':int(c.get('max_daily_fires',3)),
         'max_cluster':int(c.get('max_cluster',3)),
+        'max_daily_explore':int(c.get('max_daily_explore',1)),
         'time_stop_min':int(c.get('time_stop_min',90)),
         'min_und_move':float(c.get('min_und_move',0.0015)),
         'scale_mfe':float(c.get('scale_mfe',0.004)),
@@ -425,6 +551,18 @@ def thresh(book=None):
         'osf_gap':float(d.get('osf_gap',0.0035)),
         'vrc_atr':float(d.get('vrc_atr',0.2)),
         'vrc_rvol':float(d.get('vrc_rvol',0.9)),
+        'adaptive_min_days':int(c.get('adaptive_min_days',30)),
+        'adaptive_min_regime_days':int(c.get('adaptive_min_regime_days',10)),
+        'adaptive_min_profit_factor':float(c.get('adaptive_min_profit_factor',1.15)),
+        'adaptive_half_life_days':float(c.get('adaptive_half_life_days',30)),
+        'max_concurrent_trades':int(c.get('max_concurrent_trades',2)),
+        'max_trade_debit_pct':float(c.get('max_trade_debit_pct',0.003)),
+        'max_open_debit_pct':float(c.get('max_open_debit_pct',0.006)),
+        'daily_loss_pause_pct':float(c.get('daily_loss_pause_pct',0.005)),
+        'weekly_giveback_pause_pct':float(c.get('weekly_giveback_pause_pct',0.0075)),
+        'max_premium_loss_pct':float(c.get('max_premium_loss_pct',0.45)),
+        'trail_activate_mfe':float(c.get('trail_activate_mfe',0.006)),
+        'trail_keep_frac':float(c.get('trail_keep_frac',0.5)),
     }
 
 def ab_book(ticker):
@@ -594,7 +732,11 @@ def capture_exit_snapshot(trade_id, source='BROKER', ts=None):
 def parse_ny(ts):
     if not ts:return None
     try:
-        dt=datetime.fromisoformat(str(ts).replace('Z','+00:00'))
+        raw=str(ts).strip().replace('Z','+00:00')
+        # Alpaca emits nanoseconds; datetime.fromisoformat is not consistent
+        # across deployed Python versions beyond six fractional digits.
+        raw=re.sub(r'(\.\d{6})\d+([+-]\d\d:\d\d)$',r'\1\2',raw)
+        dt=datetime.fromisoformat(raw)
         if dt.tzinfo is None: dt=dt.replace(tzinfo=ZoneInfo('UTC'))
         return dt.astimezone(NY)
     except Exception: return None
@@ -691,6 +833,9 @@ def broker_order_by_client_id(client_id):
     except Exception:
         return None
 
+class AmbiguousBrokerOrder(RuntimeError):
+    """Alpaca may have accepted the order although the response was lost."""
+
 def place_broker_order(payload):
     """Submit an Alpaca paper order once, recovering the same client id after a crash."""
     if PROCESS_ROLE not in ('runner','test'):
@@ -702,14 +847,16 @@ def place_broker_order(payload):
         raise RuntimeError('broker order requires a client_order_id')
     existing=broker_order_by_client_id(client_id)
     if existing:return existing
+    if str((payload or {}).get('side') or '').lower()=='buy' and not new_entries_enabled():
+        raise RuntimeError('new entries are paused')
     try:
         return postj(paper_api_url('/orders'),payload)
-    except Exception:
+    except Exception as exc:
         # The request can succeed at Alpaca while the response is lost locally.
         # Re-querying the deterministic id closes that crash window.
         existing=broker_order_by_client_id(client_id)
         if existing:return existing
-        raise
+        raise AmbiguousBrokerOrder(str(exc)) from exc
 
 def mem_get(key,ttl):
     hit=_MEM_CACHE.get(key)
@@ -859,6 +1006,11 @@ def init_db():
     addcol('trades','exit_bid','REAL')
     addcol('trades','exit_ask','REAL')
     addcol('trades','exit_spread','REAL')
+    addcol('trades','entry_regime','TEXT')
+    addcol('trades','allocator_state','TEXT')
+    addcol('trades','allocator_score','REAL')
+    addcol('trades','allocator_version','TEXT')
+    addcol('trades','risk_snapshot','TEXT')
     addcol('events','seen','INTEGER')
     addcol('events','code','TEXT')
     con.execute('''CREATE TABLE IF NOT EXISTS lab_snapshots(
@@ -868,6 +1020,17 @@ def init_db():
       direction TEXT, option_symbol TEXT, status TEXT, skip_reason TEXT, spot REAL, strike REAL,
       expiry TEXT, entry_bid REAL, entry_ask REAL, entry_iv REAL, entry_delta REAL, ab_book TEXT,
       payload TEXT)''')
+    addcol('shadow_trades','entry_mark','REAL')
+    addcol('shadow_trades','exit_mark','REAL')
+    addcol('shadow_trades','outcome_pnl','REAL')
+    addcol('shadow_trades','evaluated_at','TEXT')
+    addcol('shadow_trades','entry_regime','TEXT')
+    addcol('shadow_trades','allocator_state','TEXT')
+    addcol('shadow_trades','allocator_version','TEXT')
+    addcol('shadow_trades','horizon','TEXT')
+    addcol('shadow_trades','window','TEXT')
+    addcol('shadow_trades','exit_due_at','TEXT')
+    addcol('shadow_trades','qty','INTEGER')
     con.execute('''CREATE TABLE IF NOT EXISTS debriefs(
       id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, trade_date TEXT, q1 TEXT, q2 TEXT, q3 TEXT)''')
     con.execute('''CREATE TABLE IF NOT EXISTS account_snapshots(
@@ -884,6 +1047,9 @@ def init_db():
     con.execute('CREATE INDEX IF NOT EXISTS idx_trade_predictions_trade ON trade_predictions(trade_id,ts)')
     con.execute('CREATE INDEX IF NOT EXISTS idx_trade_candidates_trade ON trade_candidates(trade_id,rank)')
     con.execute('CREATE INDEX IF NOT EXISTS idx_trade_audit_trade ON trade_audit_events(trade_id,ts,id)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_trades_evidence ON trades(strategy_id,entry_regime,trade_date,status)')
+    con.execute('CREATE INDEX IF NOT EXISTS idx_shadow_outcomes ON shadow_trades(evaluated_at,exit_due_at,status)')
+    LearningStore(con).init()
     _seed_trade_comments(con)
     con.commit(); con.close()
     _log_split_development_ledger()
@@ -1054,9 +1220,16 @@ def atr(bars,n=20):
     return avg(trs)
 
 def next_trading_date(d):
-    x=datetime.strptime(d,'%Y-%m-%d').date()+timedelta(days=1)
-    while x.weekday()>=5:x+=timedelta(days=1)
-    return x.isoformat()
+    return next_session_date(d,(cfg().get('market_holiday_overrides') or []))
+
+
+def horizon_exit_due(trade_date,horizon):
+    closed=cfg().get('market_holiday_overrides') or []
+    if horizon=='EOD':return str(trade_date)[:10]
+    if horizon=='WEEKLY':return add_sessions(trade_date,5,closed)
+    if horizon=='MONTHLY':return add_sessions(trade_date,20,closed)
+    return next_session_date(trade_date,closed)
+
 
 def fetch_bars(sym,start,end,timeframe='1Day',feed='iex'):
     out=[]; token=None; guard=0
@@ -1431,6 +1604,7 @@ def ingest_live_data(symbols=None,force=False):
         event(f'Live quote store: {e}','WARN')
     ensure_daily_cache(symbols)
     overview=build_local_live_overview(date,quotes)
+    latest_stock_news(symbols)
     persist_live_files(date,overview)
     coverage=session_coverage(symbols,date)
     avg_pct=coverage_avg(coverage)
@@ -1702,7 +1876,7 @@ def setup_book(setup, ticker, sig_idx, traded):
         else:
             dt=parse_ny(sig.get('ts'))
             if dt: hm=dt.strftime('%H:%M')
-        if st in ('ENTRY_SUBMITTED','OPEN','CLOSED','EXIT_SUBMITTED','SIGNAL_ONLY'):
+        if st in ('ENTRY_SUBMITTED','ENTRY_UNCONFIRMED','OPEN','CLOSED','EXIT_SUBMITTED','SIGNAL_ONLY'):
             other=bool(setup.get('side') and sig.get('direction') and sig.get('direction')!=setup.get('side'))
             if other:
                 return {'state':'held','label':'no order · already traded today','status':st,'skip_reason':None}
@@ -1727,7 +1901,9 @@ def setup_book(setup, ticker, sig_idx, traded):
 def open_opposite(ticker, direction):
     """Direction of an OPEN row on this ticker if it is the other side. Else None."""
     if not ticker or not direction: return None
-    con=db(); rows=con.execute("SELECT direction FROM trades WHERE ticker=? AND status IN ('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED')",(ticker,)).fetchall(); con.close()
+    con=db(); rows=con.execute(
+        f"SELECT direction FROM trades WHERE ticker=? AND status IN ({_sql_in(OPEN_TRADE_STATUSES)})",
+        (ticker,*OPEN_TRADE_STATUSES)).fetchall(); con.close()
     for r in rows:
         d=r['direction']
         if d and d!=direction: return d
@@ -1735,6 +1911,170 @@ def open_opposite(ticker, direction):
 
 def rank_signals(signals):
     return sorted(list(signals or []), key=lambda s: (-float(s.get('score') or 0), s.get('strategy_id') or '', s.get('ticker') or ''))
+
+ALLOCATOR_VERSION='context-v1'
+ALLOCATOR_STATES=frozenset(('SHADOW','EXPLORE','PROBATION','ACTIVE','PAUSED'))
+
+def signal_regime(sig, states):
+    """Point-in-time context label; never reads bars after the candidate timestamp."""
+    st=(states or {}).get((sig or {}).get('ticker')) or {}
+    raw=str(st.get('regime') or '').upper()
+    try: ret=float(st.get('ret') or 0)
+    except (TypeError,ValueError): ret=0.0
+    try: rv=float(st.get('rvol') or 0)
+    except (TypeError,ValueError): rv=0.0
+    if raw=='TREND':
+        return 'TREND_UP' if ret>=0 else 'TREND_DOWN'
+    if raw in ('CHOP','HIGH_VOLUME','MIXED'):
+        return raw
+    if rv>=1.4 and abs(ret)>=0.0075:
+        return 'TREND_UP' if ret>=0 else 'TREND_DOWN'
+    if rv and rv<0.85:
+        return 'CHOP'
+    if rv>=1.2:
+        return 'HIGH_VOLUME'
+    return 'MIXED'
+
+def _decayed_trade_metrics(rows, half_life_days=30):
+    today=now_ny().date(); weighted=[]; days=set()
+    for row in rows or []:
+        try:
+            pnl=float(row.get('pnl') or 0)-float(row.get('fees') or 0)
+            day=date_cls.fromisoformat(str(row.get('trade_date') or '')[:10])
+        except (TypeError,ValueError):
+            continue
+        age=max(0,(today-day).days)
+        weight=math.exp(-math.log(2)*age/max(1.0,float(half_life_days)))
+        weighted.append((pnl,weight)); days.add(day.isoformat())
+    den=sum(w for _,w in weighted)
+    gains=sum(max(0,p)*w for p,w in weighted)
+    losses=sum(max(0,-p)*w for p,w in weighted)
+    return {
+        'trades':len(weighted),'days':len(days),
+        'expectancy':round(sum(p*w for p,w in weighted)/den,4) if den else None,
+        'profit_factor':round(gains/losses,4) if losses else (999.0 if gains else None),
+        'wins':sum(1 for p,_ in weighted if p>0),
+    }
+
+def sleeve_evidence(strategy_id, ticker, regime, direction=None):
+    """Recency-weighted evidence with strategy-level shrinkage context."""
+    con=db()
+    rows=[dict(r) for r in con.execute(
+        """SELECT trade_date,ticker,direction,entry_regime,pnl,fees FROM trades
+           WHERE strategy_id=? AND status='CLOSED' AND pnl IS NOT NULL
+             AND IFNULL(entry_regime,'')!=''""",(strategy_id,)).fetchall()]
+    shadows=[dict(r) for r in con.execute(
+        """SELECT trade_date,ticker,direction,entry_regime,outcome_pnl pnl,0 fees FROM shadow_trades
+           WHERE strategy_id=? AND outcome_pnl IS NOT NULL
+             AND IFNULL(entry_regime,'')!=''
+             AND (status='SKIP_ENTRY_PAUSED' OR status LIKE 'SKIP_ADAPTIVE_%')""",
+        (strategy_id,)).fetchall()]
+    con.close()
+    rows+=shadows
+    half=thresh()['adaptive_half_life_days']
+    overall=_decayed_trade_metrics(rows,half)
+    contextual=_decayed_trade_metrics(
+        [r for r in rows if r.get('entry_regime')==regime and r.get('ticker')==ticker
+         and (not direction or r.get('direction')==direction)],half)
+    regime_wide=_decayed_trade_metrics([r for r in rows if r.get('entry_regime')==regime],half)
+    return {'overall':overall,'context':contextual,'regime':regime_wide}
+
+def adaptive_entry_decision(sig, states):
+    """Promote only independently sampled, positive contextual sleeves."""
+    sid=sig.get('strategy_id'); ticker=sig.get('ticker'); regime=signal_regime(sig,states)
+    c=cfg()
+    if not new_entries_enabled():
+        return {'allow':False,'state':'PAUSED','status':'SKIP_ENTRY_PAUSED',
+                'reason':'new entries are paused; exits remain armed','regime':regime,
+                'version':ALLOCATOR_VERSION,'score':None,'evidence':None}
+    if c.get('adaptive_allocator_enabled',True) is False:
+        return {'allow':True,'state':'ACTIVE','status':'ACTIVE',
+                'reason':'adaptive allocator explicitly bypassed','regime':regime,
+                'version':ALLOCATOR_VERSION,'score':float(sig.get('score') or 0),'evidence':None}
+    evidence=sleeve_evidence(sid,ticker,regime,sig.get('direction'))
+    overrides=c.get('adaptive_strategy_states') or {}
+    override=(overrides.get(f'{sid}:{ticker}:{regime}') or overrides.get(f'{sid}:{regime}')
+              or overrides.get(sid))
+    state=str(override or '').upper()
+    th=thresh(); overall=evidence['overall']; contextual=evidence['context']; reg=evidence['regime']
+    # Configuration may always reduce risk. It cannot force an unproven sleeve ACTIVE.
+    if state not in ('SHADOW','PROBATION','PAUSED'):
+        if overall['days']<th['adaptive_min_days']:
+            state='EXPLORE' if c.get('adaptive_exploration_enabled') is True else 'SHADOW'
+        elif contextual['days']<th['adaptive_min_regime_days']:
+            state='PROBATION'
+        elif ((contextual['expectancy'] or 0)>0
+              and (contextual['profit_factor'] or 0)>=th['adaptive_min_profit_factor']):
+            state='ACTIVE'
+        else:
+            state='PAUSED'
+    confidence=min(1.0,contextual['days']/max(1,th['adaptive_min_regime_days']))
+    edge=float(contextual['expectancy'] or 0)
+    score=round(float(sig.get('score') or 0)*confidence+edge/100.0,4)
+    reason=(f"{state.lower()}: strategy {overall['days']}d, context {contextual['days']}d, "
+            f"context EV {money_number(contextual['expectancy'])}, PF "
+            f"{contextual['profit_factor'] if contextual['profit_factor'] is not None else '—'}")
+    return {'allow':state in ('ACTIVE','EXPLORE'),'state':state,
+            'status':state if state in ('ACTIVE','EXPLORE') else f'SKIP_ADAPTIVE_{state}',
+            'reason':reason,'regime':regime,'version':ALLOCATOR_VERSION,
+            'score':score,'evidence':evidence}
+
+def account_equity_guard(account=None):
+    """Fail closed on daily loss or weekly high-water giveback."""
+    try:
+        account=account or broker_account()
+        equity=float(account.get('equity') or account.get('portfolio_value') or 0)
+    except Exception:
+        return 'account equity unavailable for risk gate',{'equity':None}
+    now=now_ny(); today=now.date().isoformat(); week=(now.date()-timedelta(days=7)).isoformat()
+    con=db()
+    first=con.execute("SELECT equity FROM account_snapshots WHERE substr(ts,1,10)=? ORDER BY ts,id LIMIT 1",(today,)).fetchone()
+    high=con.execute("SELECT MAX(equity) equity FROM account_snapshots WHERE substr(ts,1,10)>=?",(week,)).fetchone()
+    con.close()
+    try: previous_close=float(account.get('last_equity') or 0)
+    except (TypeError,ValueError): previous_close=0
+    daily_start=(previous_close if previous_close>0 else
+                 float(first['equity']) if first and first['equity'] is not None else equity)
+    stored_high=float(high['equity']) if high and high['equity'] is not None else 0
+    weekly_high=max(stored_high,equity,daily_start)
+    th=thresh()
+    snap={'equity':round(equity,2),'daily_start':round(daily_start,2),
+          'weekly_high':round(weekly_high,2),'version':ALLOCATOR_VERSION}
+    if equity<=daily_start*(1-th['daily_loss_pause_pct']):
+        return f"daily equity loss limit: {equity-daily_start:.0f}",snap
+    if equity<=weekly_high*(1-th['weekly_giveback_pause_pct']):
+        return f"weekly high-water giveback: {equity-weekly_high:.0f}",snap
+    return None,snap
+
+def portfolio_risk_block(ticker, ask, qty, account=None):
+    """Bound concurrent, duplicate-underlying, and premium-at-risk exposure."""
+    con=db(); rows=[dict(r) for r in con.execute(
+        f"SELECT ticker,qty,entry_fill,entry_ask FROM trades WHERE status IN ({_sql_in(OPEN_TRADE_STATUSES)})",
+        OPEN_TRADE_STATUSES).fetchall()]; con.close()
+    th=thresh()
+    if len(rows)>=th['max_concurrent_trades']:
+        return f"concurrent trade cap {len(rows)}/{th['max_concurrent_trades']}",{'open':len(rows)}
+    if any(r.get('ticker')==ticker for r in rows):
+        return f'underlying exposure already open: {ticker}',{'open':len(rows)}
+    try:
+        account=account or broker_account(); equity=float(account.get('equity') or account.get('portfolio_value') or 0)
+        debit=float(ask)*100*int(qty or 1)
+    except (TypeError,ValueError):
+        return 'risk budget unavailable',{'open':len(rows)}
+    open_debit=0.0
+    for row in rows:
+        raw=row.get('entry_fill') if row.get('entry_fill') not in (None,'') else row.get('entry_ask')
+        if raw in (None,''):
+            return f"open debit unknown for {row.get('ticker') or 'position'}",{'equity':round(equity,2),'open':len(rows)}
+        try: open_debit+=float(raw)*100*int(row.get('qty') or 1)
+        except (TypeError,ValueError):
+            return f"open debit invalid for {row.get('ticker') or 'position'}",{'equity':round(equity,2),'open':len(rows)}
+    snap={'equity':round(equity,2),'new_debit':round(debit,2),'open_debit':round(open_debit,2),'open':len(rows)}
+    if debit>equity*th['max_trade_debit_pct']:
+        return f"trade debit ${debit:.0f} > risk cap ${equity*th['max_trade_debit_pct']:.0f}",snap
+    if open_debit+debit>equity*th['max_open_debit_pct']:
+        return f"open debit ${open_debit+debit:.0f} > portfolio cap ${equity*th['max_open_debit_pct']:.0f}",snap
+    return None,snap
 
 def attach_broker_mark(d, pos=None):
     """Live mark only on open rows. Closed rows keep stored pnl — never inherit another ticket's contract."""
@@ -2424,7 +2764,7 @@ def latest_stock_news(symbols=None):
     if not names:return {}
     key='stock_news|'+','.join(names)
     hit=cache_get(key,300)
-    if hit is not None:return hit
+    if hit is not None:return enrich_stock_news(hit)
     try:
         payload=getj(f'{MD}/v1beta1/news',ah(),{
             'symbols':','.join(names),'limit':min(50,max(10,len(names)*2)),
@@ -2441,7 +2781,7 @@ def latest_stock_news(symbols=None):
                 sym=str(sym or '').upper()
                 if sym in names and sym not in out and row['headline']:out[sym]=row
         cache_set(key,out)
-        return out
+        return enrich_stock_news(out)
     except Exception as e:
         event(f'Stock news: {e}','WARN')
         return {}
@@ -2643,6 +2983,53 @@ def midday_signals(states, which='ALL', ignore_clock=False):
             else: miss('MVR',sym,f'RSI {rsi:.1f} not extreme with stretch {dist:.2f}',metrics)
     return out,evals,{'clock':hm,'opn':run_opn,'osf':run_osf,'orb':run_orb,'vrc':run_vrc,'mvr':run_mvr}
 
+
+def news_horizon_signals(states, ignore_clock=False):
+    """Route qualified NLP events to one research horizon; NLP never fires alone."""
+    now=now_ny(); hm=now.strftime('%H:%M')
+    if not ignore_clock and not ('09:35'<=hm<='14:30'):return [],[]
+    out=[]; evals=[]
+    horizon_for={
+        'MACRO':('N0D','EOD'),
+        'EARNINGS':('NWK','WEEKLY'),
+        'PRODUCT':('NWK','WEEKLY'),
+        'REGULATORY':('NMO','MONTHLY'),
+        'CAPITAL':('NMO','MONTHLY'),
+        'M_AND_A':('NMO','MONTHLY'),
+    }
+    for ticker,state in (states or {}).items():
+        nlp=state.get('news_nlp') or {}; reason=None
+        if nlp.get('status')!='READY':reason='home NLP unavailable'
+        confidence=float(nlp.get('confidence') or 0); novelty=float(nlp.get('novelty') or 0)
+        sentiment=float(nlp.get('sentiment') or 0); event_class=str(nlp.get('event_class') or 'OTHER')
+        source=parse_ny(nlp.get('source_ts'))
+        age=None if not source else max(0,(now-source).total_seconds())
+        if reason is None and confidence<float(cfg().get('nlp_min_confidence',0.45)):reason='NLP confidence too low'
+        if reason is None and novelty<0.4:reason='headline is not novel'
+        if reason is None and abs(sentiment)<0.35:reason='headline sentiment too weak'
+        if reason is None and (age is None or age>float(cfg().get('nlp_max_age_sec',1800))):reason='headline stale'
+        if reason is None and float(state.get('rvol') or 0)<0.7:reason='tape volume does not confirm event'
+        route=horizon_for.get(event_class)
+        if reason is None and route is None:
+            if abs(sentiment)>=0.7:route=('N0D','EOD')
+            else:reason='event class has no research horizon'
+        if reason:
+            evals.append({'strategy_id':'NEWS','ticker':ticker,'eligible':0,'reason':reason,
+                          'metrics':{'event_class':event_class,'confidence':confidence,
+                                     'novelty':novelty,'sentiment':sentiment,'age_sec':age}})
+            continue
+        sid,horizon=route; direction='CALL' if sentiment>0 else 'PUT'
+        sig={'strategy_id':sid,'ticker':ticker,'direction':direction,
+             'score':abs(sentiment)*confidence*max(.25,novelty),
+             'details':{'event_class':event_class,'confidence':confidence,'novelty':novelty,
+                        'sentiment':sentiment,'headline_hash':nlp.get('content_hash'),'age_sec':age},
+             'horizon':horizon,'window':hm,'session_window':'NEWS','requires_nlp':True}
+        out.append(sig)
+        evals.append({'strategy_id':sid,'ticker':ticker,'eligible':1,'direction':direction,
+                      'score':sig['score'],'reason':'FIRED','metrics':sig['details']})
+    return out,evals
+
+
 def option_quote(symbol):
     return option_quotes([symbol]).get(symbol,{}) if symbol else {}
 
@@ -2799,16 +3186,25 @@ def classify_error(msg):
 
 def daily_fire_count(sid, date=None):
     date=date or now_ny().date().isoformat()
-    marks=OPEN_TRADE_STATUSES
-    con=db(); n=con.execute(f"""SELECT COUNT(*) n FROM trades WHERE strategy_id=? AND trade_date=?
-                               AND status IN ({_sql_in(marks)})""",(sid,date,*marks)).fetchone()['n']; con.close()
+    con=db(); n=con.execute("""SELECT COUNT(*) n FROM trades WHERE strategy_id=? AND trade_date=?
+                               AND status!='ERROR'""",(sid,date)).fetchone()['n']; con.close()
     return n or 0
+
+
+def exploration_fire_count(date=None):
+    date=date or now_ny().date().isoformat()
+    con=db(); row=con.execute(
+        """SELECT COUNT(*) n FROM trades
+           WHERE trade_date=? AND allocator_state='EXPLORE'
+             AND status IN ('ENTRY_SUBMITTED','ENTRY_UNCONFIRMED','OPEN','EXIT_SUBMITTED','CLOSED')""",
+        (date,)).fetchone(); con.close()
+    return int(row['n'] or 0)
+
 
 def cluster_count(date=None, window_min=20):
     date=date or now_ny().date().isoformat()
-    marks=OPEN_TRADE_STATUSES
-    con=db(); rows=con.execute(f"""SELECT signal_ts FROM trades WHERE trade_date=?
-                                   AND status IN ({_sql_in(marks)})""",(date,*marks)).fetchall(); con.close()
+    con=db(); rows=con.execute("""SELECT signal_ts FROM trades WHERE trade_date=?
+                                  AND status!='ERROR'""",(date,)).fetchall(); con.close()
     n=now_ny(); cut=n-timedelta(minutes=window_min); k=0
     for r in rows:
         dt=parse_ny(r['signal_ts'])
@@ -3067,15 +3463,59 @@ def log_shadow(sig, status, extra):
     try:
         q=(extra.get('quality') or {}).get('quote') or {}
         gk=extra.get('greeks') or {}
-        con=db(); con.execute('''INSERT INTO shadow_trades(ts,trade_date,strategy_id,ticker,direction,option_symbol,status,skip_reason,spot,strike,expiry,entry_bid,entry_ask,entry_iv,entry_delta,ab_book,payload)
-                                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
-                              (now_ny().isoformat(),now_ny().date().isoformat(),sig.get('strategy_id'),sig.get('ticker'),
+        now=now_ny(); trade_date=now.date().isoformat()
+        horizon=extra.get('horizon') or sig.get('horizon') or 'OVERNIGHT'
+        if horizon=='EOD':
+            due=datetime.combine(now.date(),datetime.min.time(),tzinfo=NY).replace(hour=15,minute=50)
+        else:
+            due_day=date_cls.fromisoformat(next_trading_date(trade_date))
+            due=datetime.combine(due_day,datetime.min.time(),tzinfo=NY).replace(hour=9,minute=35)
+        allocator=extra.get('allocator') or {}
+        entry_mark=q.get('ask')
+        con=db(); con.execute('''INSERT INTO shadow_trades(
+                                 ts,trade_date,strategy_id,ticker,direction,option_symbol,status,skip_reason,
+                                 spot,strike,expiry,entry_bid,entry_ask,entry_iv,entry_delta,ab_book,payload,
+                                 entry_mark,entry_regime,allocator_state,allocator_version,horizon,window,exit_due_at,qty)
+                                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                              (now.isoformat(),trade_date,sig.get('strategy_id'),sig.get('ticker'),
                                sig.get('direction'),extra.get('option'),status,extra.get('skip_reason'),extra.get('spot'),
                                extra.get('strike'),extra.get('expiry'),q.get('bid'),q.get('ask'),gk.get('iv'),gk.get('delta'),
-                               extra.get('ab_book') or sig.get('ab_book'), json.dumps(extra,default=str)[:4000]))
+                               extra.get('ab_book') or sig.get('ab_book'), json.dumps(extra,default=str)[:12000],
+                               entry_mark,extra.get('regime') or allocator.get('regime'),allocator.get('state'),
+                               allocator.get('version'),horizon,extra.get('window') or sig.get('window'),
+                               due.isoformat(),int(extra.get('qty') or 1)))
         con.commit(); con.close()
     except Exception as e:
         event(f'shadow log: {e}','WARN')
+
+def evaluate_shadow_outcomes():
+    """Mark paused/adaptive candidates at their declared horizon using executable bids."""
+    now=now_ny()
+    con=db(); rows=[dict(r) for r in con.execute(
+        """SELECT * FROM shadow_trades WHERE evaluated_at IS NULL
+             AND entry_mark IS NOT NULL AND option_symbol IS NOT NULL
+             AND exit_due_at<=?
+             AND (status='SKIP_ENTRY_PAUSED' OR status LIKE 'SKIP_ADAPTIVE_%')
+           ORDER BY id LIMIT 30""",(now.isoformat(),)).fetchall()]; con.close()
+    for row in rows:
+        quote=option_quote(row.get('option_symbol'))
+        exit_mark=quote.get('bid')
+        if exit_mark is None:
+            expiry=str(row.get('expiry') or '')[:10]
+            if not expiry or (now.date().isoformat()<=expiry and now.strftime('%H:%M')<'16:00'):
+                continue
+            exit_mark=0.0
+        try:
+            pnl=option_pnl(float(row['entry_mark']),float(exit_mark),int(row.get('qty') or 1))
+        except (TypeError,ValueError):
+            continue
+        con=db(); con.execute(
+            """UPDATE shadow_trades SET exit_mark=?,outcome_pnl=?,evaluated_at=?
+               WHERE id=? AND evaluated_at IS NULL""",
+            (float(exit_mark),pnl,now.isoformat(),row['id']))
+        con.commit(); con.close()
+    return len(rows)
+
 
 def backup_db(tag='exit'):
     try:
@@ -3164,7 +3604,22 @@ def refresh_excursions_and_stops():
                 if tr.get('direction')=='PUT': und_move=-und_move
         except Exception: pass
         kind=None
-        if horizon=='EOD' and held is not None and held>=th['time_stop_min'] and abs(und_move or 0)<th['min_und_move']:
+        premium_return=None
+        if tr.get('entry_fill') not in (None,0):
+            oq=option_quote(tr.get('option_symbol'))
+            try:
+                executable=oq.get('bid'); quote_age=oq.get('age_sec')
+                if (executable is not None and quote_age is not None
+                        and float(quote_age)<=th['quote_max_age_sec']):
+                    premium_return=float(executable)/float(tr['entry_fill'])-1
+            except (TypeError,ValueError,ZeroDivisionError):
+                premium_return=None
+        if premium_return is not None and premium_return<=-th['max_premium_loss_pct']+1e-9:
+            kind='RISK'
+        elif (held is not None and held>=5 and mfe is not None and mfe>=th['trail_activate_mfe']
+              and und_move is not None and und_move<=mfe*th['trail_keep_frac']):
+            kind='TRAIL'
+        elif horizon=='EOD' and held is not None and held>=th['time_stop_min']:
             kind='TIME'
         elif sid=='ORB' and st.get('or_high') and st.get('or_low') and st.get('c'):
             if st['or_low']<=st['c']<=st['or_high'] and held and held>=15:
@@ -3202,6 +3657,12 @@ def option_contract(ticker,direction,spot,allow_0dte=False,style=None):
         td=today.isoformat()
         if now_ny().strftime('%H:%M')>='15:50': td=next_trading_date(td)
         end=td
+    elif dte=='weekly':
+        td=(today+timedelta(days=5)).isoformat()
+        end=(today+timedelta(days=21)).isoformat()
+    elif dte=='monthly':
+        td=(today+timedelta(days=30)).isoformat()
+        end=(today+timedelta(days=60)).isoformat()
     else:
         td=next_trading_date(today.isoformat())
         end=(datetime.strptime(td,'%Y-%m-%d').date()+timedelta(days=7)).isoformat()
@@ -3222,11 +3683,7 @@ def option_contract(ticker,direction,spot,allow_0dte=False,style=None):
         arr=sorted(arr,key=lambda x:abs(float(x.get('strike_price',0))-target))
     else:
         arr=sorted(arr,key=lambda x:(x.get('expiration_date','9999'),abs(float(x.get('strike_price',0))-target)))
-    c=arr[0]
-    exp=(c.get('expiration_date') or '')[:10]
-    if dte=='0dte' and exp!=td:
-        raise RuntimeError(f'same-day contract expiry {exp} != {td}')
-    reason=f"{style.get('dte',dte)} {moneyness} target {target:.2f} vs spot {spot:.2f}"
+    target_reason=f"{style.get('dte',dte)} {moneyness} target {target:.2f} vs spot {spot:.2f}"
     candidate_rows=arr[:20]
     symbols=[row.get('symbol') for row in candidate_rows if row.get('symbol')]
     quotes=option_quotes(symbols)
@@ -3248,16 +3705,15 @@ def option_contract(ticker,direction,spot,allow_0dte=False,style=None):
                           if candidate_mid else {})
         candidate_quality=contract_quality(
             spot,row_strike,row.get('expiration_date'),direction,quote,style,candidate_greeks)
-        selected=row.get('symbol')==c.get('symbol')
         try: candidate_dte=(datetime.strptime((row.get('expiration_date') or '')[:10],'%Y-%m-%d').date()-today).days
         except (TypeError,ValueError): candidate_dte=None
         candidates.append({
             'rank':i+1,'option_symbol':symbol,'strike':row_strike,
             'expiry':(row.get('expiration_date') or '')[:10],
-            'dte':candidate_dte,
+            'dte':candidate_dte,'distance_to_target_pct':distance,
             'bid':quote.get('bid'),'ask':quote.get('ask'),'spread':quote.get('spread'),
             'quote_ts':quote.get('ts'),'quote_age_sec':quote.get('age_sec'),
-            'volume':quote.get('volume'),'open_interest':quote.get('open_interest'),'selected':selected,
+            'volume':quote.get('volume'),'open_interest':quote.get('open_interest'),'selected':False,
             'score':candidate_quality.get('score'),'grade':candidate_quality.get('grade'),
             'components':{'target_strike':target,'distance_to_target_pct':round(distance,6) if distance is not None else None,
                           'bid':quote.get('bid'),'ask':quote.get('ask'),'spread':quote.get('spread'),
@@ -3265,8 +3721,24 @@ def option_contract(ticker,direction,spot,allow_0dte=False,style=None):
                           'volume':quote.get('volume'),'open_interest':quote.get('open_interest'),
                           'greeks':candidate_greeks,
                           'grades':candidate_quality.get('components')},
-            'reason':'nearest permitted strike and expiry' if selected else 'farther from the configured strike target',
+            'reason':'quality-ranked candidate',
         })
+    max_age=thresh()['quote_max_age_sec']
+    viable=[x for x in candidates
+            if x.get('bid') not in (None,0) and x.get('ask') not in (None,0)
+            and x.get('quote_age_sec') is not None and float(x['quote_age_sec'])<=max_age]
+    if not viable:
+        raise RuntimeError(f'No fresh executable {typ} quote for {ticker}')
+    selected=max(viable,key=lambda x:(
+        float(x.get('score') or 0),
+        -float(x['distance_to_target_pct']) if x.get('distance_to_target_pct') is not None else -999.0))
+    selected['selected']=True
+    selected['reason']='highest executable quality score; distance breaks ties'
+    c=next(row for row in candidate_rows if row.get('symbol')==selected.get('option_symbol'))
+    exp=(c.get('expiration_date') or '')[:10]
+    if dte=='0dte' and exp!=td:
+        raise RuntimeError(f'same-day contract expiry {exp} != {td}')
+    reason=f"{target_reason}; quality rank selected {selected.get('grade')} {selected.get('score')}"
     style['_candidates']=candidates
     style['_selected_quote']=next(({
         'bid':x.get('bid'),'ask':x.get('ask'),'spread':x.get('spread'),'ts':x.get('quote_ts'),
@@ -3287,8 +3759,12 @@ def submit_entry(sig,states):
     horizon=sig.get('horizon','OVERNIGHT'); window=sig.get('window','15:45'); style=strat_opt(sid)
     date=now_ny().date().isoformat()
     book, _thb = ab_book(ticker)
+    allocator=adaptive_entry_decision(sig,states)
+    equity_snapshot={}
     qty, kelly_note = kelly_qty(sid, int(c.get('contracts_per_trade',1)))
-    con=db(); dupe=con.execute("SELECT id FROM trades WHERE strategy_id=? AND ticker=? AND status IN ('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED') LIMIT 1",(sid,ticker)).fetchone(); con.close()
+    con=db(); dupe=con.execute(
+        f"SELECT id FROM trades WHERE strategy_id=? AND ticker=? AND status IN ({_sql_in(OPEN_TRADE_STATUSES)}) LIMIT 1",
+        (sid,ticker,*OPEN_TRADE_STATUSES)).fetchone(); con.close()
     if dupe:return 'SKIP_OPEN_TRADE',None
     opp=open_opposite(ticker, direction)
     if opp:
@@ -3310,6 +3786,18 @@ def submit_entry(sig,states):
     if pdt:
         extra={'skip_reason':pdt,'ab_book':book}; event(f'{sid} skip PDT {ticker}','WARN')
         log_shadow(sig,'SKIP_PDT',extra); return 'SKIP_PDT',extra
+    if allocator.get('state')=='EXPLORE':
+        explored=exploration_fire_count(date)
+        if explored>=th['max_daily_explore']:
+            extra={'skip_reason':f'exploration cap {explored}/{th["max_daily_explore"]}',
+                   'ab_book':book,'allocator':allocator}
+            log_shadow(sig,'SKIP_EXPLORE_CAP',extra); return 'SKIP_EXPLORE_CAP',extra
+        qty=1
+    nlp_block=nlp_required_block(sig,states)
+    if nlp_block:
+        extra={'skip_reason':nlp_block,'ab_book':book,
+               'nlp':(states.get(ticker) or {}).get('news_nlp')}
+        log_shadow(sig,'SKIP_NLP_REQUIRED',extra); return 'SKIP_NLP_REQUIRED',extra
     spot=states[ticker]['c']
     coverage=session_coverage(ALL_TICKERS,date)
     st=states[ticker]
@@ -3327,20 +3815,39 @@ def submit_entry(sig,states):
         except Exception: mid=None
     gk=greeks_snap(spot,strike,expiry,mid,direction) if mid else {'iv':None,'delta':None,'gamma':None}
     quality=contract_quality(spot,strike,expiry,direction,q,style,gk)
+    learning=record_learning_candidate(sig,st,option,q,gk)
     check=pretrade_checklist(sig,states,coverage,q,quality)
     strategy=_strategy_record(sid)
     pred=prediction_snapshot(sig,strategy,spot=spot,quote=q,greeks=gk)
     log_contract(sid,ticker,direction,spot,option,expiry,strike,style,reason)
     extra={'option':option,'expiry':expiry,'strike':strike,'horizon':horizon,'window':window,'spot':spot,'opt':style,
            'reason':reason,'quality':quality,'checklist':check,'cluster_n':clus,'dnt':dnt,'greeks':gk,
-           'ab_book':book,'kelly':kelly_note,'qty':qty}
+           'ab_book':book,'kelly':kelly_note,'qty':qty,'allocator':allocator,
+           'regime':allocator['regime'],'risk':equity_snapshot,'learning':learning}
     if dnt:
         extra['skip_reason']=', '.join(dnt); log_shadow(sig,'SKIP_DNT',extra); return 'SKIP_DNT',extra
-    if not check['pass'] and quality.get('grade') in ('D',):
-        extra['skip_reason']='checklist/contract grade D'; log_shadow(sig,'SKIP_CHECKLIST',extra); return 'SKIP_CHECKLIST',extra
+    if not check['pass']:
+        extra['skip_reason']=f"pretrade checklist failed / contract grade {quality.get('grade') or '—'}"
+        log_shadow(sig,'SKIP_CHECKLIST',extra); return 'SKIP_CHECKLIST',extra
     age=q.get('age_sec')
     if age is not None and age>th['quote_max_age_sec']:
         extra['skip_reason']=f'option quote stale {age:.0f}s'; log_shadow(sig,'SKIP_STALE_QUOTE',extra); return 'SKIP_STALE_QUOTE',extra
+    if not allocator['allow']:
+        extra['skip_reason']=allocator['reason']
+        log_shadow(sig,allocator['status'],extra)
+        return allocator['status'],extra
+    equity_block,equity_snapshot=account_equity_guard()
+    extra['risk']=equity_snapshot
+    if equity_block:
+        extra['skip_reason']=equity_block
+        event(f'{sid} skip equity guard {ticker}: {equity_block}','WARN')
+        log_shadow(sig,'SKIP_EQUITY_GUARD',extra); return 'SKIP_EQUITY_GUARD',extra
+    portfolio_block,portfolio_snapshot=portfolio_risk_block(ticker,q.get('ask'),qty)
+    extra['risk']={**equity_snapshot,**portfolio_snapshot}
+    if portfolio_block:
+        extra['skip_reason']=portfolio_block
+        event(f'{sid} skip portfolio risk {ticker}: {portfolio_block}','WARN')
+        log_shadow(sig,'SKIP_PORTFOLIO_RISK',extra); return 'SKIP_PORTFOLIO_RISK',extra
     bp=bp_block(q.get('ask'), qty)
     if bp:
         extra['skip_reason']=bp; log_shadow(sig,'SKIP_BP',extra); return 'SKIP_BP',extra
@@ -3348,13 +3855,14 @@ def submit_entry(sig,states):
     if not orders_allowed():
         extra['skip_reason']='guest LAN read-only'; log_shadow(sig,'SKIP_GUEST',extra); return 'SKIP_GUEST',extra
     client=f'a53-{date.replace("-","")}-{sid.lower()}-{ticker.lower()}'[:48]
-    exit_due=now_ny().date().isoformat() if horizon=='EOD' else next_trading_date(now_ny().date().isoformat())
-    con=db(); con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,entry_order_id,entry_client_id,exit_due_date,status,broker_note,horizon,window,entry_bid,entry_ask,entry_spread,contract_score,checklist,cluster_n,atm_spot,entry_iv,entry_delta,entry_gamma,ab_book,greeks,origin,strategy_version,parameter_hash)
-                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+    exit_due=horizon_exit_due(now_ny().date().isoformat(),horizon)
+    con=db(); con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,entry_order_id,entry_client_id,exit_due_date,status,broker_note,horizon,window,entry_bid,entry_ask,entry_spread,contract_score,checklist,cluster_n,atm_spot,entry_iv,entry_delta,entry_gamma,ab_book,greeks,origin,strategy_version,parameter_hash,entry_regime,allocator_state,allocator_score,allocator_version,risk_snapshot)
+                             VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                           (sid,ticker,direction,option,qty,sig.get('ts') or pred['ts'],date,expiry,None,client,exit_due,'ENTRY_SUBMITTED','paper order intent',horizon,window,
                            q.get('bid'),q.get('ask'),q.get('spread'),quality.get('score'),json.dumps(check,default=str),clus,spot,
                            gk.get('iv'),gk.get('delta'),gk.get('gamma'),book,json.dumps(gk,default=str),
-                           'SYSTEM',strategy.get('version'),strategy.get('parameter_hash')))
+                           'SYSTEM',strategy.get('version'),strategy.get('parameter_hash'),allocator['regime'],
+                           allocator['state'],allocator['score'],allocator['version'],json.dumps(extra['risk'],default=str)))
     tid=con.execute('SELECT last_insert_rowid() x').fetchone()['x']
     for candidate in style.get('_candidates') or []:
         selected=bool(candidate.get('selected'))
@@ -3381,8 +3889,13 @@ def submit_entry(sig,states):
         o=place_broker_order({'symbol':option,'qty':str(qty),'side':'buy','type':'market','time_in_force':'day','client_order_id':client})
     except Exception as exc:
         con=db()
-        con.execute("UPDATE trades SET status='ERROR',broker_note=? WHERE id=?",(f'entry submission failed: {str(exc)[:180]}',tid))
-        trade_audit(tid,'ORDER_ERROR','Paper entry order submission failed',{'client_id':client,'error':str(exc)[:240]},con=con)
+        ambiguous=isinstance(exc,AmbiguousBrokerOrder)
+        status='ENTRY_UNCONFIRMED' if ambiguous else 'ERROR'
+        note=('entry submission unconfirmed: ' if ambiguous else 'entry submission failed: ')+str(exc)[:180]
+        con.execute("UPDATE trades SET status=?,broker_note=? WHERE id=?",(status,note,tid))
+        trade_audit(tid,'ORDER_UNCONFIRMED' if ambiguous else 'ORDER_ERROR',
+                    'Paper entry response lost; broker state unconfirmed' if ambiguous else 'Paper entry order submission failed',
+                    {'client_id':client,'error':str(exc)[:240]},con=con)
         con.commit(); con.close()
         raise
     con=db()
@@ -3444,11 +3957,15 @@ def journal_midday(states, evals, window):
     con.commit(); con.close()
 
 def reconcile():
-    con=db(); rows=con.execute("SELECT * FROM trades WHERE status IN ('ENTRY_SUBMITTED','EXIT_SUBMITTED')").fetchall(); con.close()
+    entry_states=('ENTRY_SUBMITTED','ENTRY_UNCONFIRMED')
+    con=db(); rows=con.execute(
+        "SELECT * FROM trades WHERE status IN ('ENTRY_SUBMITTED','ENTRY_UNCONFIRMED','EXIT_SUBMITTED')"
+    ).fetchall(); con.close()
     for tr in rows:
-        oid=tr['entry_order_id'] if tr['status']=='ENTRY_SUBMITTED' else tr['exit_order_id']
+        is_entry=tr['status'] in entry_states
+        oid=tr['entry_order_id'] if is_entry else tr['exit_order_id']
         o=None
-        if not oid and tr['status']=='ENTRY_SUBMITTED' and tr['entry_client_id']:
+        if not oid and is_entry and tr['entry_client_id']:
             o=broker_order_by_client_id(tr['entry_client_id'])
             if o and o.get('id'):
                 oid=o.get('id')
@@ -3459,7 +3976,7 @@ def reconcile():
         st=o.get('status')
         if st=='filled':
             fp=float(o.get('filled_avg_price') or 0); ft=o.get('filled_at'); con=db()
-            if tr['status']=='ENTRY_SUBMITTED':
+            if is_entry:
                 priced={**dict(tr),'entry_fill':fp}
                 costs=execution_costs(priced,entry_order=o)
                 con.execute("""UPDATE trades SET entry_fill=?,entry_filled_at=?,status='OPEN',fees=?,
@@ -3481,7 +3998,7 @@ def reconcile():
                 except Exception: pass
                 msg=f"CLOSED {tr['strategy_id']} {tr['ticker']} P&L ${pnl:.2f}"
             con.commit(); con.close()
-            if tr['status']=='ENTRY_SUBMITTED':
+            if is_entry:
                 trade_audit(tr['id'],'ENTRY_FILLED',f'Filled at {money_number(fp)}',
                             {'order_id':oid,'fill':fp},source='BROKER',ts=ft)
             else:
@@ -3687,7 +4204,7 @@ def broker_ledger_repair_plan(orders, activities=None):
         if qty<=0:continue
         entry_fill=float(buy.get('filled_avg_price') or 0)
         horizon='EOD' if sid in MIDDAY_STRATEGY_IDS else 'OVERNIGHT'
-        exit_due=trade_date if horizon=='EOD' else next_trading_date(trade_date)
+        exit_due=horizon_exit_due(trade_date,horizon)
         sell=_matching_exit_fill(probe,broker_orders,remaining_qty=remaining,allow_generic=True,allow_symbol=True)
         if sell:
             exit_oid=str(sell.get('id') or '')
@@ -3833,8 +4350,9 @@ def startup_reconcile():
         submitted=parse_ny(order.get('submitted_at') or order.get('created_at')) or now_ny()
         trade_date=(datetime.strptime(day,'%Y%m%d').date().isoformat() if day else submitted.date().isoformat())
         direction,expiry=_option_direction_expiry(symbol)
-        horizon='EOD' if sid in MIDDAY_STRATEGY_IDS else 'OVERNIGHT'
-        exit_due=trade_date if horizon=='EOD' else next_trading_date(trade_date)
+        strategy=next((row for row in STRATEGIES if row.get('id')==sid),{})
+        horizon=strategy.get('horizon') or ('EOD' if sid in MIDDAY_STRATEGY_IDS else 'OVERNIGHT')
+        exit_due=horizon_exit_due(trade_date,horizon)
         con=db(); cur=con.execute('''INSERT INTO trades(strategy_id,ticker,direction,option_symbol,qty,signal_ts,trade_date,expiry,
                                  entry_order_id,entry_client_id,entry_fill,entry_filled_at,exit_due_date,status,broker_note,horizon,window)
                                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
@@ -3961,8 +4479,15 @@ def evaluate_midday(which='BOTH', force_preview=False):
     for sym in MIDDAY_TICKERS:
         st=local_intraday_state(sym,date)
         if st: states[sym]=st
+    news=latest_stock_news(ALL_TICKERS)
+    for sym in news:
+        if sym in states:continue
+        st=local_intraday_state(sym,date)
+        if st:states[sym]=st
     if not states:
         return {'note':'no local live bars yet','signals':[],'states':{}}
+    for sym,st in states.items():
+        st['news_nlp']=(news.get(sym) or {}).get('nlp') or {'status':'UNAVAILABLE'}
     lasts=[]
     for st in states.values():
         dt=parse_ny(st.get('last_bar'))
@@ -3972,7 +4497,12 @@ def evaluate_midday(which='BOTH', force_preview=False):
         for st in states.values():
             dt=parse_ny(st.get('last_bar'))
             if dt and (freshest-dt).total_seconds()>120: st['halt']=True
-    signals,evals,context=midday_signals(states,which,ignore_clock=force_preview)
+    quant_states={sym:state for sym,state in states.items() if sym in MIDDAY_TICKERS}
+    signals,evals,context=midday_signals(quant_states,which,ignore_clock=force_preview)
+    if which in ('ALL','BOTH','NEWS'):
+        news_signals,news_evals=news_horizon_signals(states,ignore_clock=force_preview)
+        signals.extend(news_signals); evals.extend(news_evals)
+        context['news']=True
     snap_window=which if which in MIDDAY_STRATEGY_IDS else 'LIVE'
     if not force_preview: journal_midday(states,evals,snap_window)
     compact={k:compact_state(v) for k,v in states.items()}
@@ -4017,6 +4547,10 @@ def runner_loop(heartbeat_callback=None):
             try: snapshot_positions()
             except Exception as e: event(f'Position snapshot: {e}','WARN')
             reconcile(); submit_due_exits()
+            try: evaluate_shadow_outcomes()
+            except Exception as e: event(f'Shadow outcomes: {e}','WARN')
+            try: resolve_learning_labels()
+            except Exception as e: event(f'Learning labels: {e}','WARN')
             try: refresh_excursions_and_stops()
             except Exception as e: event(f'Manage open: {e}','WARN')
             if n.weekday()<5 and '09:25'<=hm<='16:10':
@@ -4177,6 +4711,10 @@ def status_payload():
         'paper_only':True,'broker_orders_enabled':broker_orders_enabled(),
         'broker_config_enabled':c.get('broker_orders_enabled') is True,
         'broker_runtime_armed':broker_runtime_armed(),
+        'new_entries_enabled':new_entries_enabled(),
+        'entry_config_enabled':c.get('new_entries_enabled') is True,
+        'adaptive_allocator_enabled':c.get('adaptive_allocator_enabled',True) is not False,
+        'allocator_version':ALLOCATOR_VERSION,
         'environment':ENVIRONMENT,
         'process_role':PROCESS_ROLE,
         'release':ROOT.name,
@@ -4184,7 +4722,9 @@ def status_payload():
         'heartbeat':meta_get('heartbeat'),'last_eval':meta_get('last_eval'),
         'last_ingest':ing,'last_ingest_source':meta_get('last_ingest_source'),
         'last_midday_eval':meta_get('last_midday_eval'),'last_midday_scan':meta_get('last_midday_scan'),
-        'live_tickers':ALL_TICKERS,'execution_tickers':MIDDAY_TICKERS,'time_ny':now_ny().isoformat(),
+        'live_tickers':ALL_TICKERS,
+        'execution_tickers':list(dict.fromkeys(MIDDAY_TICKERS+READING_TICKERS)),
+        'time_ny':now_ny().isoformat(),
         'session_complete_pct':float(cov_pct) if cov_pct not in (None,'') else None,
         'clock':session_clock(),'stale_sec':stale,'data_stale':bool(stale is not None and stale>90),
         'watchdog_stale':not rh['ok'],
@@ -4219,9 +4759,15 @@ def setconfig():
     if ENVIRONMENT=='production' and PROCESS_ROLE!='runner':
         return jsonify({'error':'production configuration is runner-only'}),403
     d=request.get_json(force=True) or {}; c=cfg()
-    for k in ('alpaca_key','alpaca_secret','fred_key','fomc_dates','ntfy_url','earnings_dates'):
+    for k in ('alpaca_key','alpaca_secret','fred_key','fomc_dates','ntfy_url','earnings_dates',
+              'nlp_api_url','nlp_shared_secret','nlp_timeout_sec','nlp_min_confidence',
+              'nlp_max_age_sec'):
         if k in d:c[k]=d[k]
     if 'allow_lan_orders' in d: c['allow_lan_orders']=bool(d['allow_lan_orders'])
+    if 'new_entries_enabled' in d: c['new_entries_enabled']=d['new_entries_enabled'] is True
+    if 'adaptive_allocator_enabled' in d: c['adaptive_allocator_enabled']=d['adaptive_allocator_enabled'] is True
+    if 'adaptive_exploration_enabled' in d: c['adaptive_exploration_enabled']=d['adaptive_exploration_enabled'] is True
+    if 'max_daily_explore' in d: c['max_daily_explore']=max(0,min(5,int(d['max_daily_explore'])))
     c['broker_orders_enabled']=bool(d.get('broker_orders_enabled', c.get('broker_orders_enabled',False))); c['contracts_per_trade']=max(1,min(5,int(d.get('contracts_per_trade',c.get('contracts_per_trade',1)))));
     if any(k in d for k in ('alpaca_key','alpaca_secret','fred_key')):
         c['keys_ok']=False
@@ -4284,6 +4830,39 @@ def stock_news():
     if unsupported:return jsonify({'error':'unsupported ticker','symbols':unsupported}),400
     names=requested or ALL_TICKERS
     return jsonify({'news':latest_stock_news(names),'as_of':now_ny().isoformat(),'source':'alpaca'})
+
+
+@app.get('/api/learning/status')
+def learning_status():
+    con=db()
+    try:
+        heads=[dict(row) for row in con.execute(
+            """SELECT f.horizon_id,COUNT(DISTINCT f.id) features,
+                      COUNT(DISTINCT p.id) predictions,
+                      SUM(CASE WHEN l.resolved_at IS NOT NULL THEN 1 ELSE 0 END) labels,
+                      SUM(CASE WHEN l.resolved_at IS NULL THEN 1 ELSE 0 END) pending
+               FROM learning_features f
+               LEFT JOIN learning_predictions p ON p.feature_id=f.id
+               LEFT JOIN learning_labels l ON l.feature_id=f.id
+               GROUP BY f.horizon_id ORDER BY f.horizon_id"""
+        ).fetchall()]
+        nlp=con.execute('SELECT COUNT(*) n,MAX(inferred_at) latest FROM learning_nlp_signals').fetchone()
+    except sqlite3.OperationalError:
+        heads=[]; nlp={'n':0,'latest':None}
+    finally:
+        con.close()
+    c=cfg()
+    return jsonify({
+        'heads':heads,
+        'nlp':{'configured':bool(c.get('nlp_api_url') and c.get('nlp_shared_secret')),
+               'signals':int(nlp['n'] or 0),'latest':nlp['latest']},
+        'exploration':{'enabled':c.get('adaptive_exploration_enabled') is True,
+                       'max_daily':thresh()['max_daily_explore'],
+                       'used_today':exploration_fire_count()},
+        'last_model_update':meta_get('learning_last_update'),
+        'as_of':now_ny().isoformat(),
+    })
+
 
 @app.get('/api/market_chart/<sym>')
 def market_chart(sym):
@@ -4997,7 +5576,9 @@ def build_workspace():
     except Exception:
         macros=set(); macro_clear=None; tomorrow=None
     con=db()
-    open_tr=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status IN ('ENTRY_SUBMITTED','OPEN','EXIT_SUBMITTED') ORDER BY id DESC").fetchall()]
+    open_tr=[dict(x) for x in con.execute(
+        f"SELECT * FROM trades WHERE status IN ({_sql_in(OPEN_TRADE_STATUSES)}) ORDER BY id DESC",
+        OPEN_TRADE_STATUSES).fetchall()]
     closed=[dict(x) for x in con.execute("SELECT * FROM trades WHERE status='CLOSED' AND pnl IS NOT NULL").fetchall()]
     ev=[dict(x) for x in con.execute("SELECT * FROM events ORDER BY id DESC LIMIT 80").fetchall()]
     con.close()
